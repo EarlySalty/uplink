@@ -93,14 +93,17 @@ ungefilterten Bibliotheksfehler.
 SetChunkSize und WindowAcknowledgementSize müssen genau vier Bodybytes enthalten.
 Abweichende Längen sind `InvalidData` und führen zu `ProtocolRejected`;
 ein Parserende wird dadurch nicht mehr als geschlossener Transport gemeldet.
+Nach einer gültigen ACK-Fensterabsenkung werden bereits empfangene, noch nicht
+bestätigte Bytes sofort auf Fälligkeit geprüft und vor dem nächsten Read quittiert.
 
 ## Portable Tests
 
 Der gezielte Lauf bestand mit 24 Tests: sieben Wirekopf-Prüfungen, eine deterministische
-Nebenläufigkeitsprüfung und 16 echte Loopback-TLS-/RTMP-Tests. Zusammen mit den
-bisherigen 24 Core-/CLI-Tests und drei Beispieltests bestanden 51 Workspace-Tests
-mit `--all-targets`.
-Ingest und Beispiel wurden auch im Releaseprofil geprüft. Geprüft wurden:
+Nebenläufigkeitsprüfung und 16 echte Loopback-TLS-/RTMP-Tests. Vor der letzten
+Probe-Erweiterung bestanden zusammen mit den 24 Core-/CLI-Tests und damals drei
+Beispieltests 51 Workspace-Tests mit `--all-targets`. Der aktuelle Umfang beträgt
+24 Core-/CLI-, 24 Ingest- und neun Beispieltests. Die neun Probe-Tests wurden im
+letzten Nachreview unabhängig in Debug und Release geprüft. Geprüft wurden:
 
 - unbekannter Hostname und fremdes Zertifikat werden abgelehnt;
 - Publishabweisung liefert keine Medien;
@@ -138,6 +141,9 @@ kein Ersatz für den separaten echten FFmpeg-RTMPS-Nachweis.
 
 Der anschließende Kontrollnachrichten-Nachfix ergänzt vier Vendor-Regressionen:
 82 RTMP-Tests plus ein Doctest bestanden jeweils in Debug und Release.
+Mit der anschließenden ACK-Korrektur stieg der geprüfte Vendor-Umfang auf
+84 Tests plus ein Doctest, jeweils in Debug und Release; der gezielte
+[unabhängige Nachreview](review-rtmps.md#nachreview-von-ack-fenster-und-probe-auf-e914723) ist grün.
 Die zwei ignorierten Upstreamtests sind darin nicht als bestanden gezählt.
 Die historischen Testzahlen in den nativen Reviewberichten bleiben ihrem
 jeweiligen Prüfstand zugeordnet.
@@ -151,7 +157,7 @@ Pflichtprüfung in `cargo test`. Ein fehlender Binaryparameter oder FFmpeg 6
 beendet den Aufruf mit Fehler; diese Fälle werden nicht als bestandene
 Medienprüfung ausgegeben.
 
-Der abschließende Lauf nach den Metadata-, Gate- und Kontrollnachrichten-Korrekturen mit
+Der unabhängige abschließende Lauf nach den ACK- und Probe-Korrekturen mit
 `n8.1.2-50-g1a748fe2cd-20260831` bestätigte für
 beide Codecs jeweils 240 komprimierte Medienpakete und drei SequenceHeader
 auf drei Spuren. Sämtliche Nutzbytes und Header stimmen nach Größe und SHA-256
@@ -166,12 +172,21 @@ beim RTMP-Remux gegenüber dem FLV-Quellobjekt von 38 auf 62 Nutzbytes:
 FFmpeg ergänzt `matrixCoefficients=0`. Die Probe erwartet exakt dieses gemessene
 Objekt; daraus folgt kein geprüfter Farbraum oder HDR-Nachweis.
 
+Die Probe prüft Hilfsereignisse jetzt je Spur und ihre Gesamtsumme: Audio 0
+liefert keines, Audio 1 genau die native Mono-Metadatenmeldung, AV1-Video 0
+genau die gemessene ColorInfo und H.264-Video 0 genau ein SequenceEnd nach
+allen Frames. Fehlende, doppelte oder falsch zugeordnete Ereignisse werden
+abgelehnt. Je Codec ergeben sich 245 Events aus 240 Paketen, drei Headern und
+zwei Hilfsereignissen; daraus folgt keine allgemeine EOS-Pflicht.
+
 | Eingang | Video / Audio 0 / Audio 1 | Header / Metadaten / SequenceEnd | Events / Bodybytes | Beobachtetes Eventbudget-Maximum |
 | --- | --- | --- | --- | --- |
 | AV1 + zwei AAC | 50 / 95 / 95 Pakete | 3 / 2 / 0 | 245 / 59.665 Bytes | 8.975 Bytes |
 | H.264 + zwei AAC | 50 / 95 / 95 Pakete | 3 / 1 / 1 | 245 / 141.520 Bytes | 7.269 Bytes |
 
-Die Tabelle zeigt den abschließenden Release-Nachlauf. Die beobachteten
+Die Byte-/Budgetwerte stammen aus dem Release-Nachlauf nach der
+Kontrollnachrichtenkorrektur; der letzte unabhängige ACK-/Probe-Nachlauf
+bestätigte erneut sämtliche Paket-, Header- und Hilfsereigniszahlen. Die beobachteten
 Spitzenwerte hängen vom Scheduling ab; sie sind kein
 Kapazitätsbenchmark. Der [native Reviewer](review-rtmps.md) wiederholte den
 echten Nachweis auf dem korrigierten Librarypfad unabhängig erfolgreich.

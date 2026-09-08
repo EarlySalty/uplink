@@ -46,6 +46,7 @@ const AV1_COPY_COLOR_INFO: &[u8] = concat!(
     "\x00\x00\x09\x00\x00\x09"
 )
 .as_bytes();
+const AAC_MONO_CHANNEL_CONFIG: &[u8] = &[1, 1, 0, 0, 0, 4];
 
 #[derive(Default)]
 struct ProbeAuth {
@@ -169,6 +170,37 @@ struct ExpectedTrack {
     packets: Vec<ReferencePacket>,
     headers_seen: usize,
     packets_seen: usize,
+    expected_metadata: Option<&'static [u8]>,
+    metadata_seen: usize,
+    expects_sequence_end: bool,
+    sequence_ends_seen: usize,
+}
+
+impl ExpectedTrack {
+    fn observe_metadata(&mut self, payload: &[u8]) -> ProbeResult<()> {
+        if self.headers_seen != 1
+            || self.expected_metadata != Some(payload)
+            || self.metadata_seen != 0
+            || self.sequence_ends_seen != 0
+        {
+            return Err("Fehlzugeordnete, zusätzliche oder abweichende Testmetadaten".into());
+        }
+        self.metadata_seen = 1;
+        Ok(())
+    }
+
+    fn observe_sequence_end(&mut self, payload: &[u8]) -> ProbeResult<()> {
+        if !payload.is_empty()
+            || !self.expects_sequence_end
+            || self.sequence_ends_seen != 0
+            || self.headers_seen != 1
+            || self.packets_seen != self.packets.len()
+        {
+            return Err("Zusätzliches, vorzeitiges oder abweichendes Test-SequenceEnd".into());
+        }
+        self.sequence_ends_seen = 1;
+        Ok(())
+    }
 }
 
 struct Measurement {
@@ -236,6 +268,15 @@ impl Measurement {
                 kind,
                 wire_id: mapping.flv_track_id,
             };
+            // Nur der gemessene, versionierte FFmpeg-8-Testweg: Audio#1 sendet
+            // einmal Native-Mono, AV1-Video#0 einmal ColorInfo. Genau H264-Video#0
+            // sendet ein SequenceEnd. Andere Clients/Plattformen sind daraus
+            // ausdrücklich nicht zu SequenceEnd oder diesen Metadaten verpflichtet.
+            let expected_metadata = match (key.kind, key.wire_id, codec) {
+                (MediaKind::Audio, 1, _) => Some(AAC_MONO_CHANNEL_CONFIG),
+                (MediaKind::Video, 0, WireCodec::Av1) => Some(AV1_COPY_COLOR_INFO),
+                _ => None,
+            };
             if tracks
                 .insert(
                     key,
@@ -249,6 +290,12 @@ impl Measurement {
                         packets,
                         headers_seen: 0,
                         packets_seen: 0,
+                        expected_metadata,
+                        metadata_seen: 0,
+                        expects_sequence_end: key.kind == MediaKind::Video
+                            && key.wire_id == 0
+                            && codec == WireCodec::H264,
+                        sequence_ends_seen: 0,
                     },
                 )
                 .is_some()
@@ -329,23 +376,11 @@ impl Measurement {
                     event.payload().len(),
                     &event.payload()[..event.payload().len().min(64)]
                 );
-                // Nur die gemessenen künstlichen Metadaten, kein allgemeiner Parser.
-                let expected = match event.codec {
-                    WireCodec::Av1 => event.payload() == AV1_COPY_COLOR_INFO,
-                    WireCodec::Aac => {
-                        event.identity.track.wire_id == 1 && event.payload() == [1, 1, 0, 0, 0, 4]
-                    }
-                    WireCodec::H264 => false,
-                };
-                if !expected {
-                    return Err("Unerwartete Medienmetadaten in der Teststrecke".into());
-                }
+                track.observe_metadata(event.payload())?;
                 self.metadata += 1;
             }
             EventKind::SequenceEnd => {
-                if !event.payload().is_empty() {
-                    return Err("Unerwartete SequenceEnd-Nutzdaten".into());
-                }
+                track.observe_sequence_end(event.payload())?;
                 self.endings += 1;
             }
         }
@@ -353,12 +388,47 @@ impl Measurement {
     }
 
     fn complete(&self, report: &SessionReport) -> ProbeResult<()> {
-        if self
-            .tracks
-            .values()
-            .any(|track| track.headers_seen != 1 || track.packets_seen != track.packets.len())
+        if self.tracks.values().any(|track| {
+            track.headers_seen != 1
+                || track.packets_seen != track.packets.len()
+                || track.metadata_seen != usize::from(track.expected_metadata.is_some())
+                || track.sequence_ends_seen != usize::from(track.expects_sequence_end)
+        }) {
+            return Err(
+                "Spur, Header, Medienpaket, Metadaten oder SequenceEnd weichen vom Testweg ab"
+                    .into(),
+            );
+        }
+        if self.headers
+            != self
+                .tracks
+                .values()
+                .map(|track| track.headers_seen)
+                .sum::<usize>()
+            || self.packets
+                != self
+                    .tracks
+                    .values()
+                    .map(|track| track.packets_seen)
+                    .sum::<usize>()
+            || self.metadata
+                != self
+                    .tracks
+                    .values()
+                    .map(|track| track.metadata_seen)
+                    .sum::<usize>()
+            || self.endings
+                != self
+                    .tracks
+                    .values()
+                    .map(|track| track.sequence_ends_seen)
+                    .sum::<usize>()
+            || self.events != self.headers + self.packets + self.metadata + self.endings
         {
-            return Err("Mindestens eine Spur, ein Header oder ein Medienpaket fehlt".into());
+            return Err(
+                "Gesamtzähler stimmen nicht mit den einzeln geprüften Spurereignissen überein"
+                    .into(),
+            );
         }
         if !matches!(
             report.reason,
@@ -736,6 +806,198 @@ async fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn completed_measurement(name: &str, codec: WireCodec) -> (Measurement, SessionReport) {
+        let manifest: Manifest = serde_json::from_str(include_str!(
+            "../../../experiments/scuffle-probe/fixtures/manifest.json"
+        ))
+        .unwrap();
+        let mut measurement = Measurement::new(codec, name, &manifest).unwrap();
+        // Die öffentliche API erzeugt die opake Verbindungsgeneration selbst.
+        // Ein sofort geschlossener lokaler TCP-Client reicht für diese Identität;
+        // dieser Helfer behauptet ausdrücklich keinen Medien-Livenachweis.
+        let server = IngestServer::bind_loopback(
+            0,
+            tls::test_tls().server,
+            Arc::new(ProbeAuth::default()),
+            IngestLimits::local_probe(),
+        )
+        .await
+        .unwrap();
+        let client = tokio::net::TcpStream::connect(server.local_addr().unwrap())
+            .await
+            .unwrap();
+        let connection = server.accept().await.unwrap();
+        drop(client);
+        let mut report = timeout(Duration::from_secs(2), connection.finish())
+            .await
+            .unwrap();
+        for track in measurement.tracks.values_mut() {
+            track.headers_seen = 1;
+            track.packets_seen = track.packets.len();
+            track.metadata_seen = usize::from(track.expected_metadata.is_some());
+            track.sequence_ends_seen = usize::from(track.expects_sequence_end);
+        }
+        measurement.packets = 240;
+        measurement.headers = 3;
+        measurement.metadata = if codec == WireCodec::Av1 { 2 } else { 1 };
+        measurement.endings = usize::from(codec == WireCodec::H264);
+        measurement.events = 245;
+        measurement.bytes = 1;
+        measurement.common_shift_ms = Some(0);
+        measurement.generation = Some(report.generation);
+        report.reason = EndReason::ExplicitStop;
+        report.received_events = measurement.events as u64;
+        report.received_bytes = measurement.bytes as u64;
+        report.max_queued_bytes = 1;
+        report.track_count = measurement.tracks.len();
+        measurement.complete(&report).unwrap();
+        (measurement, report)
+    }
+
+    #[tokio::test]
+    async fn omitted_metadata_fails_even_when_the_session_counters_agree() {
+        for (name, codec) in [("av1", WireCodec::Av1), ("h264", WireCodec::H264)] {
+            let (mut measurement, mut report) = completed_measurement(name, codec).await;
+            measurement
+                .tracks
+                .get_mut(&WireTrack {
+                    kind: MediaKind::Audio,
+                    wire_id: 1,
+                })
+                .unwrap()
+                .metadata_seen -= 1;
+            measurement.metadata -= 1;
+            measurement.events -= 1;
+            report.received_events -= 1;
+            assert!(
+                measurement.complete(&report).is_err(),
+                "{name}: fehlende Metadaten"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicated_metadata_fails_even_when_the_session_counters_agree() {
+        for (name, codec) in [("av1", WireCodec::Av1), ("h264", WireCodec::H264)] {
+            let (mut measurement, mut report) = completed_measurement(name, codec).await;
+            measurement
+                .tracks
+                .get_mut(&WireTrack {
+                    kind: MediaKind::Audio,
+                    wire_id: 1,
+                })
+                .unwrap()
+                .metadata_seen += 1;
+            measurement.metadata += 1;
+            measurement.events += 1;
+            report.received_events += 1;
+            assert!(
+                measurement.complete(&report).is_err(),
+                "{name}: doppelte Metadaten"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn omitted_h264_sequence_end_fails_even_when_the_session_counters_agree() {
+        let (mut measurement, mut report) = completed_measurement("h264", WireCodec::H264).await;
+        measurement
+            .tracks
+            .get_mut(&WireTrack {
+                kind: MediaKind::Video,
+                wire_id: 0,
+            })
+            .unwrap()
+            .sequence_ends_seen = 0;
+        measurement.endings = 0;
+        measurement.events -= 1;
+        report.received_events -= 1;
+        assert!(measurement.complete(&report).is_err());
+    }
+
+    #[tokio::test]
+    async fn extra_sequence_end_fails_for_both_measured_codec_paths() {
+        for (name, codec) in [("av1", WireCodec::Av1), ("h264", WireCodec::H264)] {
+            let (mut measurement, mut report) = completed_measurement(name, codec).await;
+            measurement
+                .tracks
+                .get_mut(&WireTrack {
+                    kind: MediaKind::Video,
+                    wire_id: 0,
+                })
+                .unwrap()
+                .sequence_ends_seen += 1;
+            measurement.endings += 1;
+            measurement.events += 1;
+            report.received_events += 1;
+            assert!(
+                measurement.complete(&report).is_err(),
+                "{name}: zusätzliches Ende"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn metadata_on_the_wrong_track_cannot_replace_the_expected_event() {
+        let (mut measurement, report) = completed_measurement("av1", WireCodec::Av1).await;
+        measurement
+            .tracks
+            .get_mut(&WireTrack {
+                kind: MediaKind::Audio,
+                wire_id: 0,
+            })
+            .unwrap()
+            .metadata_seen = 1;
+        measurement
+            .tracks
+            .get_mut(&WireTrack {
+                kind: MediaKind::Audio,
+                wire_id: 1,
+            })
+            .unwrap()
+            .metadata_seen = 0;
+        assert_eq!(measurement.metadata, 2);
+        assert!(measurement.complete(&report).is_err());
+    }
+
+    #[tokio::test]
+    async fn per_track_observation_rejects_duplicates_and_unexpected_auxiliary_events() {
+        for (name, codec) in [("av1", WireCodec::Av1), ("h264", WireCodec::H264)] {
+            let (mut measurement, _) = completed_measurement(name, codec).await;
+            for track in measurement.tracks.values_mut() {
+                // Vollständig beobachtete Ereignisse dürfen nicht erneut gezählt
+                // werden; nicht erwartete Formen bleiben selbst mit gültigen Bytes abgewiesen.
+                assert!(
+                    track
+                        .observe_metadata(
+                            track.expected_metadata.unwrap_or(AAC_MONO_CHANNEL_CONFIG)
+                        )
+                        .is_err()
+                );
+                assert!(track.observe_sequence_end(&[]).is_err());
+                track.metadata_seen = 0;
+                track.sequence_ends_seen = 0;
+                if let Some(expected) = track.expected_metadata {
+                    assert!(track.observe_metadata(&[0]).is_err());
+                    track.observe_metadata(expected).unwrap();
+                    assert!(track.observe_metadata(expected).is_err());
+                } else {
+                    assert!(track.observe_metadata(AAC_MONO_CHANNEL_CONFIG).is_err());
+                }
+                if track.expects_sequence_end {
+                    track.packets_seen -= 1;
+                    assert!(track.observe_sequence_end(&[]).is_err());
+                    track.packets_seen += 1;
+                    assert!(track.observe_sequence_end(&[0]).is_err());
+                    track.observe_sequence_end(&[]).unwrap();
+                    assert!(track.observe_sequence_end(&[]).is_err());
+                } else {
+                    assert!(track.observe_sequence_end(&[]).is_err());
+                }
+            }
+        }
+    }
 
     fn reference() -> ReferencePacket {
         ReferencePacket {

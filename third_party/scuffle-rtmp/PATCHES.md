@@ -34,6 +34,15 @@ Ein fehlerhafter Nachrichtenkörper wird dadurch nicht länger als geschlossener
 Transport gemeldet. Beide offenen-Transport-Fälle wurden zuerst in Debug und
 Release rot gemessen; echte EOF- und Timeout-Semantik bleiben erhalten.
 
+Nachkorrektur des ACK-Fensterwechsels: Nach einer gültigen Änderung wird
+dieselbe Fälligkeitsprüfung wie nach einem Read angewendet. Bereits empfangene,
+noch nicht bestätigte Bytes können durch ein kleineres Fenster sofort fällig
+werden; das ACK wird im vorhandenen Nachrichten-Flush vor dem nächsten Read
+gesendet. Keine zusätzliche Schleife oder Bestätigung bereits quittierter Bytes.
+Eine vollständige Session mit wartendem Peer scheiterte zuvor in Debug/Release
+und besteht nach dem Fix; Fenstervergrößerung, Null-Abweisung, mehrfacher Wechsel
+und Wire-Zähler-Wrap sind ebenfalls geprüft.
+
 Die Bibliothek allein ist weder eine öffentlich freigegebene Ingest-Schnittstelle
 noch eine Codec-, OBS-, Twitch- oder Plattformfreigabe. Die aufrufende Anwendung
 verantwortet TLS, Autorisierung, Sessionanzahl, Medienkopien und Eventbudgets.

@@ -331,22 +331,7 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin, H: SessionHandler>
             // Count bytes since the last ACK separately from the wrapping wire counter.
             self.sequence_number = self.sequence_number.wrapping_add(n);
             self.bytes_since_ack += u64::from(n);
-            if self.bytes_since_ack >= u64::from(self.acknowledgement_window_size) {
-                tracing::debug!(sequence_number = %self.sequence_number, "sending acknowledgement");
-
-                // Send acknowledgement
-                ProtocolControlMessageAcknowledgement {
-                    sequence_number: self.sequence_number,
-                }
-                .write(
-                    &mut BoundedWriter {
-                        buffer: &mut self.write_buf,
-                        limit: self.limits.max_write_buffer_bytes,
-                    },
-                    &self.chunk_writer,
-                )?;
-                self.bytes_since_ack = 0;
-            }
+            self.queue_acknowledgement_if_due()?;
         }
 
         self.process_chunks().await?;
@@ -533,6 +518,26 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin, H: SessionHandler>
         }
         tracing::debug!(acknowledgement_window_size = %acknowledgement_window_size, "received new acknowledgement window size");
         self.acknowledgement_window_size = acknowledgement_window_size;
+        // A smaller window can make already received bytes due immediately.
+        // process_chunks flushes this response before the next blocking read.
+        self.queue_acknowledgement_if_due()
+    }
+
+    fn queue_acknowledgement_if_due(&mut self) -> Result<(), crate::error::RtmpError> {
+        if self.bytes_since_ack >= u64::from(self.acknowledgement_window_size) {
+            tracing::debug!(sequence_number = %self.sequence_number, "sending acknowledgement");
+            ProtocolControlMessageAcknowledgement {
+                sequence_number: self.sequence_number,
+            }
+            .write(
+                &mut BoundedWriter {
+                    buffer: &mut self.write_buf,
+                    limit: self.limits.max_write_buffer_bytes,
+                },
+                &self.chunk_writer,
+            )?;
+            self.bytes_since_ack = 0;
+        }
         Ok(())
     }
 

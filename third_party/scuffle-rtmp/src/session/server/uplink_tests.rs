@@ -351,3 +351,94 @@ async fn uplink_valid_control_then_transport_eof_remains_peer_close() {
         assert!(matches!(result, Ok(true)));
     }
 }
+
+#[tokio::test(start_paused = true)]
+async fn uplink_ack_window_shrink_unblocks_waiting_peer_without_more_bytes() {
+    let (server, mut client) = tokio::io::duplex(8192);
+    let session = tokio::spawn(ServerSession::new(server, Handler).run());
+    let mut c0c1 = [0; 1537];
+    c0c1[0] = 3;
+    client.write_all(&c0c1).await.unwrap();
+    let mut handshake_response = [0; 3073];
+    client.read_exact(&mut handshake_response).await.unwrap();
+    client
+        .write_all(&handshake_response[1..1537])
+        .await
+        .unwrap();
+    let mut set_chunk_size = [0; 16];
+    client.read_exact(&mut set_chunk_size).await.unwrap();
+    let mut window = Vec::new();
+    ProtocolControlMessageWindowAcknowledgementSize {
+        acknowledgement_window_size: 64,
+    }
+    .write(&mut window, &ChunkWriter::default())
+    .unwrap();
+    client.write_all(&window).await.unwrap();
+    // Send no further bytes: receipt of the ACK must precede any next read.
+    let mut response = [0; 16];
+    let receipt = client.read_exact(&mut response).await;
+    client.shutdown().await.unwrap();
+    let result = session.await.unwrap();
+    receipt.expect("window reduction must send an ACK before the next read");
+    assert!(matches!(result, Ok(true)));
+    let ack = ChunkReader::default()
+        .read_chunk(&mut BytesMut::from(response.as_slice()))
+        .unwrap()
+        .unwrap();
+    assert_eq!(ack.message_header.msg_type_id, MessageType::Acknowledgement);
+    assert_eq!(
+        ack.payload.as_ref(),
+        (3073 + window.len() as u32).to_be_bytes()
+    );
+}
+
+#[test]
+fn uplink_ack_window_transitions_preserve_unconfirmed_and_confirmed_counts() {
+    let mut session = ServerSession::new(BufferedIo::default(), Handler);
+    session.acknowledgement_window_size = 64;
+    session.bytes_since_ack = 100;
+    session.sequence_number = 1000;
+    session.on_acknowledgement_window_size(512).unwrap();
+    assert!(session.write_buf.is_empty());
+    assert_eq!(session.bytes_since_ack, 100);
+    assert_eq!(session.acknowledgement_window_size, 512);
+    assert!(session.on_acknowledgement_window_size(0).is_err());
+    assert_eq!(session.acknowledgement_window_size, 512);
+    assert_eq!(session.bytes_since_ack, 100);
+    assert!(session.write_buf.is_empty());
+
+    session.on_acknowledgement_window_size(100).unwrap();
+    assert_eq!(session.bytes_since_ack, 0);
+    let mut wire = BytesMut::from(session.write_buf.as_slice());
+    let ack = ChunkReader::default()
+        .read_chunk(&mut wire)
+        .unwrap()
+        .unwrap();
+    assert_eq!(ack.payload.as_ref(), 1000_u32.to_be_bytes());
+    assert!(wire.is_empty());
+    session.write_buf.clear();
+    for window in [100, 1, u32::MAX, 50] {
+        session.on_acknowledgement_window_size(window).unwrap();
+        assert!(
+            session.write_buf.is_empty(),
+            "already confirmed bytes must not be acknowledged again"
+        );
+        assert_eq!(session.bytes_since_ack, 0);
+    }
+
+    // Newly received bytes cross the wire counter's wrap independently of the window.
+    session.bytes_since_ack = 400;
+    session.sequence_number = 5;
+    session.on_acknowledgement_window_size(500).unwrap();
+    assert!(session.write_buf.is_empty());
+    assert_eq!(session.bytes_since_ack, 400);
+    session.on_acknowledgement_window_size(399).unwrap();
+    assert_eq!(session.bytes_since_ack, 0);
+    let mut wire = BytesMut::from(session.write_buf.as_slice());
+    let ack = ChunkReader::default()
+        .read_chunk(&mut wire)
+        .unwrap()
+        .unwrap();
+    assert_eq!(ack.payload.as_ref(), 5_u32.to_be_bytes());
+    assert!(wire.is_empty());
+}

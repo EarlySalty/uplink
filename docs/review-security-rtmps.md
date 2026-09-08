@@ -9,6 +9,9 @@ Ergänzend wurde der enge Gate-Nachfix gegen
 Ein weiterer enger Nachreview gegen
 `b6c18f55fd30b6fc0669e444de5eceeae2f99751` prüft die Trennung beschädigter
 Kontrollnachrichten von einem tatsächlichen Transport-EOF.
+Der abschließende enge Nachreview gegen
+`e9147232b482a47a10673b16f500f043fb50e7b2` umfasst ACK-Fälligkeit bei geändertem
+Empfangsfenster und die spurgenaue Ereignisprüfung der FFmpeg-Probe.
 
 **Ergebnis:** Kein weiterer konkreter Sicherheitsblocker im geprüften
 Loopback-Baustein. Der Stand kann für diesen Entwicklungsumfang übernommen
@@ -27,7 +30,7 @@ nicht untersucht oder geändert.
 SHA-256 über die sortierten Pfade und SHA-256-Werte aller Rust-Dateien und
 Manifeste/Lockfiles dieses Bereichs einschließlich Root-Cargo/CI:
 
-`40d22f5d4f51c06b467354f498c6635bda6c90dcd369b718f457d2eeacb6235b`
+`7cb05f88970e9e66d2296f83230d38565dbd07e4ee34b7f1ee2682d731b04325`
 
 Reproduktion aus der Repositorywurzel; Buildverzeichnisse bleiben ausgeschlossen:
 
@@ -191,6 +194,33 @@ Vier gezielte Regressionstests wurden eigenständig mit Rust 1.97.1,
 `git diff --check` bestand; der Gesamtfingerprint oben wurde aktualisiert.
 Ergebnis: Befund geschlossen, keine zusätzlichen Sicherheitsblocker für den
 unverändert lokalen Entwicklungsumfang.
+
+## Abschließender Nachreview von ACK und Probe
+
+Der Rust-Diff gegen `e914723` betrifft nur RTMP-Server, dessen ACK-Regressionen
+und das Probe-Beispiel. Unveränderte Parser, Abhängigkeiten und Secretpfade
+wurden nicht erneut geprüft oder gescannt.
+
+Die gemeinsame Fälligkeitsprüfung läuft nach empfangenen Bytes und nach einer
+Fensteränderung. Sie nutzt weiterhin `BoundedWriter` und setzt den Zähler erst
+nach erfolgreichem Einreihen zurück. `process_chunks` führt das begrenzte Flush
+vor dem nächsten Read aus. Fenster null wird vor jeder Zustandsänderung
+abgelehnt; bereits bestätigte Bytes erzeugen bei weiteren Fensteränderungen
+keine Doppelbestätigung. Die 32-Bit-Protokollsequenz bleibt vom Zähler der noch
+nicht bestätigten Bytes getrennt.
+
+Die Probe prüft jetzt je Fixture-Spur erwartete Metadata-Bytes, genaue Anzahl,
+Zuordnung und SequenceEnd. Fehlende oder doppelte Zusatzereignisse werden auch
+bei passend manipulierten Gesamtzählern abgelehnt. SequenceEnd wird nur für den
+gemessenen H.264-Videopfad verlangt und erst nach allen erwarteten Paketen
+akzeptiert. Daraus entsteht keine allgemeine Endmarkierungspflicht für Clients.
+
+Eigenständig bestanden mit Rust 1.97.1 und `--locked -j2`: die beiden Tests
+`uplink_ack_window_*` sowie alle neun Tests des Beispiels `rtmps_probe`.
+`git diff --check` war erfolgreich. Debug-/Release-Nachprüfung und erneuter
+echter FFmpeg-8-Lauf sind zusätzlich im Rust-Review dokumentiert; der echte
+Sender wurde hier nicht nochmals gestartet. Gesamtfingerprint aktualisiert.
+Ergebnis: keine offenen Sicherheitsbefunde im begrenzten Entwicklungsumfang.
 
 ## Aussagegrenzen
 

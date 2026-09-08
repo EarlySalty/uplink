@@ -75,6 +75,14 @@ autorisierte Publish-Streams an den Handler gegeben. Doppelte/ungültige IDs,
 zu viele parallele Publish-Streams und ungültige Delete-Stream-IDs werden
 abgewiesen. `HandlerRejected` enthält keine fremden Daten.
 
+Nach einer gültigen ACK-Fensteränderung wird dieselbe Fälligkeitsprüfung wie
+nach einer Änderung der empfangenen Bytezahl ausgeführt. Wird das Fenster unter
+die bereits unbestätigt empfangene Menge abgesenkt, legt sie sofort genau ein
+kumulatives ACK in den begrenzten Ausgabepuffer. Der vorhandene Flush nach der
+Kontrollnachricht sendet es vor dem nächsten blockierenden Read. Größere Fenster
+behalten unbestätigte Bytes; bereits bestätigte Bytes lösen kein weiteres ACK
+aus. Eine Nullgröße wird vor jeder Zustandsänderung abgewiesen.
+
 `MessageData::read_with_limits` und `Command::read_with_limits` verwenden
 `DecodeLimits`. Auch optionale Argumente bekannter Commands werden budgetiert
 validiert. Der AMF-Patch begrenzt Bytes, Strings/Schlüssel, tatsächliche
@@ -107,7 +115,7 @@ und Medien vor Publish. Type 2 panikte nur im Debugprofil; Release-Wrapping
 war kein hinreichender Protokollnachweis. Ein zusätzlich zuerst roter ACK-Test
 zeigte die veraltete Bytezahl vor dem Read statt der aktuellen Empfangssumme.
 
-Nach dem Patch: RTMP **82 Bibliothekstests plus ein Doctest** sowohl Debug als
+Nach dem Patch: RTMP **84 Bibliothekstests plus ein Doctest** sowohl Debug als
 auch Release bestanden, Exit 0. Darunter neue Tests für präallokative Header-,
 CSID-, Partialanzahl-/Summengrenzen, Freigabe von Reservierungen, Type-3-Delta,
 ChunkSize-Ablehnung, absolute Ein-Byte-Slowloris-Frist, Idle/EOF-Unterschied,
@@ -127,6 +135,21 @@ gültige vier Byte mit anschließendem echtem Transport-EOF als normales Ende.
 Es werden weder Fehlertexte verglichen noch künstliche Timeouts als
 Erkennung verwendet. Alle vier zusätzlichen Tests sowie die vorhandenen
 EOF-/Timeout-Regressionen sind in der oben genannten grünen Anzahl enthalten.
+
+ACK-Nachkorrektur gegen `e9147232b482a47a10673b16f500f043fb50e7b2`:
+`uplink_ack_window_shrink_unblocks_waiting_peer_without_more_bytes` führt den
+vollständigen RTMP-Handshake durch, senkt das ACK-Fenster auf 64 Byte und wartet
+danach ohne weitere gesendete Bytes auf das ACK. Vor dem Fix endete der Read
+mit `UnexpectedEof`, weil kein ACK vor dem nächsten serverseitigen Read kam;
+Debug und Release je ein fehlgeschlagener Test, Exit 101. Tokio verwendet dabei
+eine pausierte Testuhr; die bestehende Sessionfrist beendet den fehlerhaften
+Ablauf, keine zusätzliche ACK- oder Timeout-Schleife wurde eingeführt.
+Nach dem Fix kommt das ACK mit genau der empfangenen kumulativen Bytezahl an,
+und der Peer beendet die Sitzung kontrolliert. Ein weiterer Zustandstest prüft
+Fenstervergrößerung, Gleichheit am Grenzwert, Null-Abweisung ohne Mutation,
+mehrfache Wechsel nach einem ACK sowie neue Bytes über den Wire-Zähler-Wrap.
+Die frühere Read-/Wrap-Regression bleibt ebenfalls grün. Beide neuen Tests
+sind in den 84 bestandenen Bibliothekstests enthalten.
 
 AMF: zunächst neun neue Regressionen rot; danach **21 Grenztests plus
 40 Bibliothekstests und ein Doctest** mit Serde in Debug/Release bestanden.
