@@ -2,8 +2,8 @@ use crate::{api::ServiceState, runtime::SessionProcessor};
 use std::sync::Arc;
 use uplink_ingest::{MediaEvent, rustls};
 use uplink_media::{
-    DesiredOutput, DesiredSessionSpec, DesiredVideo, EngineConfig, MediaEngine, MediaLimits,
-    PublishSecret, PublishTarget,
+    DesiredOutput, DesiredSessionSpec, DesiredVideo, EngineConfig, MediaEngine, PublishSecret,
+    PublishTarget,
 };
 
 pub struct Coordinator {
@@ -31,7 +31,7 @@ impl Coordinator {
             ffmpeg: config.ffmpeg.clone(),
             ffprobe: config.ffprobe.clone(),
             work_directory: config.work_directory.clone(),
-            limits: MediaLimits::default(),
+            limits: state.config.media_limits(),
         })
         .map_err(|_| "Medienkonfiguration ist ungültig.")?;
         let mut roots =
@@ -84,8 +84,7 @@ impl Coordinator {
             .find(|p| p.name == platform)
             .ok_or("Für ein Ziel fehlt die geprüfte Konfiguration.")?;
         let endpoint: String = row.try_get(1).map_err(|_| "Zieladresse fehlt.")?;
-        crate::destinations::public_endpoint(&endpoint)?;
-        let endpoint = secure_default(&platform, endpoint);
+        let endpoint = crate::destinations::runtime_endpoint(&platform, &endpoint, policy)?;
         let ciphertext: Vec<u8> = row.try_get(2).map_err(|_| "Zielzugang fehlt.")?;
         let secret = self
             .state
@@ -149,7 +148,7 @@ impl Coordinator {
 /// Nur der bekannte alte Twitch-Default wird auf den offiziellen sicheren
 /// Default abgebildet (https://ingest.twitch.tv/ingests). Keine generische
 /// Protokoll-/Hostumschreibung und keine Änderung des gespeicherten Wunsches.
-fn secure_default(platform: &str, endpoint: String) -> String {
+pub(crate) fn secure_default(platform: &str, endpoint: String) -> String {
     if platform == "twitch"
         && matches!(
             endpoint.as_str(),
@@ -222,6 +221,15 @@ impl SessionProcessor for Coordinator {
         );
         if report.error.is_some() {
             return Err("Medienausgabe wurde mit Fehler beendet.");
+        }
+        if report.status.outputs.is_empty()
+            || report
+                .status
+                .outputs
+                .iter()
+                .all(|output| matches!(output.state, uplink_media::OutputState::Failed(_)))
+        {
+            return Err("Alle Plattformausgänge sind fehlgeschlagen; siehe Zielstatus.");
         }
         Ok(())
     }

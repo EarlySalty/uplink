@@ -9,28 +9,34 @@ use database::fixture;
 #[tokio::test]
 #[ignore = "Benötigt isolierte PostgreSQL 16 und den installierten geprüften FFmpeg-8-Build."]
 async fn normal_coordinator_keeps_healthy_output_and_reports_real_graph() {
-    normal_audio_case(false, None).await;
+    normal_audio_case(false, None, false).await;
 }
 
 #[tokio::test]
 #[ignore = "Benötigt isolierte PostgreSQL 16 und geprüften FFmpeg 8."]
 async fn normal_single_aac_live_mode_reaches_twitch_compatible_output() {
-    normal_audio_case(true, Some("live")).await;
+    normal_audio_case(true, Some("live"), false).await;
 }
 
 #[tokio::test]
 #[ignore = "Benötigt isolierte PostgreSQL 16 und geprüften FFmpeg 8."]
 async fn missing_separate_vod_audio_stops_only_twitch() {
-    normal_audio_case(true, Some("separate_vod")).await;
+    normal_audio_case(true, Some("separate_vod"), false).await;
 }
 
 #[tokio::test]
 #[ignore = "Benötigt isolierte PostgreSQL 16 und geprüften FFmpeg 8."]
 async fn explicit_separate_vod_preserves_both_distinct_aac_feeds() {
-    normal_audio_case(false, Some("separate_vod")).await;
+    normal_audio_case(false, Some("separate_vod"), false).await;
 }
 
-async fn normal_audio_case(single_audio: bool, twitch_mode: Option<&str>) {
+#[tokio::test]
+#[ignore = "Benötigt isolierte PostgreSQL 16 und geprüften FFmpeg 8."]
+async fn rejected_platform_publish_marks_the_entire_failed_session() {
+    normal_audio_case(true, Some("live"), true).await;
+}
+
+async fn normal_audio_case(single_audio: bool, twitch_mode: Option<&str>, all_failed: bool) {
     use futures::FutureExt;
     use sha2::{Digest, Sha256};
     use uplink_ingest::{
@@ -46,10 +52,12 @@ async fn normal_audio_case(single_audio: bool, twitch_mode: Option<&str>) {
     } else {
         "youtube"
     };
-    struct DestinationAuth;
+    struct DestinationAuth {
+        reject: bool,
+    }
     impl Authorizer for DestinationAuth {
         async fn authorize(&self, app: &str, key: &str) -> Result<AuthorizedSession, ()> {
-            if app == "live" && key == OUTPUT_KEY {
+            if !self.reject && app == "live" && key == OUTPUT_KEY {
                 AuthorizedSession::new(1, 1).map_err(|_| ())
             } else {
                 Err(())
@@ -61,7 +69,7 @@ async fn normal_audio_case(single_audio: bool, twitch_mode: Option<&str>) {
     let output = IngestServer::bind_loopback(
         0,
         certificates.server.clone(),
-        Arc::new(DestinationAuth),
+        Arc::new(DestinationAuth { reject: all_failed }),
         IngestLimits::local_probe(),
     )
     .await
@@ -177,6 +185,10 @@ async fn normal_audio_case(single_audio: bool, twitch_mode: Option<&str>) {
             loop {
                 let status: serde_json::Value = http.get(format!("http://{api}/v1/me/destinations?streamer_id=11")).header("X-Relay-Auth","synthetic-api").send().await.unwrap().json().await.unwrap();
                 let healthy = status["destinations"].as_array().unwrap().iter().find(|item| item["platform"]==healthy_platform).unwrap();
+                if all_failed && healthy["output_state"] == "failed" {
+                    assert!(healthy["active_profile"].is_null());
+                    break;
+                }
                 if healthy["output_state"]=="sending" {
                     assert_eq!(healthy["active_profile"]["width"],256);
                     assert_eq!(healthy["active_profile"]["height"],144);
@@ -207,7 +219,7 @@ async fn normal_audio_case(single_audio: bool, twitch_mode: Option<&str>) {
         assert_eq!(me["session"]["source_observation"]["height"],180);
         assert_eq!(me["session"]["source_observation"]["audio"].as_array().unwrap().len(),if single_audio {1} else {2});
         assert_eq!(me["session"]["outputs"]["encode_groups"],1);
-        if twitch_mode == Some("live") {
+        if twitch_mode == Some("live") && !all_failed {
             let response = http.put(format!("http://{api}/v1/me/destinations")).header("X-Relay-Auth","synthetic-api")
                 .json(&serde_json::json!({"streamer_id":11,"destinations":[{"platform":"twitch","twitch_audio_mode":"separate_vod"}]})).send().await.unwrap();
             assert!(response.status().is_success());
@@ -219,20 +231,24 @@ async fn normal_audio_case(single_audio: bool, twitch_mode: Option<&str>) {
         }
         producer.finish().await.unwrap();
         let (video, audio, _report) = tokio::time::timeout(Duration::from_secs(15), &mut receiving).await.unwrap().unwrap();
-        assert_eq!(video,50);
+        assert_eq!(video,if all_failed { 0 } else { 50 });
         let reference:serde_json::Value=serde_json::from_str(include_str!("../../../experiments/scuffle-probe/fixtures/h264.ffprobe.json")).unwrap();
-        assert_eq!(audio.len(),if single_audio {1} else {2},"Keine erfundene VOD-Ersatzspur");
-        for wire in 0..if single_audio {1u8} else {2} {
+        assert_eq!(audio.len(),if all_failed {0} else if single_audio {1} else {2},"Keine erfundene VOD-Ersatzspur");
+        for wire in 0..if all_failed {0} else if single_audio {1u8} else {2} {
             let expected:Vec<_>=reference["packets"].as_array().unwrap().iter().filter(|packet| packet["stream_index"]==u64::from(wire)+1).map(|packet|(packet["dts"].as_u64().unwrap() as u32,packet["data_hash"].as_str().unwrap().to_owned())).collect();
             assert_eq!(audio[&wire],expected,"AAC-Rolle und Zeitlinie müssen bytegenau stimmen");
         }
         tokio::time::timeout(Duration::from_secs(3),async {while state.registry.active_count()!=0 {tokio::time::sleep(Duration::from_millis(20)).await;}}).await.unwrap();
         assert_eq!(state.registry.status(11)[0].ingest_end_reason.as_deref(),Some("ExplicitStop"));
+        if all_failed {
+            assert_eq!(state.registry.status(11)[0].state, "Fehler", "Alle Plattformausgänge sind fehlgeschlagen; die Session darf nicht erfolgreich beendet heißen");
+            assert!(state.registry.status(11)[0].error.is_some());
+        }
         let ended:serde_json::Value=http.get(format!("http://{api}/v1/me?streamer_id=11")).header("X-Relay-Auth","synthetic-api").send().await.unwrap().json().await.unwrap();
         assert!(ended["session"].is_null(), "Ein beendeter Eingang darf nicht als empfangende Session erscheinen");
         let finished:serde_json::Value=http.get(format!("http://{api}/v1/me/destinations?streamer_id=11")).header("X-Relay-Auth","synthetic-api").send().await.unwrap().json().await.unwrap();
         let healthy = finished["destinations"].as_array().unwrap().iter().find(|item| item["platform"]==healthy_platform).unwrap();
-        assert_eq!(healthy["output_state"],"finished");
+        assert_eq!(healthy["output_state"],if all_failed {"failed"} else {"finished"});
         assert!(healthy["active_profile"].is_null());
         assert!(healthy["active_audio_mode"].is_null());
     }).catch_unwind();

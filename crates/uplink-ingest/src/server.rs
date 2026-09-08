@@ -24,6 +24,8 @@ use tokio::{
     time::{Instant, sleep_until, timeout_at},
 };
 use tokio_rustls::{TlsAcceptor, rustls::ServerConfig};
+mod admission;
+use admission::SessionSlot;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AuthorizedSession {
@@ -102,6 +104,7 @@ pub enum EndReason {
     MediaTimeout,
     ProtocolTimeout,
     AuthorizationRejected,
+    SessionCapacity,
     ProtocolRejected,
     MediaRejected(MediaError),
     Backpressure,
@@ -135,7 +138,7 @@ pub struct MediaEvent {
     payload: Range<usize>,
     _budget: OwnedSemaphorePermit,
     _event_budget: OwnedSemaphorePermit,
-    _slot: Arc<OwnedSemaphorePermit>,
+    _slot: Arc<SessionSlot>,
     retention: Option<Arc<dyn Any + Send + Sync>>,
 }
 impl MediaEvent {
@@ -152,7 +155,10 @@ impl MediaEvent {
 
 #[derive(Debug, Clone)]
 pub struct IngestLimits {
+    /// Gleichzeitige autorisierte Sessions, einschließlich gehaltener Events.
     pub max_connections: usize,
+    /// Eigener Pool für TCP/TLS/RTMP vor erfolgreicher Autorisierung.
+    pub max_pending_connections: usize,
     pub max_event_bytes: usize,
     pub max_header_bytes: usize,
     pub max_tracks: usize,
@@ -176,6 +182,7 @@ impl IngestLimits {
         rtmp.amf.max_input_bytes = 16384;
         Self {
             max_connections: 4,
+            max_pending_connections: 4,
             max_event_bytes: 65536,
             max_header_bytes: 4096,
             max_tracks: 8,
@@ -192,6 +199,8 @@ impl IngestLimits {
             .map_err(|_| IngestError::InvalidLimits)?;
         if self.max_connections == 0
             || self.max_connections > Semaphore::MAX_PERMITS
+            || self.max_pending_connections == 0
+            || self.max_pending_connections > Semaphore::MAX_PERMITS
             || self.max_event_bytes == 0
             || self.max_event_bytes > self.max_queued_bytes
             || self.max_queued_bytes > u32::MAX as usize
@@ -219,6 +228,7 @@ pub struct IngestServer<A: Authorizer> {
     authorizer: Arc<A>,
     limits: IngestLimits,
     slots: Arc<Semaphore>,
+    pending_slots: Arc<Semaphore>,
     instance: [u8; 16],
     next: AtomicU64,
     loopback_only: bool,
@@ -268,6 +278,7 @@ impl<A: Authorizer> IngestServer<A> {
             tls,
             authorizer,
             slots: Arc::new(Semaphore::new(limits.max_connections)),
+            pending_slots: Arc::new(Semaphore::new(limits.max_pending_connections)),
             limits,
             instance,
             next: AtomicU64::new(1),
@@ -289,12 +300,12 @@ impl<A: Authorizer> IngestServer<A> {
         if self.loopback_only && !peer.ip().is_loopback() {
             return Err(IngestError::AcceptFailed);
         }
-        let slot = Arc::new(
-            self.slots
-                .clone()
-                .try_acquire_owned()
-                .map_err(|_| IngestError::Capacity)?,
-        );
+        let pending = self
+            .pending_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| IngestError::Capacity)?;
+        let slot = Arc::new(SessionSlot::empty());
         let counter = self
             .next
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_add(1))
@@ -322,6 +333,8 @@ impl<A: Authorizer> IngestServer<A> {
             report.clone(),
             Admission {
                 slot: slot.clone(),
+                pending,
+                sessions: self.slots.clone(),
                 start_deadline,
             },
         ));
@@ -338,7 +351,7 @@ pub struct RunningConnection {
     receiver: mpsc::Receiver<MediaEvent>,
     task: Option<JoinHandle<SessionReport>>,
     report: Arc<Mutex<SessionReport>>,
-    _slot: Arc<OwnedSemaphorePermit>,
+    _slot: Arc<SessionSlot>,
 }
 impl RunningConnection {
     pub async fn next(&mut self) -> Option<MediaEvent> {
@@ -394,7 +407,9 @@ struct Handler<A: Authorizer> {
     status: watch::Sender<Activity>,
     report: Arc<Mutex<SessionReport>>,
     event_budget: Arc<Semaphore>,
-    slot: Arc<OwnedSemaphorePermit>,
+    slot: Arc<SessionSlot>,
+    pending: Option<OwnedSemaphorePermit>,
+    session_slots: Arc<Semaphore>,
 }
 // Lebt außerhalb des RTMP-Handlers, damit der endgültige Transport-Endgrund
 // bereits feststeht, wenn die autorisierte Reservierung freigegeben wird.
@@ -586,6 +601,11 @@ impl<A: Authorizer> SessionHandler for Handler<A> {
             .completion_session
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = Some(session);
+        self.slot
+            .authorize(&self.session_slots)
+            .map_err(|()| self.reject(EndReason::SessionCapacity))?;
+        // Pending-Kapazität endet nach Auth, nicht erst beim Streamende.
+        self.pending.take();
         self.retention = self.authorizer.retention(session);
         self.status.send_replace(Activity {
             published: true,
@@ -638,7 +658,9 @@ impl<A: Authorizer> SessionHandler for Handler<A> {
 }
 
 struct Admission {
-    slot: Arc<OwnedSemaphorePermit>,
+    slot: Arc<SessionSlot>,
+    pending: OwnedSemaphorePermit,
+    sessions: Arc<Semaphore>,
     start_deadline: Instant,
 }
 
@@ -679,6 +701,8 @@ async fn run_connection<A: Authorizer>(
                 status,
                 event_budget: Arc::new(Semaphore::new(limits.max_queued_events)),
                 slot: admission.slot,
+                pending: Some(admission.pending),
+                session_slots: admission.sessions,
                 report: report.clone(),
                 limits: limits.clone(),
             };
@@ -766,7 +790,9 @@ mod tests {
             status,
             report: report.clone(),
             event_budget: Arc::new(Semaphore::new(limits.max_queued_events)),
-            slot: Arc::new(Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap()),
+            slot: Arc::new(SessionSlot::empty()),
+            pending: None,
+            session_slots: Arc::new(Semaphore::new(1)),
         };
         // Deterministic interleaving: the consumer frees the event while the
         // producer is waiting to update the report. No timing/race lottery.

@@ -1,15 +1,22 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { once } from 'node:events';
-import { readFile, writeFile, mkdir, mkdtemp, rm } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, mkdtemp, rm, lstat, realpath } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-// Optional real Chromium test. No extension or browser automation dependency;
-// CDP controls only an isolated browser profile and a loopback fixture server.
-const executable = process.argv[2];
-if (!executable) throw new Error('Aufruf: node browser-smoke.mjs /absoluter/pfad/zu/chrome-headless-shell');
+// Nur der lokal geprüfte Browserbuild; kein Programm aus CLI/ENV übernehmen.
+assert.equal(process.argv.length, 2, 'Dieser Nachweis akzeptiert keine CLI-Argumente');
+const executable = '/home/nathanael/.cache/ms-playwright/chromium_headless_shell-1234/chrome-headless-shell-linux64/chrome-headless-shell';
+const executableInfo = await lstat(executable);
+assert.ok(executableInfo.isFile() && !executableInfo.isSymbolicLink()
+  && (executableInfo.mode & 0o022) === 0, 'Chromium muss eine geschützte reguläre Datei sein');
+assert.equal(await realpath(executable), executable, 'Chromium darf nicht umgeleitet sein');
+assert.equal(createHash('sha256').update(await readFile(executable)).digest('hex'),
+  'e11fc9ce65c96313476f7ee9844b6fb6a9220fb048693cfe9eee00acf4170a9f',
+  'Chromium entspricht nicht dem geprüften Build');
 const artifacts = new URL('./artifacts/', import.meta.url);
 await mkdir(artifacts, { recursive: true });
 const profile = await mkdtemp(join(tmpdir(), 'uplink-dock-browser-'));

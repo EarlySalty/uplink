@@ -5,12 +5,15 @@ ingest_bind = "127.0.0.1:1935"
 public_ingest_url = "rtmps://ingest.example.invalid:1935/live"
 dock_base_url = "https://deutsche-deadlock-community.de/uplink"
 max_sessions = 4
+max_pending_connections = 8
 max_sessions_per_tenant = 1
 database_max_queries = 4
 request_timeout_seconds = 10
 
 [infisical]
-base_url = "http://127.0.0.1:8080"
+base_url = "http://infisical.local"
+socket_path = "/run/uplink-infisical/api.sock"
+socket_owner_uid = 0
 project_id = "PROJEKT-ID-EINTRAGEN"
 environment = "prod"
 secret_path = "/"
@@ -44,7 +47,7 @@ vod_audio_track = 1
 
 [[platforms]]
 name = "twitch"
-allowed_hosts = ["live.twitch.tv"]
+allowed_hosts = ["live.twitch.tv", "ingest.global-contribute.live-video.net"]
 allow_unencrypted = false
 video_codec = "h264"
 use_vod_audio = true

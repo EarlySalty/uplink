@@ -1119,6 +1119,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "memoffset"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
+dependencies = [
+ "autocfg",
+]
+
+[[package]]
 name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1151,6 +1160,7 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
+ "memoffset",
 ]
 
 [[package]]
@@ -2442,6 +2452,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "uplink-infisical-transport"
+version = "0.1.0"
+dependencies = [
+ "nix",
+ "reqwest",
+ "serde",
+ "tokio",
+ "toml",
+]
+
+[[package]]
 name = "uplink-ingest"
 version = "0.1.0"
 dependencies = [
@@ -2518,6 +2539,7 @@ dependencies = [
  "tower",
  "uplink-chat",
  "uplink-core",
+ "uplink-infisical-transport",
  "uplink-ingest",
  "uplink-media",
  "webpki-roots 1.0.9",

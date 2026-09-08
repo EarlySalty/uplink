@@ -25,10 +25,10 @@ Abgedeckt sind:
 
 ## Isolierter Browser
 
-Der zusätzliche Browserlauf benötigt eine vorhandene Chromium- oder Chromium-Headless-Shell-Datei als explizites Argument:
+Der zusätzliche Browserlauf verwendet ausschließlich den im Test festgelegten geschützten Chromium-Build. Er prüft Dateityp, unveränderten Pfad und SHA256; CLI-Programme oder ENV-Konfiguration werden nicht akzeptiert:
 
 ```sh
-node web/docks/tests/browser-smoke.mjs /absoluter/pfad/zu/chrome-headless-shell
+node web/docks/tests/browser-smoke.mjs
 ```
 
 Er startet ein eigenes temporäres Profil und einen lokalen HTTP-Server. Transportantworten sind ausschließlich Testdaten; es werden keine Konten verbunden, Nachrichten verschickt oder Plattformmetadaten geändert. Die echten HTML-Docks werden unter einer restriktiven CSP geladen, per DOM bedient und bei 520 × 800 Pixeln aufgenommen. Die Screenshots und der Bericht landen in `artifacts/` und werden nicht eingecheckt. Chromium-Profil und Server werden nach dem Lauf entfernt bzw. beendet.

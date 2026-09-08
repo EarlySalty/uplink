@@ -55,6 +55,41 @@ impl DestinationUpdate {
         }
         Ok(())
     }
+
+    pub fn validate_policy(&self, config: &crate::config::Config) -> Result<(), &'static str> {
+        let policy = config
+            .platforms
+            .iter()
+            .find(|policy| policy.name == self.platform)
+            .ok_or("Für das Ziel fehlt die geprüfte Plattformkonfiguration.")?;
+        if let Some(endpoint) = &self.rtmp_url {
+            runtime_endpoint(&self.platform, endpoint, policy)?;
+        }
+        Ok(())
+    }
+}
+
+/// Einheitliche Syntax-/Host-/TLS-Policy für Speichern und tatsächlichen Start.
+/// DNS-/IP-Pinning findet weiterhin unmittelbar beim Verbindungsaufbau statt.
+pub fn runtime_endpoint(
+    platform: &str,
+    endpoint: &str,
+    policy: &crate::config::PlatformConfig,
+) -> Result<String, &'static str> {
+    public_endpoint(endpoint)?;
+    let prepared = crate::media::secure_default(platform, endpoint.to_owned());
+    let url = reqwest::Url::parse(&prepared).map_err(|_| "Plattformadresse ist ungültig.")?;
+    if !url.host_str().is_some_and(|host| {
+        policy
+            .allowed_hosts
+            .iter()
+            .any(|allowed| allowed.eq_ignore_ascii_case(host))
+    }) || (url.scheme() != "rtmps" && !policy.allow_unencrypted)
+        || url.port() == Some(0)
+    {
+        return Err("Serveradresse oder Transport ist für diese Plattform nicht freigegeben.");
+    }
+    Ok(prepared)
 }
 
 /// Ausschließlich feste öffentliche RTMP-Appnamen; ein beliebiger Pfad ist
@@ -75,27 +110,11 @@ pub fn public_endpoint(endpoint: &str) -> Result<(), &'static str> {
         || url.fragment().is_some()
         || !matches!(
             url.path(),
-            "" | "/"
-                | "/app"
-                | "/app/"
-                | "/live"
-                | "/live/"
-                | "/live2"
-                | "/live2/"
-                | "/game"
-                | "/game/"
+            "/app" | "/app/" | "/live" | "/live/" | "/live2" | "/live2/" | "/game" | "/game/"
         )
         || !matches!(
             raw_path,
-            "" | "/"
-                | "/app"
-                | "/app/"
-                | "/live"
-                | "/live/"
-                | "/live2"
-                | "/live2/"
-                | "/game"
-                | "/game/"
+            "/app" | "/app/" | "/live" | "/live/" | "/live2" | "/live2/" | "/game" | "/game/"
         )
         || endpoint.contains('%')
         || endpoint.contains('\\')

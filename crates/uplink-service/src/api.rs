@@ -150,6 +150,9 @@ async fn save_destinations(
         output
             .validate()
             .map_err(|e| failure(StatusCode::BAD_REQUEST, e))?;
+        output
+            .validate_policy(&state.config)
+            .map_err(|e| failure(StatusCode::BAD_REQUEST, e))?;
         if !ids.insert(&output.platform) {
             return Err(failure(
                 StatusCode::BAD_REQUEST,
@@ -422,7 +425,7 @@ async fn me(
     })?;
     let Some(enabled) = enabled else {
         return Ok(Json(
-            json!({"enabled":false,"waitlisted":waitlisted,"ingest_key":"","public_ingest_url":state.config.public_ingest_url,"ingest_url":state.config.public_ingest_url,"service_status":service_status(&state),"capabilities":capabilities(),"srt_hint":"","session":null,"public_visible":false,"status_text":"Zugang ist noch nicht freigeschaltet.","reconnect_wait_s":0,"reconnect_wait_max_s":0,"dock_url_vorhanden":false,"dock_urls":null,"chat":[]}),
+            json!({"enabled":false,"waitlisted":waitlisted,"ingest_key":"","public_ingest_url":state.config.public_ingest_url,"ingest_url":state.config.public_ingest_url,"service_status":service_status(&state),"capabilities":capabilities(),"srt_hint":"","session":null,"public_visible":false,"status_text":"Zugang ist noch nicht freigeschaltet.","reconnect_wait_s":0,"dock_url_vorhanden":false,"dock_urls":null,"chat":[]}),
         ));
     };
     let encrypted: Option<Vec<u8>> = row.try_get(1).map_err(|_| {
@@ -513,7 +516,7 @@ async fn me(
     };
     let status = dashboard_state(&state, query.streamer_id as u64);
     Ok(Json(
-        json!({"enabled":enabled,"waitlisted":waitlisted,"ingest_key":key,"public_ingest_url":state.config.public_ingest_url,"ingest_url":state.config.public_ingest_url,"service_status":status["service_status"],"capabilities":capabilities(),"srt_hint":"","session":status["session"],"public_visible":false,"status_text":null,"reconnect_wait_s":wait,"reconnect_wait_max_s":300,"dock_url_vorhanden":!dock_urls.is_null(),"dock_urls":dock_urls,"chat":chat,"uplink_sessions":status["sessions"]}),
+        json!({"enabled":enabled,"waitlisted":waitlisted,"ingest_key":key,"public_ingest_url":state.config.public_ingest_url,"ingest_url":state.config.public_ingest_url,"service_status":status["service_status"],"capabilities":capabilities(),"srt_hint":"","session":status["session"],"public_visible":false,"status_text":null,"reconnect_wait_s":wait,"dock_url_vorhanden":!dock_urls.is_null(),"dock_urls":dock_urls,"chat":chat,"uplink_sessions":status["sessions"]}),
     ))
 }
 async fn destinations(
@@ -650,7 +653,7 @@ async fn reconnect_wait(
         ));
     }
     Ok(Json(
-        json!({"reconnect_wait_s":body.reconnect_wait_s,"reconnect_wait_max_s":300,"applied":false,"message":"Frist gespeichert. Die Wiederverbindung der neuen Medienstrecke ist noch nicht freigegeben."}),
+        json!({"reconnect_wait_s":body.reconnect_wait_s,"applied":false,"message":"Frist gespeichert. Die Wiederverbindung der neuen Medienstrecke ist noch nicht freigegeben."}),
     ))
 }
 #[derive(Deserialize)]

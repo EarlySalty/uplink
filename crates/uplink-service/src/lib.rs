@@ -3,6 +3,7 @@ pub mod chat;
 pub mod config;
 pub mod crypto;
 pub mod destinations;
+mod ingest_config;
 pub mod media;
 mod media_status;
 pub mod migrations;

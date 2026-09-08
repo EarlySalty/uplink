@@ -8,7 +8,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 use tokio::{net::TcpListener, sync::mpsc, task::JoinSet};
-use uplink_ingest::{AuthorizedSession, Authorizer, IngestLimits, IngestServer, MediaEvent};
+use uplink_ingest::{AuthorizedSession, Authorizer, IngestServer, MediaEvent};
 
 pub struct ServiceAuthorizer {
     state: Arc<ServiceState>,
@@ -99,16 +99,10 @@ pub async fn serve_with_ready<P: SessionProcessor>(
     ready: Option<tokio::sync::oneshot::Sender<(std::net::SocketAddr, std::net::SocketAddr)>>,
 ) -> Result<(), &'static str> {
     let authorizer = Arc::new(ServiceAuthorizer::new(state.clone()));
-    let mut limits = IngestLimits::local_probe();
-    limits.max_connections = state.config.max_sessions;
-    limits.max_event_bytes = state.config.media.max_event_bytes;
-    limits.max_header_bytes = (64 * 1024).min(limits.max_event_bytes);
-    limits.max_queued_bytes = state.config.media.max_queued_bytes;
-    limits.max_queued_events = state.config.media.max_queued_events;
-    limits.max_tracks = state.config.media.max_tracks;
-    limits.rtmp.chunk.max_message_bytes = limits.max_event_bytes;
-    limits.rtmp.chunk.max_partial_bytes = limits.max_event_bytes.saturating_mul(4);
-    limits.rtmp.max_read_buffer_bytes = limits.max_event_bytes.saturating_mul(2);
+    let http_shutdown_grace = std::time::Duration::from_secs(state.config.request_timeout_seconds)
+        + crate::store::CLEANUP_GRACE
+        + std::time::Duration::from_secs(1);
+    let limits = state.config.ingest_limits()?;
     let ingest = IngestServer::bind_tls(state.config.ingest_bind, tls, authorizer.clone(), limits)
         .await
         .map_err(|_| "RTMPS-Eingang konnte nicht starten.")?;
@@ -228,7 +222,7 @@ pub async fn serve_with_ready<P: SessionProcessor>(
     if let Some(hub) = &chat {
         hub.shutdown().await;
     }
-    match tokio::time::timeout(std::time::Duration::from_secs(5), &mut http).await {
+    match tokio::time::timeout(http_shutdown_grace, &mut http).await {
         Ok(Ok(Ok(()))) if drained => Ok(()),
         _ => {
             http.abort();

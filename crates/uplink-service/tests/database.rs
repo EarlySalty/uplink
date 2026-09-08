@@ -38,6 +38,37 @@ use database::{Database, fixture};
 
 #[tokio::test]
 #[ignore = "Benötigt isolierte PostgreSQL-16-Testinstanz."]
+async fn destination_save_enforces_its_platform_transport_policy() {
+    let (database, state) = fixture().await;
+    for endpoint in [
+        "rtmps://a.rtmps.youtube.com/live2",
+        "rtmp://live.twitch.tv:1234/app",
+        "rtmps://live.twitch.tv/",
+    ] {
+        let body = serde_json::json!({"streamer_id":11,"destinations":[{"platform":"twitch","rtmp_url":endpoint,"stream_key":"synthetic-key"}]}).to_string();
+        let response = router(state.clone())
+            .oneshot(request("PUT", "/v1/me/destinations", body))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "Speichern darf einen vom normalen Pusher abgelehnten Zielvertrag nicht bestätigen"
+        );
+    }
+    let count: i64 = state
+        .store
+        .query("SELECT count(*) FROM relay.destinations", &[])
+        .await
+        .unwrap()[0]
+        .get(0);
+    assert_eq!(count, 0);
+    drop(state);
+    database.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "Benötigt isolierte PostgreSQL-16-Testinstanz."]
 async fn explicit_twitch_audio_choice_survives_omitted_updates() {
     let (database, state) = fixture().await;
     let response = router(state.clone()).oneshot(request("PUT", "/v1/me/destinations", r#"{"streamer_id":11,"destinations":[{"platform":"twitch","connection_generation":1,"rtmp_url":"rtmps://live.twitch.tv/app","stream_key":"synthetic","twitch_audio_mode":"live"}]}"#)).await.unwrap();
@@ -419,6 +450,10 @@ async fn profile_disconnect_waits_for_source_end_and_reconnect_setting_stays_a_w
         serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
     assert_eq!(body["reconnect_wait_s"], 123);
     assert_eq!(body["applied"], false);
+    assert!(
+        body.get("reconnect_wait_max_s").is_none(),
+        "Eine unbekannte Produktgrenze darf nicht als 300 Sekunden beworben werden"
+    );
     database.stop().await;
 }
 
@@ -1233,6 +1268,9 @@ async fn rejected_media_after_valid_prelude_stays_failed_in_session_status() {
     database.stop().await;
 }
 
+#[path = "support/infisical.rs"]
+mod infisical;
+
 async fn executable_smoke(database: &Database) {
     use std::{
         io::{Seek, SeekFrom, Write},
@@ -1273,9 +1311,7 @@ async fn executable_smoke(database: &Database) {
             }
         }),
     );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let provider = tokio::spawn(async { axum::serve(listener, app).await.unwrap() });
+    let provider = infisical::InfisicalMock::start(app);
     let mut config: toml::Value =
         toml::from_str(include_str!("../../../config/uplink-beispiel.toml")).unwrap();
     config.as_table_mut().unwrap().insert(
@@ -1285,7 +1321,9 @@ async fn executable_smoke(database: &Database) {
     config["api_bind"] = toml::Value::String("127.0.0.1:0".into());
     config["ingest_bind"] = toml::Value::String("127.0.0.1:0".into());
     config["public_ingest_url"] = toml::Value::String("rtmps://localhost/live".into());
-    config["infisical"]["base_url"] = toml::Value::String(format!("http://{address}"));
+    config["infisical"]["socket_path"] =
+        toml::Value::String(provider.path.to_str().unwrap().into());
+    config["infisical"]["socket_owner_uid"] = toml::Value::Integer(provider.owner.into());
     config["infisical"]["credential_fd"] = toml::Value::Integer(identity.as_raw_fd().into());
     config["media"]["ffmpeg"] = toml::Value::String("/usr/bin/ffmpeg".into());
     config["media"]["ffprobe"] = toml::Value::String("/usr/bin/ffprobe".into());
@@ -1363,8 +1401,7 @@ async fn executable_smoke(database: &Database) {
             .unwrap()
             .success()
     );
-    provider.abort();
-    let _ = provider.await;
+    drop(provider);
 }
 
 #[tokio::test]
@@ -1992,7 +2029,7 @@ async fn destination_fence_rejects_old_delete_and_rolls_back_mixed_generation_ba
             .status(),
         StatusCode::CONFLICT
     );
-    let batch = r#"{"streamer_id":11,"destinations":[{"platform":"kick","connection_generation":5,"rtmp_url":"rtmps://ingest.kick.com/app","stream_key":"synthetic-c"},{"platform":"twitch","connection_generation":2,"stream_key":"synthetic-stale"}]}"#;
+    let batch = r#"{"streamer_id":11,"destinations":[{"platform":"kick","connection_generation":5,"rtmp_url":"rtmps://live-video.net/app","stream_key":"synthetic-c"},{"platform":"twitch","connection_generation":2,"stream_key":"synthetic-stale"}]}"#;
     assert_eq!(
         app.clone()
             .oneshot(request("PUT", "/v1/me/destinations", batch))

@@ -1,6 +1,66 @@
 use uplink_service::{config::Config, crypto::Secret, registry::Registry};
 
 #[test]
+fn advertised_dock_addresses_require_an_usable_public_origin() {
+    let example = include_str!("../../../config/uplink-beispiel.toml");
+    for address in [
+        "https://",
+        "https://user:password@example.invalid/uplink",
+        "https://example.invalid/uplink?token=unused",
+        "https://example.invalid/uplink#fragment",
+    ] {
+        let mut config: toml::Value = toml::from_str(example).unwrap();
+        config["dock_base_url"] = toml::Value::String(address.into());
+        assert!(
+            Config::parse(&toml::to_string(&config).unwrap()).is_err(),
+            "Ungültige Dockadresse darf keinen erfolgreichen Konfigurationscheck erhalten"
+        );
+    }
+}
+
+#[test]
+fn parser_allocations_are_part_of_the_global_ingest_budget() {
+    let mut config: toml::Value =
+        toml::from_str(include_str!("../../../config/uplink-beispiel.toml")).unwrap();
+    config["max_sessions"] = 64.into();
+    config["media"]["max_event_bytes"] = (16 * 1024 * 1024).into();
+    config["media"]["max_queued_bytes"] = (16 * 1024 * 1024).into();
+    assert!(
+        Config::parse(&toml::to_string(&config).unwrap()).is_err(),
+        "1 GiB Queues plus mehrere GiB Parser dürfen das globale Limit nicht umgehen"
+    );
+}
+
+#[test]
+fn root_only_destinations_have_no_publishable_app() {
+    for address in [
+        "rtmps://live.twitch.tv/",
+        "rtmps://live.twitch.tv",
+        "rtmp://example.invalid/",
+    ] {
+        assert!(uplink_service::destinations::public_endpoint(address).is_err());
+    }
+}
+
+#[test]
+fn media_engine_and_ingest_use_the_same_explicit_byte_and_event_limits() {
+    let mut config = Config::parse(include_str!("../../../config/uplink-beispiel.toml")).unwrap();
+    config.media.max_event_bytes = 4 * 1024 * 1024;
+    config.media.max_queued_bytes = 12 * 1024 * 1024;
+    config.media.max_queued_events = 1024;
+    let media = config.media_limits();
+    let ingest = config.ingest_limits().unwrap();
+    assert_eq!(media.max_tag_bytes, ingest.max_event_bytes);
+    assert_eq!(media.queue_bytes, ingest.max_queued_bytes);
+    assert_eq!(media.queue_events, ingest.max_queued_events);
+    assert_eq!(ingest.max_connections, config.max_sessions);
+    assert_eq!(
+        ingest.max_pending_connections,
+        config.max_pending_connections
+    );
+}
+
+#[test]
 fn isolated_ingest_scope_requires_one_positive_explicit_identity() {
     let example = include_str!("../../../config/uplink-beispiel.toml");
     let valid = format!("{example}\n[test_ingest]\nallowed_streamer_ids = [11]\n");

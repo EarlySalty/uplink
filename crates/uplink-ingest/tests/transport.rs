@@ -13,6 +13,30 @@ struct Auth {
     allow: bool,
 }
 
+#[tokio::test]
+async fn silent_pending_handshake_does_not_consume_authorized_session_capacity() {
+    let mut limits = IngestLimits::local_probe();
+    limits.max_connections = 1;
+    let (server, config) = server(true, limits).await;
+    let silent_peer = TcpStream::connect(server.local_addr().unwrap())
+        .await
+        .unwrap();
+    let silent = server.accept().await.unwrap();
+    let (mut legitimate, mut peer) = connect(&server, config).await;
+    publish(&mut peer).await;
+    message(&mut peer, 8, 0, 1, &[0xaf, 0, 0x11, 0x90]).await;
+    let event = timeout(Duration::from_secs(2), legitimate.next())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(event.payload(), &[0x11, 0x90]);
+    drop(silent);
+    drop(silent_peer);
+    end(&mut peer).await;
+    assert!(legitimate.next().await.is_none());
+    assert_eq!(legitimate.finish().await.reason, EndReason::ExplicitStop);
+}
+
 struct LeaseAuth {
     released: std::sync::atomic::AtomicUsize,
     completed: std::sync::Mutex<Vec<EndReason>>,
@@ -451,6 +475,7 @@ async fn tls_start_deadline_and_handshake_eof_are_distinct() {
 async fn cancelled_finish_closes_silent_producer_and_releases_connection_slot() {
     let mut limits = IngestLimits::local_probe();
     limits.max_connections = 1;
+    limits.max_pending_connections = 1;
     limits.start_timeout = Duration::from_secs(60);
     let (server, config) = server(true, limits).await;
     let mut silent = TcpStream::connect(server.local_addr().unwrap())
@@ -517,9 +542,9 @@ async fn retained_events_exhaust_byte_budget_without_unbounded_queue() {
 }
 
 #[tokio::test]
-async fn connection_capacity_is_reserved_before_tls_work() {
+async fn pending_capacity_is_reserved_before_tls_work() {
     let mut limits = IngestLimits::local_probe();
-    limits.max_connections = 1;
+    limits.max_pending_connections = 1;
     let (server, _) = server(true, limits).await;
     let _one = TcpStream::connect(server.local_addr().unwrap())
         .await
@@ -537,22 +562,67 @@ async fn completed_session_keeps_reservation_until_last_event_is_released() {
     let mut limits = IngestLimits::local_probe();
     limits.max_connections = 1;
     let (server, config) = server(true, limits).await;
-    let (mut connection, mut client) = connect(&server, config).await;
+    let (mut connection, mut client) = connect(&server, config.clone()).await;
     publish(&mut client).await;
     message(&mut client, 8, 0, 1, &[0xaf, 0, 0x11, 0x90]).await;
     let retained = connection.next().await.unwrap();
     end(&mut client).await;
     assert!(connection.next().await.is_none());
     assert_eq!(connection.finish().await.reason, EndReason::ExplicitStop);
-    let _blocked = TcpStream::connect(server.local_addr().unwrap())
-        .await
-        .unwrap();
-    assert!(matches!(server.accept().await, Err(IngestError::Capacity)));
+    let (mut blocked, mut rejected_peer) = connect(&server, config.clone()).await;
+    publish(&mut rejected_peer).await;
+    assert!(
+        timeout(Duration::from_secs(2), blocked.next())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(blocked.finish().await.reason, EndReason::SessionCapacity);
     drop(retained);
-    let _accepted = TcpStream::connect(server.local_addr().unwrap())
+    let (mut accepted, mut peer) = connect(&server, config).await;
+    publish(&mut peer).await;
+    message(&mut peer, 8, 0, 1, &[0xaf, 0, 0x11, 0x90]).await;
+    assert!(accepted.next().await.is_some());
+}
+
+#[tokio::test]
+async fn authorization_releases_pending_slot_while_media_session_stays_active() {
+    let mut limits = IngestLimits::local_probe();
+    limits.max_pending_connections = 1;
+    limits.max_connections = 2;
+    let (server, config) = server(true, limits).await;
+    let (mut one, mut peer_one) = connect(&server, config.clone()).await;
+    publish(&mut peer_one).await;
+    message(&mut peer_one, 8, 0, 1, &[0xaf, 0, 0x11, 0x90]).await;
+    let _retained = one.next().await.unwrap();
+    let (mut two, mut peer_two) = connect(&server, config).await;
+    publish(&mut peer_two).await;
+    message(&mut peer_two, 8, 0, 1, &[0xaf, 0, 0x11, 0x90]).await;
+    assert!(two.next().await.is_some());
+}
+
+#[tokio::test]
+async fn timed_out_pending_connection_releases_pool_before_consumer_drop() {
+    let mut limits = IngestLimits::local_probe();
+    limits.max_pending_connections = 1;
+    limits.start_timeout = Duration::from_millis(40);
+    let (server, _) = server(true, limits).await;
+    let _peer = TcpStream::connect(server.local_addr().unwrap())
         .await
         .unwrap();
-    drop(server.accept().await.unwrap());
+    let mut timed_out = server.accept().await.unwrap();
+    assert!(
+        timeout(Duration::from_secs(2), timed_out.next())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let _replacement_peer = TcpStream::connect(server.local_addr().unwrap())
+        .await
+        .unwrap();
+    let replacement = server.accept().await.unwrap();
+    assert_eq!(timed_out.finish().await.reason, EndReason::StartTimeout);
+    drop(replacement);
 }
 
 #[tokio::test]
