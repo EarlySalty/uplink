@@ -1,0 +1,28 @@
+[package]
+name = "uplink-media"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+bytes = "1.11"
+getrandom = "0.4"
+serde.workspace = true
+serde_json = "1.0"
+tokio = { version = "1.49", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
+uplink-core = { path = "../uplink-core" }
+uplink-ingest = { path = "../uplink-ingest" }
+url = "2.5"
+zeroize = "1.8"
+scuffle-rtmp = { path = "../../third_party/scuffle-rtmp" }
+scuffle-amf0 = { path = "../../third_party/scuffle-amf" }
+tokio-rustls = { version = "0.26.5", default-features = false, features = ["ring", "tls12"] }
+webpki-roots = "1.0"
+
+[dev-dependencies]
+rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "ring", "pem"] }
+sha2 = "0.10"
+
+[lints]
+workspace = true

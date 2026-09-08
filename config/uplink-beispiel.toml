@@ -1,0 +1,63 @@
+# Technische Startkonfiguration. Kein Plattform- oder Kapazitätsnachweis.
+api_bind = "127.0.0.1:8892"
+ingest_bind = "127.0.0.1:8893"
+public_ingest_url = "rtmps://deutsche-deadlock-community.de:443/live"
+dock_base_url = "https://deutsche-deadlock-community.de/uplink"
+max_sessions = 4
+max_sessions_per_tenant = 1
+database_max_queries = 4
+request_timeout_seconds = 10
+
+[infisical]
+base_url = "http://127.0.0.1:8080"
+project_id = "PROJEKT-ID-EINTRAGEN"
+environment = "prod"
+secret_path = "/"
+# Vom vorhandenen autorisierten Startprozess geöffneter FD; keine neue Datei.
+credential_fd = 5
+
+[tls]
+# Nur Namen; Bereitstellung und Erneuerung müssen vor Start eingerichtet sein.
+source = "infisical"
+certificate_secret = "UPLINK_TLS_CERTIFICATE"
+private_key_secret = "UPLINK_TLS_PRIVATE_KEY"
+
+[media]
+ffmpeg = "/opt/uplink/media/ffmpeg"
+ffprobe = "/opt/uplink/media/ffprobe"
+work_directory = "/run/user/1000/uplink-media"
+max_event_bytes = 2097152
+max_queued_bytes = 16777216
+max_queued_events = 512
+max_tracks = 8
+# Explizite Quellzuordnung, keine aus dem Codec erratene Audio-Rolle.
+live_audio_track = 0
+vod_audio_track = 1
+
+[[platforms]]
+name = "twitch"
+allowed_hosts = ["live.twitch.tv"]
+allow_unencrypted = false
+video_codec = "h264"
+use_vod_audio = true
+
+[[platforms]]
+name = "kick"
+allowed_hosts = ["live-video.net"]
+allow_unencrypted = false
+video_codec = "h264"
+use_vod_audio = false
+
+[[platforms]]
+name = "youtube"
+allowed_hosts = ["a.rtmps.youtube.com", "b.rtmps.youtube.com"]
+allow_unencrypted = false
+video_codec = "h264"
+use_vod_audio = false
+
+[[platforms]]
+name = "tiktok"
+allowed_hosts = ["tiktok.com"]
+allow_unencrypted = false
+video_codec = "h264"
+use_vod_audio = false

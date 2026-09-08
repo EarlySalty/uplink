@@ -5,6 +5,7 @@ use scuffle_rtmp::session::server::{
     ServerSession, ServerSessionError, SessionData, SessionHandler,
 };
 use std::{
+    any::Any,
     collections::HashMap,
     future::Future,
     net::{Ipv4Addr, SocketAddr},
@@ -30,6 +31,12 @@ pub struct AuthorizedSession {
     session: NonZeroU64,
 }
 impl AuthorizedSession {
+    pub fn tenant_id(self) -> u64 {
+        self.tenant.get()
+    }
+    pub fn session_id(self) -> u64 {
+        self.session.get()
+    }
     pub fn new(tenant: u64, session: u64) -> Result<Self, IngestError> {
         Ok(Self {
             tenant: NonZeroU64::new(tenant).ok_or(IngestError::InvalidIdentity)?,
@@ -46,6 +53,18 @@ pub trait Authorizer: Send + Sync + 'static {
         app: &str,
         stream: &str,
     ) -> impl Future<Output = Result<AuthorizedSession, ()>> + Send;
+    /// Synchroner, kurzer Abschluss jeder erfolgreichen Autorisierung, auch bei
+    /// Taskabbruch. Verbraucher halten benötigte eigene Reservationsanteile.
+    fn release(&self, _session: AuthorizedSession) {}
+    /// Genau ein kurzer, synchroner Abschluss vor release, auch ohne Medien.
+    /// Nur erfolgreich autorisierte Sessions werden zugeordnet. Bei Taskabbruch
+    /// bleibt ein bereits belegter Fehler erhalten, sonst lautet er TaskFailed.
+    fn completed(&self, _session: AuthorizedSession, _report: &SessionReport) {}
+    /// Optionaler, nicht serialisierbarer Reservationsanteil. Handler und alle
+    /// weitergereichten Medien halten ihn bis zum letzten Verbraucher.
+    fn retention(&self, _session: AuthorizedSession) -> Option<Arc<dyn Any + Send + Sync>> {
+        None
+    }
 }
 
 /// Frische Serverinstanz (128 Bit Zufall) plus nicht wiederverwendbarer Zähler.
@@ -117,8 +136,12 @@ pub struct MediaEvent {
     _budget: OwnedSemaphorePermit,
     _event_budget: OwnedSemaphorePermit,
     _slot: Arc<OwnedSemaphorePermit>,
+    retention: Option<Arc<dyn Any + Send + Sync>>,
 }
 impl MediaEvent {
+    pub fn authorization_retention(&self) -> Option<Arc<dyn Any + Send + Sync>> {
+        self.retention.clone()
+    }
     pub fn payload(&self) -> &[u8] {
         &self.body[self.payload.clone()]
     }
@@ -198,6 +221,7 @@ pub struct IngestServer<A: Authorizer> {
     slots: Arc<Semaphore>,
     instance: [u8; 16],
     next: AtomicU64,
+    loopback_only: bool,
 }
 impl<A: Authorizer> IngestServer<A> {
     /// Eine öffentliche Adresse kann mit dieser API absichtlich nicht gewählt werden.
@@ -207,10 +231,36 @@ impl<A: Authorizer> IngestServer<A> {
         authorizer: Arc<A>,
         limits: IngestLimits,
     ) -> Result<Self, IngestError> {
+        Self::bind(
+            (Ipv4Addr::LOCALHOST, port).into(),
+            tls,
+            authorizer,
+            limits,
+            true,
+        )
+        .await
+    }
+    /// Explizite TLS-Bindung für den autorisierten Dienst. TLS und Authorizer
+    /// müssen vor dem Öffnen bereitstehen; alle Admission-Grenzen bleiben aktiv.
+    pub async fn bind_tls(
+        address: SocketAddr,
+        tls: Arc<ServerConfig>,
+        authorizer: Arc<A>,
+        limits: IngestLimits,
+    ) -> Result<Self, IngestError> {
+        Self::bind(address, tls, authorizer, limits, false).await
+    }
+    async fn bind(
+        address: SocketAddr,
+        tls: Arc<ServerConfig>,
+        authorizer: Arc<A>,
+        limits: IngestLimits,
+        loopback_only: bool,
+    ) -> Result<Self, IngestError> {
         limits.validate()?;
         let mut instance = [0; 16];
         getrandom::fill(&mut instance).map_err(|_| IngestError::RandomUnavailable)?;
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port))
+        let listener = TcpListener::bind(address)
             .await
             .map_err(|_| IngestError::BindFailed)?;
         Ok(Self {
@@ -221,6 +271,7 @@ impl<A: Authorizer> IngestServer<A> {
             limits,
             instance,
             next: AtomicU64::new(1),
+            loopback_only,
         })
     }
     pub fn local_addr(&self) -> Result<SocketAddr, IngestError> {
@@ -235,7 +286,7 @@ impl<A: Authorizer> IngestServer<A> {
             .await
             .map_err(|_| IngestError::AcceptFailed)?;
         let start_deadline = Instant::now() + self.limits.start_timeout;
-        if !peer.ip().is_loopback() {
+        if self.loopback_only && !peer.ip().is_loopback() {
             return Err(IngestError::AcceptFailed);
         }
         let slot = Arc::new(
@@ -330,9 +381,11 @@ struct TrackState {
     last_dts: Option<u32>,
     ended: bool,
 }
-struct Handler<A> {
+struct Handler<A: Authorizer> {
     authorizer: Arc<A>,
+    retention: Option<Arc<dyn Any + Send + Sync>>,
     session: Option<(u32, AuthorizedSession)>,
+    completion_session: Arc<Mutex<Option<AuthorizedSession>>>,
     generation: ConnectionGeneration,
     tracks: HashMap<WireTrack, TrackState>,
     limits: IngestLimits,
@@ -342,6 +395,35 @@ struct Handler<A> {
     report: Arc<Mutex<SessionReport>>,
     event_budget: Arc<Semaphore>,
     slot: Arc<OwnedSemaphorePermit>,
+}
+// Lebt außerhalb des RTMP-Handlers, damit der endgültige Transport-Endgrund
+// bereits feststeht, wenn die autorisierte Reservierung freigegeben wird.
+struct AuthorizationCompletion<A: Authorizer> {
+    authorizer: Arc<A>,
+    session: Arc<Mutex<Option<AuthorizedSession>>>,
+    report: Arc<Mutex<SessionReport>>,
+    finished: bool,
+}
+impl<A: Authorizer> Drop for AuthorizationCompletion<A> {
+    fn drop(&mut self) {
+        let session = self
+            .session
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        if let Some(session) = session {
+            let mut report = self
+                .report
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone();
+            if !self.finished && report.reason == EndReason::ProtocolRejected {
+                report.reason = EndReason::TaskFailed;
+            }
+            self.authorizer.completed(session, &report);
+            self.authorizer.release(session);
+        }
+    }
 }
 #[derive(Clone, Copy)]
 struct Activity {
@@ -461,6 +543,7 @@ impl<A: Authorizer> Handler<A> {
             _budget: permit,
             _event_budget: event_permit,
             _slot: self.slot.clone(),
+            retention: self.retention.clone(),
         };
         self.sender.try_send(event).map_err(|error| {
             self.reject(match error {
@@ -499,6 +582,11 @@ impl<A: Authorizer> SessionHandler for Handler<A> {
             .await
             .map_err(|()| self.reject(EndReason::AuthorizationRejected))?;
         self.session = Some((stream_id, session));
+        *self
+            .completion_session
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(session);
+        self.retention = self.authorizer.retention(session);
         self.status.send_replace(Activity {
             published: true,
             last_media: Instant::now(),
@@ -563,6 +651,12 @@ async fn run_connection<A: Authorizer>(
     report: Arc<Mutex<SessionReport>>,
     admission: Admission,
 ) -> SessionReport {
+    let mut completion = AuthorizationCompletion {
+        authorizer: authorizer.clone(),
+        session: Arc::new(Mutex::new(None)),
+        report: report.clone(),
+        finished: false,
+    };
     let deadline = admission.start_deadline;
     let reason = match timeout_at(deadline, TlsAcceptor::from(tls).accept(socket)).await {
         Err(_) => EndReason::StartTimeout,
@@ -575,7 +669,9 @@ async fn run_connection<A: Authorizer>(
             let generation = report.lock().unwrap_or_else(|e| e.into_inner()).generation;
             let handler = Handler {
                 authorizer,
+                retention: None,
                 session: None,
+                completion_session: completion.session.clone(),
                 generation,
                 tracks: HashMap::new(),
                 budget: Arc::new(Semaphore::new(limits.max_queued_bytes)),
@@ -619,6 +715,8 @@ async fn run_connection<A: Authorizer>(
     };
     let mut final_report = report.lock().unwrap_or_else(|e| e.into_inner()).clone();
     final_report.reason = reason;
+    *report.lock().unwrap_or_else(|error| error.into_inner()) = final_report.clone();
+    completion.finished = true;
     final_report
 }
 
@@ -657,7 +755,9 @@ mod tests {
         });
         let mut handler = Handler {
             authorizer: Arc::new(UnusedAuthorizer),
+            retention: None,
             session: Some((1, AuthorizedSession::new(1, 1).unwrap())),
+            completion_session: Arc::new(Mutex::new(None)),
             generation,
             tracks: HashMap::new(),
             limits: limits.clone(),
