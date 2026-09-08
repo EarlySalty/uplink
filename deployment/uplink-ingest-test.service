@@ -1,0 +1,19 @@
+[Unit]
+Description=Uplink isolierter RTMPS-Eingangstest
+After=rs-relay.service
+BindsTo=rs-relay.service
+
+[Service]
+Type=simple
+ExecStart=/opt/uplink/ingest-test/start
+WorkingDirectory=/opt/uplink/ingest-test
+Restart=on-failure
+RestartSec=30
+TimeoutStopSec=30
+NoNewPrivileges=yes
+UMask=0077
+TasksMax=64
+MemoryMax=256M
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,38 @@
+# Isolierter Eingangsnachweis: keine Ausgänge und keine schreibende API.
+api_bind = "127.0.0.1:8895"
+ingest_bind = "0.0.0.0:8893"
+public_ingest_url = "rtmps://deutsche-deadlock-community.de:8893/live"
+dock_base_url = "https://deutsche-deadlock-community.de/uplink"
+max_sessions = 4
+max_sessions_per_tenant = 1
+database_max_queries = 2
+request_timeout_seconds = 10
+tls_reload_seconds = 60
+platforms = []
+
+[test_ingest]
+# Wird ausschließlich aus der eindeutig vorhandenen autorisierten Twitch-Zuordnung gesetzt.
+allowed_streamer_ids = [TEST_STREAMER_ID]
+
+[infisical]
+base_url = "http://127.0.0.1:8080"
+project_id = "2f5df3ca-12e5-4ae1-abf2-ca7fbd841705"
+environment = "prod"
+secret_path = "/"
+credential_fd = 5
+
+[tls]
+source = "infisical"
+certificate_secret = "UPLINK_TLS_CERTIFICATE"
+private_key_secret = "UPLINK_TLS_PRIVATE_KEY"
+
+[media]
+ffmpeg = "/opt/uplink/media/ffmpeg8-c733b4b2/ffmpeg"
+ffprobe = "/opt/uplink/media/ffmpeg8-c733b4b2/ffprobe"
+work_directory = "/run/user/1000/uplink-ingest-test-media"
+max_event_bytes = 2097152
+max_queued_bytes = 16777216
+max_queued_events = 512
+max_tracks = 8
+live_audio_track = 0
+vod_audio_track = 1

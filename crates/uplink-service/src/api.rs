@@ -14,6 +14,7 @@ pub struct ServiceState {
     pub store: Arc<Store>,
     pub secrets: Arc<ServiceSecrets>,
     pub registry: Registry,
+    pub tls: Option<Arc<crate::tls_reload::ReloadingTls>>,
 }
 #[derive(Deserialize)]
 pub struct TenantQuery {
@@ -31,7 +32,10 @@ fn authorize(
     let candidate = headers
         .get("X-Relay-Auth")
         .map_or(&[][..], |v| v.as_bytes());
-    if !state.secrets.api.matches(candidate) || tenant <= 0 {
+    if !state.secrets.api.matches(candidate)
+        || tenant <= 0
+        || !state.config.permits_tenant(tenant as u64)
+    {
         return Err(failure(
             StatusCode::UNAUTHORIZED,
             "Zugriff wurde abgewiesen.",
@@ -42,16 +46,22 @@ fn authorize(
 pub fn router(state: Arc<ServiceState>) -> Router {
     let timeout_seconds = state.config.request_timeout_seconds;
     let slots = Arc::new(tokio::sync::Semaphore::new(32));
-    Router::new()
+    let routes = Router::new()
         .route("/v1/health", get(health))
         .route("/v1/me", get(me))
-        .route(
-            "/v1/me/destinations",
-            get(destinations).put(save_destinations),
-        )
-        .route("/v1/me/status", get(status))
-        .route("/v1/me/waitlist", post(waitlist))
-        .route("/v1/me/key/rotate", post(rotate_key))
+        .route("/v1/me/status", get(status));
+    let routes = if state.config.test_ingest.is_some() {
+        routes.route("/v1/me/destinations", get(destinations))
+    } else {
+        routes
+            .route(
+                "/v1/me/destinations",
+                get(destinations).put(save_destinations),
+            )
+            .route("/v1/me/waitlist", post(waitlist))
+            .route("/v1/me/key/rotate", post(rotate_key))
+    };
+    routes
         .layer(DefaultBodyLimit::max(32 * 1024))
         .layer(axum::middleware::from_fn(
             move |request: axum::extract::Request, next: axum::middleware::Next| {
@@ -238,7 +248,9 @@ async fn rotate_key(
     ))
 }
 async fn health(State(state): State<Arc<ServiceState>>) -> (StatusCode, Json<Value>) {
-    let ready = state.store.ready().await;
+    let database_ready = state.store.ready().await;
+    let tls_ready = state.tls.as_ref().is_none_or(|tls| tls.ready());
+    let ready = database_ready && tls_ready;
     (
         if ready {
             StatusCode::OK
@@ -246,7 +258,10 @@ async fn health(State(state): State<Arc<ServiceState>>) -> (StatusCode, Json<Val
             StatusCode::SERVICE_UNAVAILABLE
         },
         Json(
-            json!({"ok":ready,"service":"uplink", "active_sessions":state.registry.active_count()}),
+            json!({"ok":ready,"service":"uplink", "active_sessions":state.registry.active_count(),
+                "database_ready":database_ready,"tls_ready":tls_ready,
+                "tls_refresh_failed":state.tls.as_ref().is_some_and(|tls|tls.refresh_failed()),
+                "ingest_test":state.config.test_ingest.is_some()}),
         ),
     )
 }

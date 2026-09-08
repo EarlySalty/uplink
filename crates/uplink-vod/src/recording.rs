@@ -442,6 +442,7 @@ async fn record(
                     WireCodec::Aac => "aac",
                     WireCodec::Av1 => "av1",
                     WireCodec::H264 => "h264",
+                    WireCodec::Hevc => "hevc",
                 }
                 .into(),
                 configuration_revision: packet.configuration_revision,

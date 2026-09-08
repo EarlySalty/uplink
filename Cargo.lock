@@ -2409,6 +2409,7 @@ dependencies = [
  "bytes",
  "getrandom 0.4.3",
  "rcgen",
+ "reqwest",
  "scuffle-amf0",
  "scuffle-rtmp",
  "serde",
@@ -2420,6 +2421,19 @@ dependencies = [
  "uplink-ingest",
  "url",
  "webpki-roots",
+ "zeroize",
+]
+
+[[package]]
+name = "uplink-platform-probe"
+version = "0.1.0"
+dependencies = [
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "uplink-media",
+ "uplink-service",
  "zeroize",
 ]
 
@@ -2449,6 +2463,24 @@ dependencies = [
  "uplink-core",
  "uplink-ingest",
  "uplink-media",
+ "webpki-roots",
+ "zeroize",
+]
+
+[[package]]
+name = "uplink-tls-provider"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "nix",
+ "rcgen",
+ "reqwest",
+ "rustls",
+ "rustls-pki-types",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml",
  "webpki-roots",
  "zeroize",
 ]

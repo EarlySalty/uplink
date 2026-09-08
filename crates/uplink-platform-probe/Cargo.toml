@@ -1,0 +1,18 @@
+[package]
+name = "uplink-platform-probe"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+serde.workspace = true
+serde_json = "1"
+tokio = { version = "1.49", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "time"] }
+uplink-media = { path = "../uplink-media" }
+uplink-service = { path = "../uplink-service" }
+zeroize = "1"
+
+[lints]
+workspace = true

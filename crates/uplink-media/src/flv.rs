@@ -56,6 +56,7 @@ impl FlvTag {
             8 if self.body[0] >> 4 == 10 => self.body.get(1) == Some(&0),
             8 if self.body[0] == 0x95 => self.body.get(1) == Some(&0),
             9 if self.body[0] & 0x80 == 0 => self.body.get(1) == Some(&0),
+            9 if self.body[0] & 0x0f == 6 => self.body.get(1) == Some(&0),
             9 => self.body[0] & 0x0f == 0,
             _ => false,
         }
@@ -103,6 +104,9 @@ impl FlvTag {
             if self.body[0] & 15 != 7 || self.body[1] > 2 {
                 return Err(MediaError::UnsupportedProfile);
             }
+            if track == 0 {
+                return Ok(self.clone());
+            }
             body.push(self.body[1]); // OneTrack, ursprünglicher Pakettyp
             body.extend_from_slice(b"avc1");
             body.push(track);
@@ -112,8 +116,26 @@ impl FlvTag {
             body.extend_from_slice(&self.body[5..]);
         } else {
             let packet_type = self.body[0] & 15;
+            if packet_type == 6 {
+                if self.body.len() < 7
+                    || self.body[1] > 4
+                    || ![b"avc1", b"hvc1", b"av01"].contains(
+                        &self.body[2..6]
+                            .try_into()
+                            .map_err(|_| MediaError::InvalidMedia)?,
+                    )
+                {
+                    return Err(MediaError::UnsupportedProfile);
+                }
+                let mut remapped = self.body.to_vec();
+                remapped[6] = track;
+                return Self::new(9, self.timestamp_ms, remapped.into(), max_bytes);
+            }
             if packet_type > 4 {
                 return Err(MediaError::UnsupportedProfile);
+            }
+            if track == 0 {
+                return Ok(self.clone());
             }
             body.push(packet_type);
             body.extend_from_slice(&self.body[1..5]);
@@ -260,6 +282,28 @@ mod tests {
         assert_eq!(
             video.with_video_track(4, 64).unwrap().body(),
             b"\xa6\x01avc1\x04\xff\xff\xffabc"
+        );
+    }
+    #[test]
+    fn existing_multivideo_remaps_only_wire_id_and_preserves_cts() {
+        let tag = FlvTag::new(
+            9,
+            137,
+            Arc::from(&b"\xa6\x01hvc1\x07\xff\xff\xfeopaque"[..]),
+            64,
+        )
+        .unwrap();
+        assert_eq!(
+            tag.with_video_track(12, 64).unwrap().body(),
+            b"\xa6\x01hvc1\x0c\xff\xff\xfeopaque"
+        );
+        let header = FlvTag::new(9, 0, Arc::from(&b"\x96\x00hvc1\x07opaque"[..]), 64).unwrap();
+        assert!(header.is_sequence_header());
+        let legacy =
+            FlvTag::new(9, 137, Arc::from(&b"\x27\x01\xff\xff\xfeopaque"[..]), 64).unwrap();
+        assert_eq!(
+            legacy.with_video_track(0, 64).unwrap().body(),
+            legacy.body()
         );
     }
 }

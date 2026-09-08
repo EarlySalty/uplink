@@ -187,3 +187,40 @@ async fn abgebrochene_paketkopie_und_offenes_permit_verhindern_vollstaendigkeit(
         }
     }
 }
+
+#[tokio::test]
+async fn hevc_transport_metadaten_und_opaque_bytes_bleiben_erhalten() {
+    let (_tmp, storage, spec, cfg) = fixture();
+    let running = Recorder::start(storage.clone(), spec, cfg).await.unwrap();
+    let sink = running.sink();
+    // Künstliche E-FLV-Tags prüfen nur Speicherung und Codecbezeichnung.
+    // Dies ist kein gültiger HEVC-Decoder-/YouTube-Exportnachweis.
+    let bodies = [
+        vec![0x90, b'h', b'v', b'c', b'1', 1],
+        vec![0x93, b'h', b'v', b'c', b'1', 1, 2, 3],
+    ];
+    for (index, body) in bodies.iter().enumerate() {
+        let mut p = packet(1, MediaKind::Video, 0, index == 0);
+        p.codec = WireCodec::Hevc;
+        p.tag = Arc::new(FlvTag::new(9, (index * 40) as u32, body.clone().into(), 4096).unwrap());
+        sink.reserve(p.tag.wire_len()).unwrap().submit(p).unwrap();
+    }
+    let manifest = running.finish().await.unwrap();
+    assert_eq!(manifest.tracks.len(), 1);
+    assert_eq!(manifest.tracks[0].codec, "hevc");
+    assert_eq!(manifest.tracks[0].headers, 1);
+    assert_eq!(manifest.tracks[0].frames, 1);
+    assert!(!manifest.has_vod_audio());
+    let mut reader = uplink_media::flv::FlvReader::new(
+        storage
+            .open(&manifest.object_id, &manifest.segments[0].file)
+            .await
+            .unwrap(),
+        4096,
+    );
+    for body in bodies {
+        assert_eq!(reader.next().await.unwrap().unwrap().body(), body);
+    }
+    assert!(reader.next().await.unwrap().is_none());
+    manifest.verify_segments(&storage).await.unwrap();
+}
