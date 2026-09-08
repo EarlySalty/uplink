@@ -169,6 +169,7 @@ async fn save_destinations(
         FROM incoming i LEFT JOIN relay.destinations p
             ON p.streamer_id=$1 AND p.platform=i.platform
         WHERE EXISTS(SELECT 1 FROM relay.users WHERE streamer_id=$1 AND enabled=true)
+        ORDER BY i.platform COLLATE "C"
         ON CONFLICT(streamer_id,platform) DO UPDATE SET
             rtmp_url=COALESCE((SELECT rtmp_url FROM incoming WHERE platform=EXCLUDED.platform),relay.destinations.rtmp_url),
             stream_key_enc=COALESCE((SELECT stream_key_enc FROM incoming WHERE platform=EXCLUDED.platform),relay.destinations.stream_key_enc),

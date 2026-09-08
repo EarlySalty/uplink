@@ -168,6 +168,145 @@ fn request(method: &str, uri: &str, body: impl Into<Body>) -> Request<Body> {
 
 #[tokio::test]
 #[ignore = "Benötigt isolierte PostgreSQL-16-Testinstanz."]
+async fn opposite_multi_target_updates_use_one_lock_order() {
+    let (database, state) = fixture().await;
+    let key = state
+        .secrets
+        .encryption
+        .seal(b"synthetic-key", "destination:11:twitch")
+        .unwrap();
+    state.store.query("INSERT INTO relay.destinations(streamer_id,platform,rtmp_url,stream_key_enc,enabled,width,height) VALUES(11,'twitch','rtmps://publish.invalid/app',$1,true,1920,1080),(11,'kick','rtmps://publish.invalid/app',$1,true,1920,1080)",&[&key]).await.unwrap();
+    // Ein kurzer Trigger hält die jeweils erste Zeilensperre lange genug,
+    // damit gegensinnige Reihenfolgen tatsächlich aufeinandertreffen.
+    state.store.query("CREATE FUNCTION relay.hold_target_lock() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN PERFORM pg_sleep(0.1); RETURN NEW; END'",&[]).await.unwrap();
+    state.store.query("CREATE TRIGGER hold_target_lock BEFORE UPDATE ON relay.destinations FOR EACH ROW EXECUTE FUNCTION relay.hold_target_lock()",&[]).await.unwrap();
+    let (observer, driver) = database.raw().await;
+    observer
+        .batch_execute("ALTER DATABASE postgres SET deadlock_timeout='100ms'")
+        .await
+        .unwrap();
+    let gate = Arc::new(tokio::sync::Barrier::new(3));
+    let app = router(state.clone());
+    let mut tasks = Vec::new();
+    for payload in [
+        r#"{"streamer_id":11,"destinations":[{"platform":"twitch","width":1280},{"platform":"kick","width":1280}]}"#,
+        r#"{"streamer_id":11,"destinations":[{"platform":"kick","height":720},{"platform":"twitch","height":720}]}"#,
+    ] {
+        let gate = gate.clone();
+        let app = app.clone();
+        tasks.push(tokio::spawn(async move {
+            gate.wait().await;
+            app.oneshot(request("PUT", "/v1/me/destinations", payload))
+                .await
+                .unwrap()
+                .status()
+        }));
+    }
+    gate.wait().await;
+    let mut statuses = Vec::new();
+    for task in tasks {
+        statuses.push(task.await.unwrap());
+    }
+    let rows = state
+        .store
+        .query(
+            "SELECT width,height FROM relay.destinations ORDER BY platform",
+            &[],
+        )
+        .await
+        .unwrap();
+    let deadlocks: i64 = observer
+        .query_one(
+            "SELECT deadlocks FROM pg_stat_database WHERE datname=current_database()",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    drop(observer);
+    driver.await.unwrap();
+    database.stop().await;
+    assert_eq!(
+        statuses,
+        vec![StatusCode::OK; 2],
+        "Gegensinnige Mehrziel-Updates dürfen keinen Deadlock erzeugen"
+    );
+    assert_eq!(deadlocks, 0);
+    assert_eq!(rows.len(), 2);
+    for row in rows {
+        assert_eq!(row.get::<_, i32>(0), 1280);
+        assert_eq!(row.get::<_, i32>(1), 720);
+    }
+}
+
+#[tokio::test]
+#[ignore = "Benötigt isolierte PostgreSQL-16-Testinstanz und lokales TCP."]
+async fn closed_tcp_client_cannot_leave_a_late_key_rotation() {
+    use tokio::io::AsyncWriteExt;
+    let (database, state) = fixture().await;
+    let before: String = state
+        .store
+        .query(
+            "SELECT ingest_key_hash FROM relay.users WHERE streamer_id=11",
+            &[],
+        )
+        .await
+        .unwrap()[0]
+        .get(0);
+    let (mut locker, driver) = database.raw().await;
+    let transaction = locker.transaction().await.unwrap();
+    transaction
+        .query(
+            "SELECT streamer_id FROM relay.users WHERE streamer_id=11 FOR UPDATE",
+            &[],
+        )
+        .await
+        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let app = router(state.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+    client.write_all(b"POST /v1/me/key/rotate?streamer_id=11 HTTP/1.1\r\nHost: localhost\r\nX-Relay-Auth: synthetic-api\r\nContent-Length: 0\r\n\r\n").await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2),async {
+        loop {
+            transaction.batch_execute("SELECT pg_stat_clear_snapshot()").await.unwrap();
+            if transaction.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE wait_event_type='Lock' AND pid<>pg_backend_pid())",&[]).await.unwrap().get::<_,bool>(0) {break;}
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+    drop(client);
+    // Der echte TCP-Abbruch muss spätestens mit Anfragefrist und Nachlauf die
+    // wartende Datenbankarbeit beenden. Sofortige TCP-Cancellation ist damit
+    // ausdrücklich nicht behauptet.
+    tokio::time::timeout(Duration::from_secs(3),async {
+        loop {
+            transaction.batch_execute("SELECT pg_stat_clear_snapshot()").await.unwrap();
+            let active:i64=transaction.query_one("SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() AND pid<>pg_backend_pid()",&[]).await.unwrap().get(0);
+            if active==0 {break;}
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+    transaction.commit().await.unwrap();
+    let after: String = state
+        .store
+        .query(
+            "SELECT ingest_key_hash FROM relay.users WHERE streamer_id=11",
+            &[],
+        )
+        .await
+        .unwrap()[0]
+        .get(0);
+    server.abort();
+    let _ = server.await;
+    drop(locker);
+    driver.await.unwrap();
+    database.stop().await;
+    assert_eq!(after, before);
+}
+
+#[tokio::test]
+#[ignore = "Benötigt isolierte PostgreSQL-16-Testinstanz."]
 async fn concurrent_profile_patch_keeps_key_committed_while_waiting() {
     let (database, state) = fixture().await;
     let old = state
