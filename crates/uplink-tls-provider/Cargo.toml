@@ -1,0 +1,25 @@
+[package]
+name = "uplink-tls-provider"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+bytes = "1"
+nix = { version = "0.29", default-features = false, features = ["fs"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+rustls = { version = "0.23.44", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = { version = "1.15.1", features = ["std"] }
+serde.workspace = true
+serde_json = "1"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "time"] }
+toml.workspace = true
+webpki-roots = "1"
+zeroize = "1"
+
+[dev-dependencies]
+rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "ring", "pem"] }
+
+[lints]
+workspace = true
