@@ -9,6 +9,11 @@ tokio::task_local! { pub static REQUEST_DEADLINE: Instant; }
 pub const CLEANUP_GRACE: Duration = Duration::from_secs(2);
 const QUERY_LIMIT: Duration = Duration::from_secs(10);
 
+pub(crate) struct CheckedStatement<'a> {
+    pub sql: &'a str,
+    pub expected_rows: Option<usize>,
+}
+
 pub struct Store {
     connection: tokio_postgres::Config,
     slots: Arc<Semaphore>,
@@ -61,6 +66,33 @@ impl Store {
         params: &[&(dyn ToSql + Sync)],
         retention: Option<Arc<dyn std::any::Any + Send + Sync>>,
     ) -> Result<Vec<Row>, &'static str> {
+        self.query_statements(
+            &[CheckedStatement {
+                sql,
+                expected_rows: None,
+            }],
+            params,
+            retention,
+        )
+        .await
+    }
+    /// Each statement obtains a new READ COMMITTED snapshot, while all fence
+    /// row locks remain held until the shared commit. A single modifying CTE
+    /// cannot see a first INSERT that committed while it waited for its fence.
+    pub(crate) async fn query_fenced(
+        &self,
+        statements: [CheckedStatement<'_>; 2],
+        params: &[&(dyn ToSql + Sync)],
+        retention: Option<Arc<dyn std::any::Any + Send + Sync>>,
+    ) -> Result<Vec<Row>, &'static str> {
+        self.query_statements(&statements, params, retention).await
+    }
+    async fn query_statements(
+        &self,
+        statements: &[CheckedStatement<'_>],
+        params: &[&(dyn ToSql + Sync)],
+        retention: Option<Arc<dyn std::any::Any + Send + Sync>>,
+    ) -> Result<Vec<Row>, &'static str> {
         let slot = self
             .slots
             .clone()
@@ -94,11 +126,13 @@ impl Store {
         });
         let result = async {
             let cancel = client.cancel_token();
-            let transaction = timeout_at(deadline, client.transaction()).await
+            let transaction = timeout_at(deadline, client.build_transaction().isolation_level(tokio_postgres::IsolationLevel::ReadCommitted).start()).await
                 .map_err(|_| "Datenbankanfrage hat die Frist überschritten.")?
                 .map_err(|_| "Datenbanktransaktion konnte nicht starten.")?;
-            let rows = {
-                let query = transaction.query(sql, params);
+            let mut rows=Vec::new();
+            for statement in statements {
+            rows = {
+                let query = transaction.query(statement.sql, params);
                 tokio::pin!(query);
                 match timeout_at(deadline, &mut query).await {
                     Ok(Ok(rows)) => rows,
@@ -115,6 +149,10 @@ impl Store {
                     }
                 }
             };
+            if statement.expected_rows.is_some_and(|expected| rows.len()!=expected) {
+                return Err("Zielgeneration ist veraltet; Verbindung wurde zwischenzeitlich geändert.");
+            }
+            }
             if Instant::now() >= deadline {
                 return Err("Datenbankanfrage hat die Frist überschritten.");
             }

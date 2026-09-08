@@ -5,6 +5,9 @@ use zeroize::Zeroize;
 #[serde(deny_unknown_fields)]
 pub struct DestinationUpdate {
     pub platform: String,
+    /// Generation 0 gilt ausschließlich für den noch unveränderten Bestand.
+    #[serde(default)]
+    pub connection_generation: i64,
     pub rtmp_url: Option<String>,
     pub stream_key: Option<String>,
     pub enabled: Option<bool>,
@@ -25,10 +28,12 @@ impl Drop for DestinationUpdate {
 }
 impl DestinationUpdate {
     pub fn validate(&self) -> Result<(), &'static str> {
-        if !matches!(
-            self.platform.as_str(),
-            "twitch" | "kick" | "youtube" | "tiktok"
-        ) || self.width.is_some_and(|v| v <= 0 || v > 8192 || v % 2 != 0)
+        if self.connection_generation < 0
+            || !matches!(
+                self.platform.as_str(),
+                "twitch" | "kick" | "youtube" | "tiktok"
+            )
+            || self.width.is_some_and(|v| v <= 0 || v > 8192 || v % 2 != 0)
             || self
                 .height
                 .is_some_and(|v| v <= 0 || v > 8192 || v % 2 != 0)

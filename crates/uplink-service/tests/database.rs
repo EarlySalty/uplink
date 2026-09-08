@@ -243,7 +243,7 @@ async fn profile_disconnect_waits_for_source_end_and_reconnect_setting_stays_a_w
         app.clone()
             .oneshot(request(
                 "DELETE",
-                "/v1/me/destinations/twitch?streamer_id=11",
+                "/v1/me/destinations/twitch?streamer_id=11&connection_generation=1",
                 ""
             ))
             .await
@@ -256,7 +256,7 @@ async fn profile_disconnect_waits_for_source_end_and_reconnect_setting_stays_a_w
         app.clone()
             .oneshot(request(
                 "DELETE",
-                "/v1/me/destinations/twitch?streamer_id=11",
+                "/v1/me/destinations/twitch?streamer_id=11&connection_generation=1",
                 ""
             ))
             .await
@@ -1213,6 +1213,7 @@ async fn controlplane_preserves_credentials_and_rejects_unauthorized_changes() {
         "CREATE TABLE relay.users(streamer_id bigint PRIMARY KEY,enabled boolean NOT NULL,ingest_key_enc bytea,dock_token_enc bytea,ingest_key_hash text,reconnect_wait_s integer NOT NULL DEFAULT 0)",
         "CREATE TABLE relay.destinations(streamer_id bigint REFERENCES relay.users(streamer_id),platform text NOT NULL,rtmp_url text NOT NULL,stream_key_enc bytea NOT NULL,enabled boolean NOT NULL,width integer,height integer,fps integer,bitrate_kbps integer,UNIQUE(streamer_id,platform))",
         "CREATE TABLE relay.waitlist(streamer_id bigint PRIMARY KEY)",
+        include_str!("../../../db/migrations/20260908_destination_fences.sql"),
     ] {
         store.query(statement, &[]).await.unwrap();
     }
@@ -1718,4 +1719,254 @@ async fn review_transient_database_error_recovers_active_chat_user() {
         recovered,
         "The real runtime removed the active chat user after one SQL error and did not recover it; media reservations still active: {still_active}"
     );
+}
+
+#[tokio::test]
+#[ignore = "Benötigt isolierte PostgreSQL-16-Testinstanz."]
+async fn old_destination_write_cannot_recreate_a_successfully_deleted_target() {
+    let (database, state) = fixture().await;
+    let app = router(state.clone());
+    let old = r#"{"streamer_id":11,"destinations":[{"platform":"twitch","rtmp_url":"rtmps://live.twitch.tv/app","stream_key":"synthetic-old-key"}]}"#;
+    assert_eq!(
+        app.clone()
+            .oneshot(request("PUT", "/v1/me/destinations", old))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(request(
+                "DELETE",
+                "/v1/me/destinations/twitch?streamer_id=11&connection_generation=1",
+                ""
+            ))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    // Neue Registry, neuer Store und Router: der Schutz kommt aus PostgreSQL.
+    let restarted = Arc::new(ServiceState {
+        chat: None,
+        tls: None,
+        config: state.config.clone(),
+        store: Arc::new(database.connect().await),
+        secrets: state.secrets.clone(),
+        registry: Registry::new(2, 1).unwrap(),
+    });
+    drop(app);
+    let app = router(restarted);
+    let delayed = app
+        .clone()
+        .oneshot(request("PUT", "/v1/me/destinations", old))
+        .await
+        .unwrap();
+    assert_eq!(
+        delayed.status(),
+        StatusCode::CONFLICT,
+        "Verspäteter PUT hat getrenntes Ziel wieder angelegt"
+    );
+    let rows = state
+        .store
+        .query(
+            "SELECT count(*) FROM relay.destinations WHERE streamer_id=11 AND platform='twitch'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows[0].get::<_, i64>(0), 0);
+    database.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "Benötigt isolierte PostgreSQL-16-Testinstanz."]
+async fn destination_fence_rejects_old_delete_and_rolls_back_mixed_generation_batches() {
+    let (database, state) = fixture().await;
+    let app = router(state.clone());
+    let old = r#"{"streamer_id":11,"destinations":[{"platform":"twitch","connection_generation":2,"rtmp_url":"rtmps://live.twitch.tv/app","stream_key":"synthetic-a"}]}"#;
+    assert_eq!(
+        app.clone()
+            .oneshot(request("PUT", "/v1/me/destinations", old))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(request(
+                "DELETE",
+                "/v1/me/destinations/twitch?streamer_id=11&connection_generation=3",
+                ""
+            ))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    let fresh = r#"{"streamer_id":11,"destinations":[{"platform":"twitch","connection_generation":4,"rtmp_url":"rtmps://live.twitch.tv/app","stream_key":"synthetic-b"}]}"#;
+    assert_eq!(
+        app.clone()
+            .oneshot(request("PUT", "/v1/me/destinations", fresh))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(request(
+                "DELETE",
+                "/v1/me/destinations/twitch?streamer_id=11&connection_generation=3",
+                ""
+            ))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CONFLICT
+    );
+    let batch = r#"{"streamer_id":11,"destinations":[{"platform":"kick","connection_generation":5,"rtmp_url":"rtmps://ingest.kick.com/app","stream_key":"synthetic-c"},{"platform":"twitch","connection_generation":2,"stream_key":"synthetic-stale"}]}"#;
+    assert_eq!(
+        app.clone()
+            .oneshot(request("PUT", "/v1/me/destinations", batch))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CONFLICT
+    );
+    let rows=state.store.query("SELECT f.platform,f.generation,f.deleted,d.platform FROM relay.destination_fences f LEFT JOIN relay.destinations d USING(streamer_id,platform) WHERE f.streamer_id=11 ORDER BY f.platform",&[]).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, String>(0), "twitch");
+    assert_eq!(rows[0].get::<_, i64>(1), 4);
+    assert!(!rows[0].get::<_, bool>(2));
+    assert_eq!(rows[0].get::<_, String>(3), "twitch");
+    database.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "Benötigt isolierte PostgreSQL-16-Testinstanz."]
+async fn disconnect_orders_after_a_remote_put_already_holding_the_fence() {
+    let (database, state) = fixture().await;
+    let app = router(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    let old = r#"{"streamer_id":11,"destinations":[{"platform":"twitch","rtmp_url":"rtmps://live.twitch.tv/app","stream_key":"synthetic-old"}]}"#;
+    assert_eq!(
+        client
+            .put(format!("{base}/v1/me/destinations"))
+            .header("X-Relay-Auth", "synthetic-api")
+            .header("Content-Type", "application/json")
+            .body(old)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    let (mut blocker, driver) = database.raw().await;
+    let hold = blocker.transaction().await.unwrap();
+    hold.execute("SELECT pg_advisory_xact_lock(71921)", &[])
+        .await
+        .unwrap();
+    state.store.query("CREATE FUNCTION relay.delay_destination() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_advisory_xact_lock(71921); RETURN NEW; END $$",&[]).await.unwrap();
+    state.store.query("CREATE TRIGGER delay_destination BEFORE UPDATE ON relay.destinations FOR EACH ROW EXECUTE FUNCTION relay.delay_destination()",&[]).await.unwrap();
+    let put = tokio::spawn(
+        client
+            .put(format!("{base}/v1/me/destinations"))
+            .header("X-Relay-Auth", "synthetic-api")
+            .header("Content-Type", "application/json")
+            .body(old)
+            .send(),
+    );
+    let (observe, observer) = database.raw().await;
+    tokio::time::timeout(Duration::from_secs(2),async{loop{let row=observe.query_one("SELECT count(*) FROM pg_stat_activity WHERE wait_event='advisory' AND query LIKE '%INSERT INTO relay.destinations%'",&[]).await.unwrap();if row.get::<_,i64>(0)>0{break}tokio::time::sleep(Duration::from_millis(10)).await;}}).await.unwrap();
+    let delete = tokio::spawn(
+        client
+            .delete(format!(
+                "{base}/v1/me/destinations/twitch?streamer_id=11&connection_generation=1"
+            ))
+            .header("X-Relay-Auth", "synthetic-api")
+            .send(),
+    );
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert!(!delete.is_finished());
+    hold.commit().await.unwrap();
+    assert_eq!(put.await.unwrap().unwrap().status(), StatusCode::OK);
+    assert_eq!(delete.await.unwrap().unwrap().status(), StatusCode::OK);
+    let rows=state.store.query("SELECT generation,deleted,(SELECT count(*) FROM relay.destinations WHERE streamer_id=11) FROM relay.destination_fences WHERE streamer_id=11 AND platform='twitch'",&[]).await.unwrap();
+    assert_eq!(rows[0].get::<_, i64>(0), 1);
+    assert!(rows[0].get::<_, bool>(1));
+    assert_eq!(rows[0].get::<_, i64>(2), 0);
+    server.abort();
+    assert!(server.await.unwrap_err().is_cancelled());
+    drop(observe);
+    observer.await.unwrap();
+    drop(blocker);
+    driver.await.unwrap();
+    database.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "Benötigt isolierte PostgreSQL-16-Testinstanz."]
+async fn disconnect_removes_first_destination_insert_that_commits_while_waiting_for_fence() {
+    let (database, state) = fixture().await;
+    let app = router(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    let old = r#"{"streamer_id":11,"destinations":[{"platform":"twitch","connection_generation":1,"rtmp_url":"rtmps://live.twitch.tv/app","stream_key":"synthetic-old"}]}"#;
+    let (mut blocker, driver) = database.raw().await;
+    let hold = blocker.transaction().await.unwrap();
+    hold.execute("SELECT pg_advisory_xact_lock(71921)", &[])
+        .await
+        .unwrap();
+    state.store.query("CREATE FUNCTION relay.delay_destination() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_advisory_xact_lock(71921); RETURN NEW; END $$",&[]).await.unwrap();
+    state.store.query("CREATE TRIGGER delay_destination BEFORE INSERT ON relay.destinations FOR EACH ROW EXECUTE FUNCTION relay.delay_destination()",&[]).await.unwrap();
+    let put = tokio::spawn(
+        client
+            .put(format!("{base}/v1/me/destinations"))
+            .header("X-Relay-Auth", "synthetic-api")
+            .header("Content-Type", "application/json")
+            .body(old)
+            .send(),
+    );
+    let (observe, observer) = database.raw().await;
+    tokio::time::timeout(Duration::from_secs(2),async{loop{let row=observe.query_one("SELECT count(*) FROM pg_stat_activity WHERE wait_event='advisory' AND query LIKE '%INSERT INTO relay.destinations%'",&[]).await.unwrap();if row.get::<_,i64>(0)>0{break}tokio::time::sleep(Duration::from_millis(10)).await;}}).await.unwrap();
+    let delete = tokio::spawn(
+        client
+            .delete(format!(
+                "{base}/v1/me/destinations/twitch?streamer_id=11&connection_generation=2"
+            ))
+            .header("X-Relay-Auth", "synthetic-api")
+            .send(),
+    );
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert!(!delete.is_finished());
+    hold.commit().await.unwrap();
+    assert_eq!(put.await.unwrap().unwrap().status(), StatusCode::OK);
+    assert_eq!(delete.await.unwrap().unwrap().status(), StatusCode::OK);
+    let rows=state.store.query("SELECT generation,deleted,(SELECT count(*) FROM relay.destinations WHERE streamer_id=11) FROM relay.destination_fences WHERE streamer_id=11 AND platform='twitch'",&[]).await.unwrap();
+    assert_eq!(rows[0].get::<_, i64>(0), 2);
+    assert!(rows[0].get::<_, bool>(1));
+    assert_eq!(rows[0].get::<_, i64>(2), 0);
+    server.abort();
+    assert!(server.await.unwrap_err().is_cancelled());
+    drop(observe);
+    observer.await.unwrap();
+    drop(blocker);
+    driver.await.unwrap();
+    database.stop().await;
 }

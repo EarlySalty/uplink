@@ -168,18 +168,36 @@ async fn save_destinations(
             })
             .transpose()
             .map_err(|e| failure(StatusCode::SERVICE_UNAVAILABLE, e))?;
-        rows.push(json!({"platform":output.platform,"rtmp_url":output.rtmp_url,"stream_key_enc":ciphertext.map(|bytes|format!("\\x{}",hex::encode(bytes))),"enabled":output.enabled,"width":output.width,"height":output.height,"fps":output.fps,"bitrate_kbps":output.bitrate_kbps}));
+        rows.push(json!({"platform":output.platform,"connection_generation":output.connection_generation,"rtmp_url":output.rtmp_url,"stream_key_enc":ciphertext.map(|bytes|format!("\\x{}",hex::encode(bytes))),"enabled":output.enabled,"width":output.width,"height":output.height,"fps":output.fps,"bitrate_kbps":output.bitrate_kbps}));
     }
     let data = json!(rows);
     // INSERT benötigt Pflichtwerte auch für bestehende Ziele. Beim Konflikt
     // zählen für ausgelassene Felder jedoch die jetzt gesperrten aktuellen
     // Werte, niemals die vorher gelesenen INSERT-Snapshotwerte aus EXCLUDED.
-    let sql = r#"
+    let fence_sql = r#"
         WITH incoming AS (
             SELECT * FROM jsonb_to_recordset($2::jsonb) AS x(
                 platform text, rtmp_url text, stream_key_enc bytea,
                 enabled boolean, width integer, height integer,
-                fps integer, bitrate_kbps integer
+                fps integer, bitrate_kbps integer, connection_generation bigint
+            )
+        )
+            INSERT INTO relay.destination_fences AS current(streamer_id,platform,generation,deleted)
+            SELECT $1,platform,connection_generation,false FROM incoming
+            WHERE EXISTS(SELECT 1 FROM relay.users WHERE streamer_id=$1 AND enabled=true)
+            ORDER BY platform COLLATE "C"
+            ON CONFLICT(streamer_id,platform) DO UPDATE SET
+                generation=EXCLUDED.generation,deleted=false
+            WHERE EXCLUDED.generation > current.generation
+                OR (EXCLUDED.generation=current.generation AND NOT current.deleted)
+            RETURNING platform
+    "#;
+    let write_sql = r#"
+        WITH incoming AS (
+            SELECT * FROM jsonb_to_recordset($2::jsonb) AS x(
+                platform text, rtmp_url text, stream_key_enc bytea,
+                enabled boolean, width integer, height integer,
+                fps integer, bitrate_kbps integer, connection_generation bigint
             )
         )
         INSERT INTO relay.destinations(
@@ -191,7 +209,8 @@ async fn save_destinations(
             COALESCE(i.enabled,p.enabled,true), COALESCE(i.width,p.width),
             COALESCE(i.height,p.height), COALESCE(i.fps,p.fps),
             COALESCE(i.bitrate_kbps,p.bitrate_kbps)
-        FROM incoming i LEFT JOIN relay.destinations p
+        FROM incoming i
+        LEFT JOIN relay.destinations p
             ON p.streamer_id=$1 AND p.platform=i.platform
         WHERE EXISTS(SELECT 1 FROM relay.users WHERE streamer_id=$1 AND enabled=true)
         ORDER BY i.platform COLLATE "C"
@@ -205,19 +224,40 @@ async fn save_destinations(
             bitrate_kbps=COALESCE((SELECT bitrate_kbps FROM incoming WHERE platform=EXCLUDED.platform),relay.destinations.bitrate_kbps)
         RETURNING platform
     "#;
-    let stored = state
+    state
         .store
-        .query(sql, &[&request.streamer_id, &data])
+        .query_fenced(
+            [
+                crate::store::CheckedStatement {
+                    sql: fence_sql,
+                    expected_rows: Some(request.destinations.len()),
+                },
+                crate::store::CheckedStatement {
+                    sql: write_sql,
+                    expected_rows: Some(request.destinations.len()),
+                },
+            ],
+            &[&request.streamer_id, &data],
+            None,
+        )
         .await
-        .map_err(|error| failure(StatusCode::SERVICE_UNAVAILABLE, error))?;
-    if stored.len() != request.destinations.len() {
-        return Err(failure(
-            StatusCode::FORBIDDEN,
-            "Der Zugang ist nicht freigeschaltet.",
-        ));
-    }
+        .map_err(|error| {
+            failure(
+                if error.starts_with("Zielgeneration") {
+                    StatusCode::CONFLICT
+                } else {
+                    StatusCode::SERVICE_UNAVAILABLE
+                },
+                error,
+            )
+        })?;
+    let generations: std::collections::BTreeMap<_, _> = request
+        .destinations
+        .iter()
+        .map(|d| (&d.platform, d.connection_generation))
+        .collect();
     Ok(Json(
-        json!({"ok":true,"live_quality":{"status":"next_stream","message":"Das Wunschprofil ist gespeichert und wird beim nächsten Stream anhand des Eingangs geprüft."}}),
+        json!({"ok":true,"connection_generations":generations,"live_quality":{"status":"next_stream","message":"Das Wunschprofil ist gespeichert und wird beim nächsten Stream anhand des Eingangs geprüft."}}),
     ))
 }
 
@@ -481,7 +521,7 @@ async fn destinations(
     Query(query): Query<TenantQuery>,
 ) -> ApiResult {
     authorize(&state, &headers, query.streamer_id)?;
-    let rows = state.store.query("SELECT platform,rtmp_url,enabled,width,height,fps,bitrate_kbps FROM relay.destinations WHERE streamer_id=$1 ORDER BY platform", &[&query.streamer_id]).await.map_err(|e|failure(StatusCode::SERVICE_UNAVAILABLE,e))?;
+    let rows = state.store.query("SELECT d.platform,d.rtmp_url,d.enabled,d.width,d.height,d.fps,d.bitrate_kbps,COALESCE(f.generation,0) FROM relay.destinations d LEFT JOIN relay.destination_fences f USING(streamer_id,platform) WHERE d.streamer_id=$1 ORDER BY d.platform", &[&query.streamer_id]).await.map_err(|e|failure(StatusCode::SERVICE_UNAVAILABLE,e))?;
     let mut outputs = Vec::with_capacity(rows.len());
     let sessions = state.registry.status(query.streamer_id as u64);
     for row in rows {
@@ -497,7 +537,7 @@ async fn destinations(
         let (output_state, reason) = output_status(sessions.first(), &platform, blocked);
         let active_profile =
             crate::media_status::active_profile(sessions.first(), &platform, output_state);
-        outputs.push(json!({"platform":platform,"rtmp_url":if blocked {""} else {endpoint.as_str()},"enabled":row.try_get::<_,bool>(2).map_err(|_|invalid())?,"blocked":blocked,"error":if blocked {Some("Gespeicherte Zieladresse ist gesperrt; Serveradresse und Zugang müssen getrennt eingerichtet werden.")} else {None},"requested":{"width":row.try_get::<_,Option<i32>>(3).map_err(|_|invalid())?,"height":row.try_get::<_,Option<i32>>(4).map_err(|_|invalid())?,"fps":row.try_get::<_,Option<i32>>(5).map_err(|_|invalid())?,"bitrate_kbps":row.try_get::<_,Option<i32>>(6).map_err(|_|invalid())?},"active_profile":active_profile,"output_state":output_state,"reason":reason,"publication_confirmed":false}));
+        outputs.push(json!({"platform":platform,"connection_generation":row.try_get::<_,i64>(7).map_err(|_|invalid())?,"rtmp_url":if blocked {""} else {endpoint.as_str()},"enabled":row.try_get::<_,bool>(2).map_err(|_|invalid())?,"blocked":blocked,"error":if blocked {Some("Gespeicherte Zieladresse ist gesperrt; Serveradresse und Zugang müssen getrennt eingerichtet werden.")} else {None},"requested":{"width":row.try_get::<_,Option<i32>>(3).map_err(|_|invalid())?,"height":row.try_get::<_,Option<i32>>(4).map_err(|_|invalid())?,"fps":row.try_get::<_,Option<i32>>(5).map_err(|_|invalid())?,"bitrate_kbps":row.try_get::<_,Option<i32>>(6).map_err(|_|invalid())?},"active_profile":active_profile,"output_state":output_state,"reason":reason,"publication_confirmed":false}));
     }
     Ok(Json(json!({"destinations": outputs})))
 }
@@ -591,14 +631,21 @@ async fn reconnect_wait(
         json!({"reconnect_wait_s":body.reconnect_wait_s,"reconnect_wait_max_s":300,"applied":false,"message":"Frist gespeichert. Die Wiederverbindung der neuen Medienstrecke ist noch nicht freigegeben."}),
     ))
 }
+#[derive(Deserialize)]
+struct DestinationDeleteQuery {
+    streamer_id: i64,
+    connection_generation: i64,
+}
 async fn delete_destination(
     State(state): State<Arc<ServiceState>>,
     headers: HeaderMap,
-    Query(query): Query<TenantQuery>,
+    Query(query): Query<DestinationDeleteQuery>,
     Path(platform): Path<String>,
 ) -> ApiResult {
     authorize(&state, &headers, query.streamer_id)?;
-    if !matches!(platform.as_str(), "twitch" | "kick" | "youtube" | "tiktok") {
+    if query.connection_generation <= 0
+        || !matches!(platform.as_str(), "twitch" | "kick" | "youtube" | "tiktok")
+    {
         return Err(failure(StatusCode::BAD_REQUEST, "Ziel ist ungültig."));
     }
     let guard = state
@@ -607,14 +654,22 @@ async fn delete_destination(
         .map_err(|e| failure(StatusCode::CONFLICT, e))?;
     state
         .store
-        .query_with_retention(
-            "DELETE FROM relay.destinations WHERE streamer_id=$1 AND platform=$2",
-            &[&query.streamer_id, &platform],
+        .query_fenced(
+            [crate::store::CheckedStatement{
+                sql:"INSERT INTO relay.destination_fences AS current(streamer_id,platform,generation,deleted) VALUES($1,$2,$3,true) ON CONFLICT(streamer_id,platform) DO UPDATE SET generation=EXCLUDED.generation,deleted=true WHERE EXCLUDED.generation>=current.generation RETURNING generation",
+                expected_rows:Some(1),
+            },crate::store::CheckedStatement{
+                sql:"DELETE FROM relay.destinations WHERE streamer_id=$1 AND platform=$2 RETURNING $3::bigint AS generation",
+                expected_rows:None,
+            }],
+            &[&query.streamer_id, &platform,&query.connection_generation],
             Some(guard),
         )
         .await
-        .map_err(|e| failure(StatusCode::SERVICE_UNAVAILABLE, e))?;
-    Ok(Json(json!({"platform":platform,"deleted":true})))
+        .map_err(|e| failure(if e.starts_with("Zielgeneration"){StatusCode::CONFLICT}else{StatusCode::SERVICE_UNAVAILABLE}, e))?;
+    Ok(Json(
+        json!({"platform":platform,"deleted":true,"connection_generation":query.connection_generation}),
+    ))
 }
 fn internal_auth(
     state: &ServiceState,

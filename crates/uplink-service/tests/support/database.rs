@@ -83,6 +83,7 @@ pub(crate) async fn fixture() -> (Database, Arc<ServiceState>) {
         "CREATE TABLE relay.users(streamer_id bigint PRIMARY KEY,enabled boolean NOT NULL,ingest_key_enc bytea,dock_token_enc bytea,ingest_key_hash text,reconnect_wait_s integer NOT NULL DEFAULT 0)",
         "CREATE TABLE relay.destinations(streamer_id bigint REFERENCES relay.users(streamer_id),platform text NOT NULL,rtmp_url text NOT NULL,stream_key_enc bytea NOT NULL,enabled boolean NOT NULL,width integer,height integer,fps integer,bitrate_kbps integer,UNIQUE(streamer_id,platform))",
         "CREATE TABLE relay.waitlist(streamer_id bigint PRIMARY KEY)",
+        include_str!("../../../../db/migrations/20260908_destination_fences.sql"),
     ] {
         store.query(sql, &[]).await.unwrap();
     }
