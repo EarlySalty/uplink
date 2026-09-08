@@ -253,6 +253,9 @@ fn fetch_config(args: &Arguments, meta: Metadata) -> Result<Config> {
     // Adapt the existing fetch contract. No server is started, and its TLS,
     // ingest and dashboard fields are never consumed by this executable.
     Ok(Config {
+        test_ingest: None,
+        tls_reload_seconds: 60,
+        loopback_test_ca: None,
         api_bind: ([127, 0, 0, 1], 0).into(),
         ingest_bind: ([127, 0, 0, 1], 0).into(),
         public_ingest_url: "rtmps://localhost/live".into(),

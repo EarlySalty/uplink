@@ -4,6 +4,12 @@ use std::net::SocketAddr;
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    #[serde(default)]
+    pub test_ingest: Option<TestIngestConfig>,
+    #[serde(default = "tls_reload_default")]
+    pub tls_reload_seconds: u64,
+    #[serde(default)]
+    pub loopback_test_ca: Option<std::path::PathBuf>,
     pub api_bind: SocketAddr,
     pub ingest_bind: SocketAddr,
     pub public_ingest_url: String,
@@ -16,6 +22,14 @@ pub struct Config {
     pub tls: TlsConfig,
     pub media: MediaConfig,
     pub platforms: Vec<PlatformConfig>,
+}
+fn tls_reload_default() -> u64 {
+    60
+}
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TestIngestConfig {
+    pub allowed_streamer_ids: Vec<u64>,
 }
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -61,11 +75,46 @@ pub enum TlsConfig {
     },
 }
 impl Config {
+    pub fn permits_tenant(&self, tenant: u64) -> bool {
+        tenant > 0
+            && self
+                .test_ingest
+                .as_ref()
+                .is_none_or(|scope| scope.allowed_streamer_ids.contains(&tenant))
+    }
     pub fn parse(input: &str) -> Result<Self, &'static str> {
         if input.len() > 64 * 1024 {
             return Err("Konfigurationsdatei ist zu groß.");
         }
         let config: Self = toml::from_str(input).map_err(|_| "Konfiguration ist ungültig.")?;
+        let public_ingest = reqwest::Url::parse(&config.public_ingest_url)
+            .map_err(|_| "Öffentliche Eingangsadresse ist ungültig.")?;
+        if public_ingest.scheme() != "rtmps"
+            || public_ingest.host_str().is_none()
+            || !public_ingest.username().is_empty()
+            || public_ingest.password().is_some()
+            || public_ingest.query().is_some()
+            || public_ingest.fragment().is_some()
+            || !matches!(public_ingest.path(), "/live" | "/live/")
+        {
+            return Err("Öffentliche Eingangsadresse darf keinen Zugang enthalten.");
+        }
+        if config
+            .loopback_test_ca
+            .as_ref()
+            .is_some_and(|path| !path.is_absolute() || !config.ingest_bind.ip().is_loopback())
+        {
+            return Err("Eigene Test-CA ist nur am lokalen Testeingang erlaubt.");
+        }
+        if config.test_ingest.as_ref().is_some_and(|scope| {
+            scope.allowed_streamer_ids.len() != 1
+                || scope
+                    .allowed_streamer_ids
+                    .iter()
+                    .any(|id| *id == 0 || *id > i64::MAX as u64)
+        }) {
+            return Err("Testeingang benötigt genau eine ausdrückliche Nutzerfreigabe.");
+        }
         let infisical = reqwest::Url::parse(&config.infisical.base_url)
             .map_err(|_| "Infisical-Adresse ist ungültig.")?;
         let allowed_infisical = infisical.scheme() == "https"
@@ -75,6 +124,7 @@ impl Config {
                     Some("127.0.0.1" | "localhost" | "[::1]")
                 ));
         if !config.api_bind.ip().is_loopback()
+            || !(30..=86400).contains(&config.tls_reload_seconds)
             || config.max_sessions == 0
             || config.max_sessions > 1024
             || config.max_sessions_per_tenant == 0

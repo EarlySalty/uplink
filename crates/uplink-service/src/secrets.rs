@@ -17,6 +17,24 @@ pub struct ServiceSecrets {
     pub tls_material: Option<(Secret, Secret)>,
 }
 
+/// One inherited bootstrap read; subsequent authorized fetches reuse only RAM.
+pub struct SecretReader {
+    config: Config,
+    token: Secret,
+}
+impl SecretReader {
+    pub async fn new(config: &Config) -> Result<Self, &'static str> {
+        let token = read_fd(config.infisical.credential_fd, 8192).await?;
+        Ok(Self {
+            config: config.clone(),
+            token,
+        })
+    }
+    pub async fn fetch(&self) -> Result<ServiceSecrets, &'static str> {
+        fetch_with_token(&self.config, &self.token).await
+    }
+}
+
 pub async fn read_fd(fd: u32, limit: usize) -> Result<Secret, &'static str> {
     protect_fd(fd)?;
     // A real duplicate keeps the provider's already-authorized open description.
@@ -100,7 +118,9 @@ impl Drop for Entry {
 }
 
 pub async fn fetch(config: &Config) -> Result<ServiceSecrets, &'static str> {
-    let token = read_fd(config.infisical.credential_fd, 8192).await?;
+    SecretReader::new(config).await?.fetch().await
+}
+async fn fetch_with_token(config: &Config, token: &Secret) -> Result<ServiceSecrets, &'static str> {
     let token = std::str::from_utf8(token.expose())
         .map_err(|_| "Infisical-Zugang ist ungültig.")?
         .trim();

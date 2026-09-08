@@ -2249,6 +2249,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "uplink-tls-provider"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "nix",
+ "rcgen",
+ "reqwest",
+ "rustls",
+ "rustls-pki-types",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml",
+ "webpki-roots",
+ "zeroize",
+]
+
+[[package]]
 name = "url"
 version = "2.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
