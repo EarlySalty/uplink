@@ -1,6 +1,6 @@
 # Arbeitsstand
 
-Stand: 8. September 2026, nach Merge von PR #1 und PR #2 auf `main` (`001724fdacded263f16681ba0aec8e5f348de601`) und erfolgreicher Main-CI. Grundlagen- und isolierter Nachweisbaustein sind abgeschlossen; der produktive Neubau bleibt offen.
+Stand: 8. September 2026, nach Merge von PR #1–#3. Geprüfter funktionaler Main-Stand: `0aca4d9d3ffc6c3a3fe3b8e3dab165ba391a4c0c`, identischer Baum zum geprüften Featurestand `4a5c1b6`. Grundlagen-, Offline- und lokaler RTMPS-Baustein sind abgeschlossen; der produktive Neubau bleibt offen.
 
 ## Erste Arbeitsrunde
 
@@ -36,12 +36,15 @@ Stand: 8. September 2026, nach Merge von PR #1 und PR #2 auf `main` (`001724fdac
 - [x] 24 Ingesttests und zuletzt neun Beispieltests sowie echte FFmpeg-8-AV1-/H.264-plus-zwei-AAC-Übertragung prüfen; TLS-CA-/Hostname-Negativfälle und numerische URL-Grenze dokumentieren.
 - [x] Metadata-Tracklimit und fremde Codec-Revision mit roten Regressionstests beheben und unabhängig nachprüfen; [Nachweis](../../docs/rtmps-nachweis.md).
 - [x] Separaten [Sicherheitsreview](../../docs/review-security-rtmps.md) mit 59 gezielten Tests, drei Audits und Gitleaks abschließen.
-- [x] Eigene Gate-Prüfung auf `baf240c` ausführen; beide Hinweise zu `finish()`-Abbruch und Eventbudget-Messung mit zuerst roten Regressionen beheben. Finaler Gate nach Nachreview bleibt offen.
+- [x] Eigene Gate-Prüfung auf `baf240c` ausführen; beide Hinweise zu `finish()`-Abbruch und Eventbudget-Messung mit zuerst roten Regressionen beheben und nachprüfen.
 - [x] Weiteren Hinweis aus Gate-ALLOW auf `b6c18f5` beheben: falsche Kontrollnachrichtenlängen werden als Protokollfehler erkannt; vier Regressionen, 82 Vendor-Tests plus Doctest in Debug/Release und Sicherheitsnachreview grün.
 - [x] ACK-Fensterwechsel und vollständige Hilfsereignisse je Spur nachprüfen: Vendor zuletzt 84 Tests plus Doctest, Probe neun Tests; unabhängiger echter FFmpeg-Nachlauf Exit 0.
 - [x] Rust-CI und GitGuardian für PR-Stand `e914723` getrennt als erfolgreich nachweisen; SonarCloud ist CANCELLED mit nicht zugänglicher Ursache.
 - [ ] Autorisierten Zugriff auf die SonarCloud-Analysedetails klären; kein fehlendes Projekt oder bestandener Check aus dem unauthentifizierten 404 ableiten.
-- [ ] Finalen neuen Gate, Push, GitHub-CI und Merge nach dem ACK-/Probe-Fix abschließen und tatsächlichen Stand nachtragen.
+- [x] Eigener Schlussgate auf `4a5c1b6`: Exit 0/ALLOW über unveränderte Kette; fehlende Repositorywerkzeuge und nicht ausgegebene Vergleichsbasis dokumentiert.
+- [x] Finalen Featurestand pushen; beide Rust-CI-Läufe und GitGuardian auf `4a5c1b6` erfolgreich nachweisen. SonarCloud bleibt separat CANCELLED.
+- [x] [PR #3](https://github.com/EarlySalty/uplink/pull/3) am `2026-09-08T13:11:11Z` mergen: funktionaler Stand `0aca4d9`, Dateibaumgleichheit zu `4a5c1b6` geprüft.
+- [x] `feat/rtmps-ingest` lokal und remote löschen; nur `main`/`origin/main` und ein Hauptworktree verbleiben.
 
 ## Vollständiger Produktumfang
 

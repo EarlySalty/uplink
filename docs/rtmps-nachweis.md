@@ -190,9 +190,13 @@ bestätigte erneut sämtliche Paket-, Header- und Hilfsereigniszahlen. Die beoba
 Spitzenwerte hängen vom Scheduling ab; sie sind kein
 Kapazitätsbenchmark. Der [native Reviewer](review-rtmps.md) wiederholte den
 echten Nachweis auf dem korrigierten Librarypfad unabhängig erfolgreich.
-Der [separate Sicherheitsreview](review-security-rtmps.md) bestätigt den finalen
-lokalen Baustein mit 59 gezielten Tests, drei Audits und Gitleaks; Gate und
-Merge werden separat nach tatsächlicher Ausführung festgehalten.
+Der [separate Sicherheitsreview](review-security-rtmps.md) dokumentiert 59
+gezielte Tests, drei Audits und Gitleaks sowie die späteren Nachreviews.
+Der [eigene Schlussgate](review-gate.md) meldete ALLOW mit dokumentierter
+Aussagegrenze. [PR #3](https://github.com/EarlySalty/uplink/pull/3) ist gemergt;
+geprüfter funktionaler Main-Stand `0aca4d9d3ffc6c3a3fe3b8e3dab165ba391a4c0c`
+mit unverändertem Baum des erfolgreich geprüften Featurestands `4a5c1b6`.
+SonarCloud bleibt separat CANCELLED ohne autorisiert zugängliche Fehlerdetails.
 
 Der Aufruf verwendet `rtmps://localhost:<port>/live/probe`, `tls_verify=1` und
 eine explizite öffentliche Test-CA. Falsche CA sowie eine vertraute CA mit einem
