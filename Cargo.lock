@@ -2560,6 +2560,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "toml",
+ "uplink-infisical-transport",
  "webpki-roots 1.0.9",
  "zeroize",
 ]

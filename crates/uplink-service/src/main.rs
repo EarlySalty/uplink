@@ -173,9 +173,15 @@ async fn run() -> Result<(), &'static str> {
             };
             resolver.mark_refresh_failure(result.is_err());
             match (result.is_err(), failed) {
-                (true, false) => eprintln!(
-                    "TLS-Aktualisierung fehlgeschlagen; neue Verbindungen benötigen einen weiterhin gültigen Stand."
-                ),
+                (true, false) => {
+                    // Fetch/Resolver liefern ausschließlich geprüfte statische
+                    // Fehlertexte, niemals den Infisical-Antwortkörper.
+                    if let Err(reason) = result {
+                        eprintln!(
+                            "TLS-Aktualisierung fehlgeschlagen: {reason} Neue Verbindungen benötigen einen weiterhin gültigen Stand."
+                        );
+                    }
+                }
                 (false, true) => eprintln!("TLS-Aktualisierung wieder verfügbar."),
                 _ => {}
             }

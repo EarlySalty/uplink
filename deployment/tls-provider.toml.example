@@ -9,4 +9,4 @@ identity_owner_uid = 1000
 project_id = "2f5df3ca-12e5-4ae1-abf2-ca7fbd841705"
 environment = "prod"
 secret_path = "/"
-infisical_port = 8080
+infisical_socket = "/run/uplink-infisical/api.sock"

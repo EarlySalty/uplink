@@ -6,6 +6,7 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+uplink-infisical-transport = { path = "../uplink-infisical-transport" }
 bytes = "1"
 nix = { version = "0.29", default-features = false, features = ["fs"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
