@@ -1,0 +1,907 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<!-- Die Adresse enthaelt den geheimen Teil im Query-Teil. Kein Referrer,
+     damit keine eingebundene Fremdadresse (etwa Twitch-Boxart) ihn
+     mitgeschickt bekommt. -->
+<meta name="referrer" content="no-referrer">
+<title>Uplink Stream-Infos</title>
+<style>
+/* Marke: dunkel mit Gold, Farbwerte und Schriften aus dem Dashboard
+   (shared-theme/industrial-gold.css). Plattformfarben nur als schmales
+   Kennzeichen, nie als Flaeche. */
+@font-face { font-family: "Manrope"; src: url("/brand/fonts/manrope-latin.woff2") format("woff2"); font-weight: 400 800; font-display: swap; }
+@font-face { font-family: "Sora"; src: url("/brand/fonts/sora-latin.woff2") format("woff2"); font-weight: 400 800; font-display: swap; }
+:root {
+  --gold: #c5a059;
+  --gold-hell: #f1d299;
+  --messing: #e0be86;
+  --auf-gold: #241a12;
+  --text: #f2eee6;
+  --dim: #9d968a;
+  --blass: #6f6a61;
+  --linie: rgba(255, 255, 255, .08);
+  --linie-stark: rgba(255, 255, 255, .18);
+  --gruen: #43b581;
+  --warn: #e8a33d;
+  --rot: #ff5a3c;
+  --twitch: #9146ff;
+  --kick: #53fc18;
+  --youtube: #ff0033;
+  --tiktok: #69c9d0;
+  --aus: cubic-bezier(.23, 1, .32, 1);
+  --schrift: "Manrope", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --anzeige: "Sora", "Manrope", system-ui, sans-serif;
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+html { color-scheme: dark; }
+::selection { background: rgba(197, 160, 89, .32); color: var(--text); }
+input { caret-color: var(--gold); }
+/* Grundmass fuer jedes Symbol. Ohne das nimmt ein SVG ohne eigene Groesse
+   die volle Breite seines Kastens und sprengt die Zeile. */
+svg { width: 1em; height: 1em; display: inline-block; vertical-align: -.13em; }
+body {
+  background: linear-gradient(180deg, #121211, #0e0e0d);
+  color: var(--text);
+  font: 14px/1.5 var(--schrift);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+
+header {
+  position: relative;
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 9px 12px;
+  background: rgba(255, 255, 255, .02);
+  border-bottom: 1px solid var(--linie);
+}
+#plattformen { display: flex; gap: 6px; flex-wrap: wrap; min-width: 0; }
+.pille {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 2px 9px; border-radius: 999px;
+  border: 1px solid var(--linie); background: rgba(255, 255, 255, .03);
+  font-size: 12px; color: var(--dim);
+  transition: color 220ms var(--aus), border-color 220ms var(--aus), background-color 220ms var(--aus);
+}
+.pille .punkt { width: 6px; height: 6px; border-radius: 50%; background: #4a463f; transition: background-color 220ms var(--aus), box-shadow 220ms var(--aus); }
+.pille.live { color: var(--text); border-color: var(--linie-stark); background: rgba(255, 255, 255, .06); }
+.pille.live .punkt { background: var(--gruen); animation: atmen 2.8s ease-in-out infinite; }
+.pille.leer { color: var(--blass); }
+@keyframes atmen { 0%, 100% { opacity: 1; } 50% { opacity: .55; } }
+
+.stand {
+  margin-left: auto;
+  display: inline-flex; align-items: center; gap: 5px;
+  font-size: 12px; color: var(--blass); white-space: nowrap;
+}
+.stand::before { content: ""; width: 5px; height: 5px; border-radius: 50%; background: currentColor; opacity: .75; }
+.stand[data-lage="verbindet"] { color: var(--gold); }
+.stand[data-lage="neu"] { color: var(--warn); }
+.stand[data-lage="fehler"] { color: var(--rot); }
+
+main {
+  flex: 1; min-height: 0; overflow-y: auto;
+  padding: 14px 12px 16px;
+  scrollbar-width: thin; scrollbar-color: rgba(255, 255, 255, .16) transparent;
+}
+main::-webkit-scrollbar { width: 8px; }
+main::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, .14); border-radius: 999px; }
+
+.abschnitt { margin-bottom: 18px; }
+.abschnitt:last-of-type { margin-bottom: 0; }
+label, .feldname {
+  display: block;
+  font-size: 13px; font-weight: 600; letter-spacing: 0; text-transform: none;
+  color: var(--text);
+  margin-bottom: 6px;
+}
+.zaehler {
+  display: block; margin-top: 4px; text-align: right;
+  font-size: 12px; color: var(--blass); font-variant-numeric: tabular-nums;
+}
+.zaehler.nah { color: var(--warn); }
+.zaehler.voll { color: var(--rot); }
+.hilfe { margin: 8px 0 0; font-size: 12px; line-height: 1.45; color: var(--blass); }
+.regel { margin-top: 5px; font-size: 12px; color: var(--warn); }
+.regel:empty { display: none; }
+
+input[type="text"], textarea {
+  width: 100%;
+  height: 38px;
+  background: rgba(0, 0, 0, .35);
+  color: var(--text);
+  border: 1px solid var(--linie);
+  border-radius: 6px;
+  padding: 0 10px;
+  font: inherit;
+  font-size: 14px;
+  transition: border-color 180ms var(--aus), background-color 180ms var(--aus);
+}
+textarea {
+  height: auto; min-height: 74px;
+  padding: 8px 10px;
+  line-height: 1.45;
+  resize: vertical;
+}
+input[type="text"]::placeholder, textarea::placeholder { color: var(--blass); }
+input[type="text"]:hover, textarea:hover { border-color: var(--linie-stark); }
+input[type="text"]:focus, textarea:focus { outline: none; border-color: var(--gold); background: rgba(0, 0, 0, .5); }
+input[type="text"]:disabled, textarea:disabled { opacity: .55; }
+
+/* Feld mit Lupe davor, wie die Suchfelder im Twitch-Panel. */
+.suchzeile { position: relative; flex: 1; min-width: 0; }
+.suchzeile .lupe {
+  position: absolute; left: 10px; top: 50%; transform: translateY(-50%);
+  color: var(--blass); pointer-events: none;
+}
+.suchzeile .lupe svg { width: 14px; height: 14px; }
+.suchzeile input[type="text"] { padding-left: 31px; }
+.tagzeile { display: flex; align-items: center; gap: 8px; }
+.zweit {
+  flex: none; height: 38px;
+  border: 1px solid var(--linie); border-radius: 6px;
+  background: rgba(255, 255, 255, .05);
+  color: var(--text);
+  padding: 0 12px;
+  font: inherit; font-size: 13px; font-weight: 600;
+  cursor: pointer;
+  transition: background-color 160ms var(--aus), border-color 160ms var(--aus);
+}
+.zweit:hover { background: rgba(255, 255, 255, .1); border-color: var(--linie-stark); }
+.zweit:disabled { opacity: .45; cursor: default; }
+.chipzeile { display: flex; align-items: flex-start; gap: 8px; margin-top: 8px; }
+.chipzeile .zaehler { flex: none; margin-top: 2px; margin-left: auto; }
+
+/* Kategorie */
+.kategorie { position: relative; }
+#vorschlaege {
+  position: absolute; left: 0; right: 0; top: calc(100% + 4px);
+  z-index: 3; display: none;
+  max-height: 232px; overflow-y: auto;
+  background: #191919;
+  border: 1px solid var(--linie-stark);
+  border-radius: 6px;
+  box-shadow: 0 12px 30px rgba(0, 0, 0, .55);
+  scrollbar-width: thin;
+}
+#vorschlaege button {
+  display: flex; align-items: center; gap: 10px; width: 100%;
+  background: none; border: 0; color: var(--text);
+  padding: 7px 10px; font: inherit; font-size: 13px; text-align: left; cursor: pointer;
+  transition: background-color 150ms var(--aus);
+}
+#vorschlaege button:hover { background: rgba(255, 255, 255, .07); }
+#vorschlaege button:focus-visible { outline: 2px solid var(--gold); outline-offset: -2px; }
+#vorschlaege img { width: 26px; height: 36px; object-fit: cover; border-radius: 4px; flex: none; background: #0d0d0c; }
+#vorschlaege .titel { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#vorschlaege .zuschauer { font-size: 12px; color: var(--blass); font-variant-numeric: tabular-nums; }
+#vorschlaege .quelle { font-size: 12px; color: var(--blass); }
+
+.katkarte {
+  position: relative;
+  display: flex; align-items: flex-start; gap: 12px;
+  padding: 10px 40px 10px 10px;
+  border: 1px solid var(--linie); border-radius: 6px;
+  background: rgba(255, 255, 255, .03);
+  animation: karteRein 240ms var(--aus) both;
+}
+@keyframes karteRein { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: none; } }
+.katkarte img {
+  width: 40px; height: 54px; flex: none;
+  object-fit: cover; border-radius: 4px;
+  background: #0d0d0c;
+  opacity: 0;
+  transition: opacity 260ms var(--aus);
+}
+.katkarte img.da { opacity: 1; }
+.katkarte .text { flex: 1; min-width: 0; }
+.katkarte .name { display: block; font-weight: 700; font-size: 14px; color: var(--text); overflow: hidden; text-overflow: ellipsis; }
+.katkarte .unter { display: block; font-size: 13px; color: var(--dim); margin-top: 3px; }
+.katkarte .weg {
+  position: absolute; top: 8px; right: 8px;
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 24px; height: 24px; padding: 0;
+  border-radius: 6px; border: 1px solid transparent;
+  background: none; color: var(--dim); cursor: pointer;
+  transition: color 160ms var(--aus), background-color 160ms var(--aus);
+}
+.katkarte .weg svg { width: 13px; height: 13px; }
+.katkarte .weg:hover { color: var(--text); background: rgba(255, 255, 255, .08); }
+
+/* Tags */
+#chips { display: flex; flex-wrap: wrap; gap: 6px; min-width: 0; }
+#chips:empty { display: none; }
+.tag {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 3px 8px; border-radius: 6px;
+  background: rgba(255, 255, 255, .06);
+  border: 1px solid var(--linie);
+  font-size: 13px;
+  animation: karteRein 200ms var(--aus) both;
+}
+.tag button {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 14px; height: 14px; padding: 0;
+  border: 0; border-radius: 3px;
+  background: none; color: var(--dim);
+  cursor: pointer;
+  transition: color 150ms var(--aus);
+}
+.tag button svg { width: 9px; height: 9px; }
+.tag button:hover { color: var(--text); }
+
+/* Speichern */
+#nichtgespeichert {
+  display: none;
+  align-items: center; gap: 6px;
+  margin: 0 0 8px;
+  font-size: 12px; color: var(--gold-hell);
+}
+#nichtgespeichert.da { display: flex; }
+#nichtgespeichert::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--gold); }
+footer {
+  flex: none;
+  padding: 12px;
+  border-top: 1px solid var(--linie);
+}
+#speichern {
+  position: relative;
+  width: 100%;
+  display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+  height: 40px;
+  background: var(--gold);
+  color: var(--auf-gold);
+  border: 0; border-radius: 6px;
+  padding: 0 12px;
+  font: inherit; font-weight: 700; font-size: 14px;
+  cursor: pointer;
+  transition: background-color 160ms var(--aus), opacity 180ms var(--aus);
+}
+#speichern:hover { background: var(--gold-hell); }
+#speichern:disabled { opacity: .45; cursor: default; background: var(--gold); }
+.kringel {
+  width: 14px; height: 14px; flex: none;
+  border-radius: 50%;
+  border: 2px solid rgba(36, 26, 18, .28);
+  border-top-color: var(--auf-gold);
+  animation: dreht 700ms linear infinite;
+}
+@keyframes dreht { to { transform: rotate(360deg); } }
+
+#ergebnis { margin-top: 8px; display: flex; flex-direction: column; gap: 4px; }
+.ergebniszeile {
+  display: flex; align-items: center; gap: 7px;
+  font-size: 13px;
+  animation: karteRein 220ms var(--aus) both;
+}
+.ergebniszeile .marke { flex: none; width: 3px; height: 14px; border-radius: 2px; background: #4a463f; }
+.ergebniszeile[data-platform="twitch"] .marke { background: var(--twitch); }
+.ergebniszeile[data-platform="kick"] .marke { background: var(--kick); }
+.ergebniszeile[data-platform="youtube"] .marke { background: var(--youtube); }
+.ergebniszeile[data-platform="tiktok"] .marke { background: var(--tiktok); }
+.ergebniszeile.ok { color: var(--gruen); }
+.ergebniszeile.schief { color: var(--rot); }
+.ergebniszeile svg { width: 13px; height: 13px; flex: none; }
+/* Das Haekchen zeichnet sich, je Plattform kurz versetzt. */
+.ergebniszeile.ok svg path {
+  stroke-dasharray: 26; stroke-dashoffset: 26;
+  animation: zeichnen 420ms var(--aus) forwards;
+}
+@keyframes zeichnen { to { stroke-dashoffset: 0; } }
+
+#meldung { font-size: 12px; padding: 0 12px 8px; color: var(--dim); }
+#meldung.fehler { color: var(--rot); }
+#meldung:empty { display: none; }
+
+@media (prefers-reduced-motion: reduce) {
+  .katkarte, .tag, .ergebniszeile { animation: none; }
+  .ergebniszeile.ok svg path { animation: none; stroke-dashoffset: 0; }
+  .pille.live .punkt { animation: none; }
+  .kringel { animation-duration: 1400ms; }
+}
+</style>
+</head>
+<body>
+<header>
+  <div id="plattformen"></div>
+  <span class="stand" id="verbindung" data-lage="verbindet" aria-live="polite">verbindet</span>
+</header>
+<main>
+  <div class="abschnitt">
+    <label for="titel">Titel</label>
+    <textarea id="titel" maxlength="140" rows="3" placeholder="Worum geht es heute?" autocomplete="off"></textarea>
+    <span class="zaehler" id="titel-zaehler">0/140</span>
+  </div>
+
+  <div class="abschnitt">
+    <span class="feldname">Kategorie</span>
+    <div id="katkarte-platz"></div>
+    <div class="kategorie" id="suchfeld">
+      <label class="visuell-versteckt" for="kategorie" hidden>Kategorie suchen</label>
+      <div class="suchzeile">
+        <span class="lupe" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg></span>
+        <input id="kategorie" type="text" placeholder="Spiel oder Kategorie suchen" autocomplete="off">
+      </div>
+      <div id="vorschlaege" role="listbox" aria-label="Kategorie-Treffer"></div>
+    </div>
+  </div>
+
+  <div class="abschnitt">
+    <label for="tag">Tags</label>
+    <div class="tagzeile">
+      <div class="suchzeile">
+        <span class="lupe" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg></span>
+        <input id="tag" type="text" maxlength="25" placeholder="Tag eingeben" autocomplete="off">
+      </div>
+      <button class="zweit" id="tag-dazu" type="button">Tag hinzufügen</button>
+    </div>
+    <div class="chipzeile">
+      <div id="chips"></div>
+      <span class="zaehler" id="tag-zaehler">0/10</span>
+    </div>
+    <p class="hilfe">Füge bis zu 10 Tags hinzu. Jeder Tag darf 25 Zeichen lang sein und keine Leer- oder Sonderzeichen enthalten.</p>
+    <div class="regel" id="tagregel"></div>
+  </div>
+
+</main>
+<footer>
+  <div id="nichtgespeichert">Noch nicht gespeichert</div>
+  <button id="speichern" type="button"></button>
+  <div id="ergebnis"></div>
+</footer>
+<div id="meldung" role="status"></div>
+<script>
+(function () {
+  "use strict";
+
+  var PFADE = {
+    haken: '<path d="M20 6 9 17l-5-5"/>',
+    kreuz: '<path d="M18 6 6 18M6 6l12 12"/>'
+  };
+  function ikone(name) {
+    var span = document.createElement("span");
+    span.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' + PFADE[name] + "</svg>";
+    var svg = span.firstChild;
+    svg.setAttribute("aria-hidden", "true");
+    return svg;
+  }
+
+  var params = new URLSearchParams(location.search);
+  var token = params.get("t") || "";
+  // Die Adresse ist so geheim wie der Stream-Key. OBS legt sie im Klartext in
+  // der Szenensammlung ab und zeigt sie in den Eigenschaften; wer sie einmal
+  // im normalen Browser oeffnet, hat sie im Verlauf und in der
+  // Browser-Synchronisation stehen. Nach dem Lesen kommt sie deshalb aus der
+  // Adresszeile heraus. Fuer den Rueckweg (Neuladen im OBS-Browser) bleibt sie
+  // in sessionStorage, das nur zu diesem Fenster gehoert.
+  try {
+    if (!token && window.sessionStorage) { token = sessionStorage.getItem("uplink_dock_token") || ""; }
+    if (token && window.sessionStorage) { sessionStorage.setItem("uplink_dock_token", token); }
+    if (params.get("t") && window.history && history.replaceState) {
+      params.delete("t");
+      var rest = params.toString();
+      history.replaceState(null, "", location.pathname + (rest ? "?" + rest : ""));
+    }
+  } catch (e) { /* privater Modus ohne sessionStorage: dann bleibt es wie bisher */ }
+  var titel = document.getElementById("titel");
+  var titelZaehler = document.getElementById("titel-zaehler");
+  var kategorie = document.getElementById("kategorie");
+  var suchfeld = document.getElementById("suchfeld");
+  var vorschlaege = document.getElementById("vorschlaege");
+  var kartePlatz = document.getElementById("katkarte-platz");
+  var chips = document.getElementById("chips");
+  var tagZaehler = document.getElementById("tag-zaehler");
+  var tagEingabe = document.getElementById("tag");
+  var tagKnopf = document.getElementById("tag-dazu");
+  var tagRegel = document.getElementById("tagregel");
+  var speichern = document.getElementById("speichern");
+  var nichtGespeichert = document.getElementById("nichtgespeichert");
+  var ergebnis = document.getElementById("ergebnis");
+  var meldung = document.getElementById("meldung");
+  var verbindung = document.getElementById("verbindung");
+  var plattformen = document.getElementById("plattformen");
+
+  var TITEL_MAX = 140;
+  var TAGS_MAX = 10;
+  var TAG_LAENGE_MAX = 25;
+
+  var tags = [];
+  var kategorieId = null;
+  var kategorieName = "";
+  var kategorieBild = null;
+  var kategorieZuschauer = null;
+  var titelGeaendert = false;
+  var kategorieGeaendert = false;
+  var tagsGeaendert = false;
+  var sucheTimer = null;
+  var sucheLauf = 0;
+  var letzteId = 0;
+  var generation = 0;
+  var sock = null;
+  var wartezeit = 1000;
+  var ohneStatus = 0;
+  var OHNE_STATUS_MAX = 3;
+  var statusGesehen = false;
+  var letzterStand = [];
+
+  speichern.appendChild(document.createTextNode("Fertig"));
+
+  function basis() { return location.pathname.replace(/\/dock\/[a-z-]+\/?$/, ""); }
+  function api(pfad) { return basis() + pfad; }
+  function kopf() { return { "Content-Type": "application/json", "X-Dock-Token": token }; }
+  function anzeige(p) { return { twitch: "Twitch", kick: "Kick", youtube: "YouTube", tiktok: "TikTok" }[p] || p; }
+  function lage(text, art) { verbindung.textContent = text; verbindung.setAttribute("data-lage", art); }
+
+  function setzeMeldung(text, fehler) {
+    meldung.textContent = text || "";
+    meldung.className = fehler ? "fehler" : "";
+  }
+
+  /* Nur Bilder vom Twitch-CDN, damit keine fremde Adresse ins Fenster kommt. */
+  var BILD_HOST = "https://static-cdn.jtvnw.net/";
+  function bildUrl(muster, breite, hoehe) {
+    if (typeof muster !== "string" || muster.indexOf(BILD_HOST) !== 0) return null;
+    return muster.replace("{width}", String(breite)).replace("{height}", String(hoehe));
+  }
+
+  function geaendert() {
+    return titelGeaendert || (kategorieGeaendert && kategorieId) || tagsGeaendert;
+  }
+  function unsauberZeigen() {
+    nichtGespeichert.classList.toggle("da", !!geaendert());
+  }
+
+  function karteZeichnen() {
+    kartePlatz.textContent = "";
+    if (!kategorieName) {
+      suchfeld.style.display = "";
+      kategorie.placeholder = "Spiel oder Kategorie suchen";
+      return;
+    }
+    var karte = document.createElement("div");
+    karte.className = "katkarte";
+    var url = bildUrl(kategorieBild, 88, 120);
+    if (url) {
+      var img = document.createElement("img");
+      img.alt = "";
+      img.loading = "lazy";
+      /* Weicher Bildwechsel: erst laden, dann einblenden. */
+      img.addEventListener("load", function () { img.classList.add("da"); });
+      img.addEventListener("error", function () { img.remove(); });
+      img.src = url;
+      karte.appendChild(img);
+    }
+    var text = document.createElement("div");
+    text.className = "text";
+    var name = document.createElement("span");
+    name.className = "name";
+    name.textContent = kategorieName;
+    name.title = kategorieName;
+    text.appendChild(name);
+    var unter = document.createElement("span");
+    unter.className = "unter";
+    /* Zahlen stehen nur da, wenn sie aus der Suche zu einer frisch gewaehlten
+       Kategorie stammen. Sobald gespeichert ist, sagt die Zeile wieder, woran
+       man gerade ist. */
+    if (kategorieGeaendert && typeof kategorieZuschauer === "number") {
+      unter.textContent = kategorieZuschauer.toLocaleString("de-DE") + " Zuschauer";
+    } else if (kategorieGeaendert) {
+      unter.textContent = "Neu gewählt, noch nicht gespeichert";
+    } else {
+      unter.textContent = "Aktuelle Kategorie";
+    }
+    text.appendChild(unter);
+    karte.appendChild(text);
+    var weg = document.createElement("button");
+    weg.className = "weg";
+    weg.type = "button";
+    weg.title = "Andere Kategorie wählen";
+    weg.setAttribute("aria-label", "Andere Kategorie wählen");
+    weg.appendChild(ikone("kreuz"));
+    weg.addEventListener("click", function () {
+      kategorieName = "";
+      kategorieBild = null;
+      kategorieZuschauer = null;
+      kategorieId = null;
+      kategorieGeaendert = false;
+      karteZeichnen();
+      unsauberZeigen();
+      kategorie.value = "";
+      kategorie.focus();
+      setzeMeldung("Ohne neue Auswahl bleibt die Kategorie, wie sie ist.");
+    });
+    karte.appendChild(weg);
+    kartePlatz.appendChild(karte);
+    suchfeld.style.display = "none";
+  }
+
+  function tagsZeichnen() {
+    chips.textContent = "";
+    tags.forEach(function (t, i) {
+      var chip = document.createElement("span");
+      chip.className = "tag";
+      chip.appendChild(document.createTextNode(t));
+      var weg = document.createElement("button");
+      weg.type = "button";
+      weg.setAttribute("aria-label", t + " entfernen");
+      weg.appendChild(ikone("kreuz"));
+      weg.addEventListener("click", function () {
+        tags.splice(i, 1);
+        tagsGeaendert = true;
+        tagsZeichnen();
+        unsauberZeigen();
+      });
+      chip.appendChild(weg);
+      chips.appendChild(chip);
+    });
+    tagZaehler.textContent = tags.length + "/" + TAGS_MAX;
+    tagZaehler.className = "zaehler" + (tags.length >= TAGS_MAX ? " voll" : (tags.length >= TAGS_MAX - 2 ? " nah" : ""));
+    tagEingabe.disabled = tags.length >= TAGS_MAX;
+    tagKnopf.disabled = tags.length >= TAGS_MAX;
+    tagEingabe.placeholder = tags.length >= TAGS_MAX ? "Mehr als 10 gehen nicht" : "Tag eingeben";
+  }
+
+  function tagHinzu() {
+    var roh = tagEingabe.value.trim();
+    if (!roh) return;
+    var t = roh.replace(/\s+/g, "");
+    /* Der Regelhinweis erscheint nur, wenn wirklich etwas dagegen spricht. */
+    if (t.length > TAG_LAENGE_MAX) { tagRegel.textContent = "Ein Tag darf höchstens 25 Zeichen haben."; return; }
+    /* Twitch nimmt nur Buchstaben und Ziffern. Alles andere wird nicht still
+       weggeputzt, sondern abgelehnt, damit klar ist, warum der Tag fehlt. */
+    if (!/^[\p{L}\p{N}]+$/u.test(t)) { tagRegel.textContent = "Ein Tag darf nur aus Buchstaben und Zahlen bestehen, Sonderzeichen gehen nicht."; return; }
+    if (t !== roh) { tagRegel.textContent = "Leerzeichen gehen nicht, der Tag steht jetzt zusammengeschrieben da."; }
+    else { tagRegel.textContent = ""; }
+    if (tags.length >= TAGS_MAX) { tagRegel.textContent = "Mehr als 10 Tags nimmt Twitch nicht."; return; }
+    if (tags.some(function (x) { return x.toLowerCase() === t.toLowerCase(); })) { tagEingabe.value = ""; return; }
+    tags.push(t);
+    tagsGeaendert = true;
+    tagEingabe.value = "";
+    tagsZeichnen();
+    unsauberZeigen();
+  }
+
+  function titelZaehlerZeigen() {
+    var n = titel.value.length;
+    titelZaehler.textContent = n + "/" + TITEL_MAX;
+    titelZaehler.className = "zaehler" + (n >= TITEL_MAX ? " voll" : (n >= TITEL_MAX - 20 ? " nah" : ""));
+  }
+
+  function standUebernehmen(info, quelle) {
+    if (!info) return;
+    if (quelle !== "live" || !titelGeaendert) {
+      titel.value = info.title || "";
+      titelZaehlerZeigen();
+      if (quelle === "live") titelGeaendert = false;
+    }
+    if (quelle !== "live" || !kategorieGeaendert) {
+      var vorherId = kategorieId;
+      kategorieId = info.category_id || null;
+      kategorieName = info.category_name || "";
+      /* `channel.update` schickt kein Bild mit. Ist die Kategorie dieselbe
+         geblieben, bleibt auch ihr Bild stehen, statt aus der Karte zu
+         verschwinden. */
+      if (info.category_bild) {
+        kategorieBild = info.category_bild;
+      } else if (kategorieId !== vorherId) {
+        kategorieBild = null;
+      }
+      /* Der gespeicherte Stand bringt keine Zuschauerzahl mit. Die kommt nur
+         aus der Suche, also faellt sie hier immer weg. Blieb sie stehen,
+         verdraengte eine einmal gesuchte Zahl "Aktuelle Kategorie" dauerhaft. */
+      kategorieZuschauer = null;
+      if (quelle === "live" || quelle === "gespeichert") kategorieGeaendert = false;
+      kategorie.value = "";
+      karteZeichnen();
+    }
+    if (quelle !== "live" && (!tagsGeaendert || quelle === "gespeichert")) {
+      tags = (info.tags || []).slice(0, TAGS_MAX);
+      tagsGeaendert = false;
+      tagsZeichnen();
+    }
+    unsauberZeigen();
+  }
+
+  function ergebnisZeichnen(liste, wasOk) {
+    ergebnis.textContent = "";
+    if (!liste || !liste.length) return;
+    liste.forEach(function (e, i) {
+      var zeile = document.createElement("div");
+      zeile.className = "ergebniszeile " + (e.ok ? "ok" : "schief");
+      zeile.setAttribute("data-platform", e.platform || "");
+      zeile.style.animationDelay = (i * 70) + "ms";
+      var marke = document.createElement("span");
+      marke.className = "marke";
+      zeile.appendChild(marke);
+      var symbol = ikone(e.ok ? "haken" : "kreuz");
+      symbol.style.animationDelay = (i * 70 + 120) + "ms";
+      zeile.appendChild(symbol);
+      var text = document.createElement("span");
+      /* Auch ein Erfolg kann etwas zu sagen haben: gespeichert ist
+         gespeichert, aber der Stand danach war vielleicht nicht lesbar.
+         Frueher stand hier bei ok fest "Auf Twitch gespeichert", und der
+         Hinweis des Servers kam nie an. */
+      text.textContent = e.ok
+        ? (e.hinweis || ("Auf " + anzeige(e.platform) + " " + wasOk))
+        : (e.hinweis || ("Auf " + anzeige(e.platform) + " hat es nicht geklappt"));
+      zeile.appendChild(text);
+      ergebnis.appendChild(zeile);
+    });
+  }
+
+  function laden() {
+    fetch(api("/v1/stream-info"), { headers: kopf() }).then(function (r) {
+      if (r.status === 401) {
+        setzeMeldung("Diese Adresse gilt nicht mehr. Im Dashboard unter Uplink eine neue erzeugen.", true);
+        speichern.disabled = true;
+        return null;
+      }
+      return r.json();
+    }).then(function (j) {
+      if (!j) return;
+      var liste = j.ergebnisse || [];
+      var erste = liste.filter(function (e) { return e.ok && e.info; })[0];
+      standUebernehmen(erste ? erste.info : null, "geladen");
+      /* Beim Lesen nur zeigen, was schiefging. Ein Erfolg steht schon in den
+         Feldern. */
+      var schief = liste.filter(function (e) { return !e.ok; });
+      ergebnisZeichnen(schief, "gelesen");
+      if (!liste.length) setzeMeldung("Noch keine Plattform verbunden. Im Dashboard unter Uplink eine Plattform verbinden.", true);
+    }).catch(function () {
+      setzeMeldung("Stream-Infos konnten nicht geladen werden", true);
+    });
+  }
+
+  function suchen(q) {
+    var lauf = ++sucheLauf;
+    fetch(api("/v1/stream-info/kategorien?q=" + encodeURIComponent(q)), { headers: kopf() })
+      .then(function (r) {
+        /* Eine leere Liste heisst "gibt es nicht". Wer zu schnell getippt hat,
+           soll das nicht als Antwort auf seine Suche lesen, sondern den Grund
+           sehen; der Server schickt ihn mit. */
+        if (r.status === 429) return r.json().then(function (j) { return { bremse: (j && j.error) || "Zu schnell hintereinander, bitte kurz warten" }; }, function () { return { bremse: "Zu schnell hintereinander, bitte kurz warten" }; });
+        return r.ok ? r.json() : { ergebnisse: [] };
+      })
+      .then(function (j) {
+        /* Eine langsamere aeltere Antwort darf die neuere nicht ueberschreiben. */
+        if (lauf !== sucheLauf) return;
+        if (j && j.bremse) { vorschlaege.textContent = ""; setzeMeldung(j.bremse, true); return; }
+        vorschlaege.textContent = "";
+        var eine = false;
+        (j.ergebnisse || []).forEach(function (e) {
+          (e.info || []).forEach(function (k) {
+            eine = true;
+            var b = document.createElement("button");
+            b.type = "button";
+            var url = bildUrl(k.bild, 52, 72);
+            if (url) {
+              var img = document.createElement("img");
+              img.src = url;
+              img.alt = "";
+              img.loading = "lazy";
+              b.appendChild(img);
+            }
+            var titelSpan = document.createElement("span");
+            titelSpan.className = "titel";
+            titelSpan.textContent = k.name;
+            b.appendChild(titelSpan);
+            if (typeof k.zuschauer === "number") {
+              var z = document.createElement("span");
+              z.className = "zuschauer";
+              z.textContent = k.zuschauer.toLocaleString("de-DE") + " Zuschauer";
+              b.appendChild(z);
+            }
+            var p = document.createElement("span");
+            p.className = "quelle";
+            p.textContent = anzeige(e.platform);
+            b.appendChild(p);
+            b.addEventListener("click", function () {
+              kategorieId = k.id;
+              kategorieName = k.name;
+              kategorieBild = k.bild || null;
+              kategorieZuschauer = typeof k.zuschauer === "number" ? k.zuschauer : null;
+              kategorieGeaendert = true;
+              kategorie.value = "";
+              vorschlaege.style.display = "none";
+              karteZeichnen();
+              unsauberZeigen();
+            });
+            vorschlaege.appendChild(b);
+          });
+        });
+        vorschlaege.style.display = eine ? "block" : "none";
+      })
+      .catch(function () { if (lauf === sucheLauf) vorschlaege.style.display = "none"; });
+  }
+
+  function speichernLage(laedt) {
+    speichern.textContent = "";
+    if (laedt) {
+      var kringel = document.createElement("span");
+      kringel.className = "kringel";
+      speichern.appendChild(kringel);
+      speichern.appendChild(document.createTextNode("Speichert"));
+    } else {
+      speichern.appendChild(document.createTextNode("Fertig"));
+    }
+    speichern.disabled = laedt;
+  }
+
+  function speichernKlick() {
+    var patch = {};
+    if (titelGeaendert) patch.title = titel.value.replace(/[\r\n]+/g, " ").trim();
+    if (kategorieGeaendert && kategorieId) patch.category_id = kategorieId;
+    if (tagsGeaendert) patch.tags = tags.slice();
+    if (!Object.keys(patch).length) { setzeMeldung("Nichts geändert"); return; }
+    speichernLage(true);
+    setzeMeldung("");
+    fetch(api("/v1/stream-info"), { method: "PUT", headers: kopf(), body: JSON.stringify(patch) })
+      .then(function (r) { return r.json().then(function (j) { return { status: r.status, json: j }; }, function () { return { status: r.status, json: {} }; }); })
+      .then(function (a) {
+        if (a.status === 200) {
+          var liste = a.json.ergebnisse || [];
+          ergebnisZeichnen(liste, "gespeichert");
+          /* Gespeichert ist gespeichert, auch wenn der Stand danach nicht
+             lesbar war. Ohne diese Trennung stand gleichzeitig "Gespeichert"
+             und die Marke "nicht gespeichert" auf dem Schirm. */
+          var etwasOk = liste.some(function (e) { return e.ok; });
+          if (etwasOk) {
+            titelGeaendert = false; kategorieGeaendert = false; tagsGeaendert = false;
+          }
+          var erste = liste.filter(function (e) { return e.ok && e.info; })[0];
+          if (erste) {
+            standUebernehmen(erste.info, "gespeichert");
+          } else if (etwasOk) {
+            /* Gespeichert, aber der Stand danach war nicht lesbar. Die Zahl aus
+               der Kategoriesuche gilt trotzdem nicht mehr, sonst bliebe sie ohne
+               das Neuzeichnen auf der Karte stehen. */
+            kategorieZuschauer = null;
+            karteZeichnen();
+          }
+          if (!liste.length) setzeMeldung("Noch keine Plattform verbunden. Im Dashboard unter Uplink eine Plattform verbinden.", true);
+          unsauberZeigen();
+        } else if (a.status === 401) {
+          setzeMeldung("Diese Adresse gilt nicht mehr. Im Dashboard unter Uplink eine neue erzeugen.", true);
+        } else {
+          setzeMeldung((a.json && a.json.error) || "Speichern hat nicht geklappt", true);
+        }
+      })
+      .catch(function () { setzeMeldung("Speichern hat nicht geklappt, keine Verbindung", true); })
+      .then(function () { speichernLage(false); });
+  }
+
+  function wsUrl() {
+    var proto = location.protocol === "https:" ? "wss:" : "ws:";
+    return proto + "//" + location.host + basis() + "/v1/chat/ws?t=" + encodeURIComponent(token) + "&arten=info&seit=" + letzteId + (generation ? "&gen=" + generation : "");
+  }
+
+  function pilleBauen(p) {
+    var span = document.createElement("span");
+    span.className = "pille" + (p.verbunden ? " live" : "");
+    span.setAttribute("data-platform", p.platform);
+    span.appendChild(document.createTextNode(anzeige(p.platform)));
+    var punkt = document.createElement("span");
+    punkt.className = "punkt";
+    span.appendChild(punkt);
+    /* Speichern geht auch ohne laufenden Stream. Der Punkt sagt nur, ob
+       gerade gesendet wird, nicht ob das Fenster arbeitet. */
+    span.title = p.verbunden ? "Stream läuft" : "Verbunden, Stream läuft gerade nicht";
+    return span;
+  }
+
+  function statusAnzeigen(stand) {
+    if (stand) letzterStand = stand;
+    var sichtbar = letzterStand.filter(function (p) { return p.eingerichtet || p.verbunden; });
+    if (!stand) {
+      sichtbar = sichtbar.map(function (p) {
+        return { platform: p.platform, eingerichtet: true, verbunden: false };
+      });
+    }
+    plattformen.textContent = "";
+    if (!sichtbar.length) {
+      var hinweis = document.createElement("span");
+      hinweis.className = "pille leer";
+      hinweis.textContent = "Noch keine Plattform verbunden";
+      plattformen.appendChild(hinweis);
+      return;
+    }
+    sichtbar.forEach(function (p) { plattformen.appendChild(pilleBauen(p)); });
+  }
+
+  function verbinden() {
+    if (!statusGesehen) lage("verbindet", "verbindet");
+    try { sock = new WebSocket(wsUrl()); } catch (e) { neuVerbinden(); return; }
+    sock.onopen = function () { wartezeit = 1000; statusGesehen = false; };
+    sock.onmessage = function (ev) {
+      var daten;
+      try { daten = JSON.parse(ev.data); } catch (e) { return; }
+      if (daten && daten.typ === "status") {
+        statusGesehen = true;
+        ohneStatus = 0;
+        lage("verbunden", "verbunden");
+        if (typeof daten.generation === "number" && daten.generation !== generation) {
+          if (generation !== 0) letzteId = 0;
+          generation = daten.generation;
+        }
+        statusAnzeigen(daten.plattformen);
+        return;
+      }
+      if (daten && daten.ereignis && daten.ereignis.typ === "info") {
+        if (typeof daten.id === "number" && daten.id > letzteId) letzteId = daten.id;
+        standUebernehmen(daten.ereignis, "live");
+      }
+    };
+    sock.onclose = function (ev) {
+      /* Eine abgelehnte Adresse meldet im Browser nur 1006. Nach ein paar
+         Versuchen ohne Statusrahmen sagen wir, was los ist, statt still
+         weiter zu versuchen. */
+      if (ev && ev.code === 1012) { wartezeit = 1000; neuVerbinden("verbindet neu"); return; }
+      if (ev && ev.code === 1008) {
+        /* Der Server hat dieses Fenster ausdruecklich beendet: entweder gilt
+           die Adresse nicht mehr, oder es waren zu viele Fenster offen. Beides
+           aendert sich nicht dadurch, dass wir es gleich noch einmal
+           versuchen. Frueher fiel dieser Fall in den Standardzweig: das
+           ausgeworfene Fenster war nach einer Sekunde zurueck und warf das
+           naechste hinaus, und das lief endlos so weiter. */
+        aufgeben(ev.reason);
+        return;
+      }
+      if (!statusGesehen) ohneStatus += 1;
+      if (ohneStatus >= OHNE_STATUS_MAX) { neuVerbinden("Diese Adresse gilt nicht mehr oder Uplink ist gerade nicht erreichbar", "fehler"); return; }
+      neuVerbinden("verbindet neu");
+    };
+    sock.onerror = function () { try { sock.close(); } catch (e) {} };
+  }
+
+  /* Ende ohne Rueckweg. Kein neuer Versuch, dafuer der Grund im Klartext. */
+  function aufgeben(grund) {
+    statusGesehen = false;
+    lage(grund || "Dieses Fenster wurde geschlossen", "fehler");
+    statusAnzeigen(null);
+  }
+
+  function neuVerbinden(text, art) {
+    lage(text || "verbindet neu", art || "neu");
+    statusAnzeigen(null);
+    setTimeout(verbinden, wartezeit);
+    wartezeit = Math.min(wartezeit * 2, 30000);
+  }
+
+  titel.addEventListener("input", function () { titelGeaendert = true; titelZaehlerZeigen(); unsauberZeigen(); });
+  /* Enter im Titel speichert nicht: sonst geht ein Titel raus, den der
+     Streamer nur zu Ende tippen wollte. */
+  titel.addEventListener("keydown", function (ev) { if (ev.key === "Enter") ev.preventDefault(); });
+  kategorie.addEventListener("input", function () {
+    clearTimeout(sucheTimer);
+    var q = kategorie.value.trim();
+    if (q.length < 2) { vorschlaege.style.display = "none"; return; }
+    sucheTimer = setTimeout(function () { suchen(q); }, 300);
+  });
+  kategorie.addEventListener("blur", function () { setTimeout(function () { vorschlaege.style.display = "none"; }, 150); });
+  tagEingabe.addEventListener("keydown", function (ev) {
+    if (ev.key === "Enter" || ev.key === ",") { ev.preventDefault(); tagHinzu(); }
+  });
+  tagKnopf.addEventListener("click", function () { tagHinzu(); tagEingabe.focus(); });
+  speichern.addEventListener("click", speichernKlick);
+
+  tagsZeichnen();
+  titelZaehlerZeigen();
+  statusAnzeigen([]);
+  if (!token) {
+    lage("Adresse ungültig", "fehler");
+    setzeMeldung("Diese Adresse hat keinen Zugang. Im Dashboard unter Uplink die Adresse für dieses Fenster kopieren.", true);
+    speichern.disabled = true;
+  } else {
+    laden();
+    verbinden();
+  }
+})();
+</script>
+</body>
+</html>

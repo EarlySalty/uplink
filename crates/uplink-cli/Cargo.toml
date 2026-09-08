@@ -1,0 +1,19 @@
+[package]
+name = "uplink-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde.workspace = true
+toml.workspace = true
+uplink-core.workspace = true
+
+[[bin]]
+name = "uplink"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+

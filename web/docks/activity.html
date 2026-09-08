@@ -1,0 +1,689 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<!-- Die Adresse enthaelt den geheimen Teil im Query-Teil. Kein Referrer,
+     damit keine eingebundene Fremdadresse (etwa Twitch-Boxart) ihn
+     mitgeschickt bekommt. -->
+<meta name="referrer" content="no-referrer">
+<title>Uplink Aktivität</title>
+<style>
+/* Marke: dunkel mit Gold, Farbwerte und Schriften aus dem Dashboard
+   (shared-theme/industrial-gold.css). Plattformfarben nur als schmales
+   Kennzeichen, nie als Flaeche. */
+@font-face { font-family: "Manrope"; src: url("/brand/fonts/manrope-latin.woff2") format("woff2"); font-weight: 400 800; font-display: swap; }
+@font-face { font-family: "Sora"; src: url("/brand/fonts/sora-latin.woff2") format("woff2"); font-weight: 400 800; font-display: swap; }
+:root {
+  --ink: #0b0b0b;
+  --gold: #c5a059;
+  --gold-hell: #f1d299;
+  --messing: #e0be86;
+  --auf-gold: #241a12;
+  --text: #f2eee6;
+  --dim: #9d968a;
+  --blass: #6f6a61;
+  --linie: rgba(255, 255, 255, .08);
+  --linie-stark: rgba(255, 255, 255, .18);
+  --gruen: #43b581;
+  --warn: #e8a33d;
+  --rot: #ff5a3c;
+  --rost: #dd6a4d;
+  --twitch: #9146ff;
+  --kick: #53fc18;
+  --youtube: #ff0033;
+  --tiktok: #69c9d0;
+  --aus: cubic-bezier(.23, 1, .32, 1);
+  --schrift: "Manrope", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --anzeige: "Sora", "Manrope", system-ui, sans-serif;
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+html { color-scheme: dark; }
+::selection { background: rgba(197, 160, 89, .32); color: var(--text); }
+/* Grundmass fuer jedes Symbol. Ohne das nimmt ein SVG ohne eigene Groesse
+   die volle Breite seines Kastens und sprengt die Zeile. */
+svg { width: 1em; height: 1em; display: inline-block; vertical-align: -.13em; }
+body {
+  background: linear-gradient(180deg, #121211, #0e0e0d);
+  color: var(--text);
+  font: 14px/1.5 var(--schrift);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+
+header {
+  position: relative;
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 9px 12px;
+  background: rgba(255, 255, 255, .02);
+  border-bottom: 1px solid var(--linie);
+}
+#plattformen { display: flex; gap: 6px; flex-wrap: wrap; min-width: 0; }
+.pille {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 2px 9px; border-radius: 999px;
+  border: 1px solid var(--linie); background: rgba(255, 255, 255, .03);
+  font-size: 12px; color: var(--dim);
+  transition: color 220ms var(--aus), border-color 220ms var(--aus), background-color 220ms var(--aus);
+}
+.pille .punkt { width: 6px; height: 6px; border-radius: 50%; background: #4a463f; transition: background-color 220ms var(--aus), box-shadow 220ms var(--aus); }
+.pille.live { color: var(--text); border-color: var(--linie-stark); background: rgba(255, 255, 255, .06); }
+.pille.live .punkt { background: var(--gruen); animation: atmen 2.8s ease-in-out infinite; }
+.pille.leer { color: var(--blass); }
+@keyframes atmen { 0%, 100% { opacity: 1; } 50% { opacity: .55; } }
+
+.stand {
+  margin-left: auto;
+  display: inline-flex; align-items: center; gap: 5px;
+  font-size: 12px; color: var(--blass); white-space: nowrap;
+}
+.stand::before { content: ""; width: 5px; height: 5px; border-radius: 50%; background: currentColor; opacity: .75; }
+.stand[data-lage="verbindet"] { color: var(--gold); }
+.stand[data-lage="neu"] { color: var(--warn); }
+.stand[data-lage="fehler"] { color: var(--rot); }
+
+/* Filterreihe */
+#filter {
+  display: flex; gap: 6px;
+  padding: 8px 12px;
+  overflow-x: auto;
+  border-bottom: 1px solid var(--linie);
+  scrollbar-width: none;
+}
+#filter::-webkit-scrollbar { display: none; }
+.chip {
+  flex: none;
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 3px 10px; border-radius: 999px;
+  border: 1px solid var(--linie); background: transparent;
+  color: var(--dim); font: inherit; font-size: 12.5px; white-space: nowrap; cursor: pointer;
+  transition: color 180ms var(--aus), background-color 180ms var(--aus), border-color 180ms var(--aus);
+}
+.chip svg { width: 12px; height: 12px; }
+.chip:hover { color: var(--text); background: rgba(255, 255, 255, .05); }
+.chip[aria-pressed="true"] {
+  color: var(--gold-hell); font-weight: 600;
+  border-color: rgba(197, 160, 89, .45);
+  background: rgba(197, 160, 89, .12);
+}
+
+#fehlend {
+  font-size: 12px; color: var(--gold-hell);
+  background: rgba(197, 160, 89, .08);
+  border-bottom: 1px solid var(--linie);
+  padding: 6px 12px;
+  display: none;
+}
+
+#liste {
+  flex: 1; min-height: 0;
+  display: flex; flex-direction: column;
+  overflow-y: auto; padding: 0 0 8px;
+  scrollbar-width: thin; scrollbar-color: rgba(255, 255, 255, .16) transparent;
+}
+#liste::-webkit-scrollbar { width: 8px; }
+#liste::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, .14); border-radius: 999px; }
+
+.eintrag {
+  position: relative;
+  overflow: hidden;
+  /* `#liste` ist Column-Flex-Container, `overflow: hidden` setzt hier
+     `min-height` faktisch auf 0. Ohne `flex: none` staucht der Container
+     ab dem ersten Ueberlauf jeden Eintrag flach, statt zu scrollen. */
+  flex: none;
+  display: flex; gap: 10px; align-items: flex-start;
+  padding: 10px 12px;
+  border-bottom: 1px solid rgba(255, 255, 255, .06);
+  word-break: break-word;
+  transition: background-color 160ms var(--aus);
+  animation: reinschieben 260ms var(--aus) both;
+}
+.eintrag:hover { background: rgba(255, 255, 255, .03); }
+@keyframes reinschieben { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: none; } }
+/* Kurzer Gold-Schimmer, genau einmal, nur bei frisch eingetroffenen Zeilen. */
+.eintrag.frisch::after {
+  content: "";
+  position: absolute; top: 0; bottom: 0; left: 0; width: 45%;
+  pointer-events: none;
+  background: linear-gradient(105deg, transparent 12%, rgba(241, 210, 153, .17) 50%, transparent 88%);
+  transform: translateX(-130%);
+  animation: schimmer 950ms var(--aus) 1 both;
+}
+@keyframes schimmer { to { transform: translateX(340%); } }
+
+/* Nur das Symbol traegt Farbe, wie in der Twitch-Aktivitaet. Keine Kachel
+   drumherum, damit die Zeile ruhig bleibt. */
+.symbol {
+  flex: none;
+  width: 18px; height: 18px;
+  display: flex; align-items: center; justify-content: center;
+  margin-top: 2px;
+  color: var(--ton, var(--gold-hell));
+}
+.symbol svg { width: 17px; height: 17px; }
+.eintrag[data-gruppe="follow"] { --ton: #7fe0b0; }
+.eintrag[data-gruppe="abo"] { --ton: var(--gold-hell); }
+.eintrag[data-gruppe="geschenk"] { --ton: var(--messing); }
+.eintrag[data-gruppe="bits"] { --ton: var(--gold-hell); }
+.eintrag[data-gruppe="raid"] { --ton: #ffbfa8; }
+
+.eintrag .inhalt { flex: 1; min-width: 0; }
+.eintrag .wer { display: block; font-weight: 700; font-size: 14px; color: var(--text); }
+.eintrag .untenzeile { display: block; margin-top: 1px; font-size: 13px; }
+.eintrag .satz { color: var(--dim); }
+.eintrag .trenner { color: var(--blass); margin: 0 5px; }
+.eintrag .notiz {
+  display: block; margin-top: 5px;
+  padding: 6px 9px; border-radius: 6px;
+  background: rgba(255, 255, 255, .04); border: 1px solid var(--linie);
+  color: var(--text); font-size: 13px;
+}
+.eintrag .zeit { color: var(--blass); white-space: nowrap; }
+.eintrag .marke { display: none; flex: none; width: 3px; border-radius: 2px; align-self: stretch; background: #4a463f; }
+body.mehrere .eintrag .marke { display: block; }
+.eintrag[data-platform="twitch"] .marke { background: var(--twitch); }
+.eintrag[data-platform="kick"] .marke { background: var(--kick); }
+.eintrag[data-platform="youtube"] .marke { background: var(--youtube); }
+.eintrag[data-platform="tiktok"] .marke { background: var(--tiktok); }
+
+/* Raids und Geschenk-Abos sind der groessere Moment. Statt einer eigenen
+   Kachel pulst nur das Symbol kurz, die Zeile bleibt eine Zeile. */
+.eintrag.gross.frisch .symbol { animation: sympuls 1.5s var(--aus) 2 both; }
+@keyframes sympuls { 0%, 100% { transform: scale(1); } 45% { transform: scale(1.13); } }
+/* Bits funkeln genau einmal. */
+.eintrag[data-gruppe="bits"].frisch .symbol { animation: funkeln 1.2s ease-out 1 both; }
+@keyframes funkeln {
+  0% { filter: none; }
+  22% { filter: brightness(1.85) drop-shadow(0 0 7px rgba(241, 210, 153, .75)); }
+  55% { filter: brightness(1.1); }
+  100% { filter: none; }
+}
+
+.leerzustand { flex: none; padding: 14px 12px 6px; }
+.willkommen {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--dim);
+}
+
+#meldung { font-size: 12px; padding: 0 12px 6px; color: var(--rot); }
+#meldung:empty { display: none; }
+
+@media (prefers-reduced-motion: reduce) {
+  .eintrag { animation: none; }
+  .eintrag.frisch::after,
+  .eintrag.gross.frisch .symbol,
+  .eintrag[data-gruppe="bits"].frisch .symbol { animation: none; }
+  .pille.live .punkt { animation: none; }
+}
+</style>
+</head>
+<body>
+<header>
+  <div id="plattformen"></div>
+  <span class="stand" id="verbindung" data-lage="verbindet" aria-live="polite">verbindet</span>
+</header>
+<div id="filter" role="group" aria-label="Nach Art filtern"></div>
+<div id="fehlend"></div>
+<div id="liste" role="log">
+  <div class="leerzustand" id="leer">
+    <p class="willkommen" id="leertext">Follows, Abos, Bits und Raids erscheinen hier.</p>
+  </div>
+</div>
+<div id="meldung" role="status"></div>
+<script>
+(function () {
+  "use strict";
+
+  var PFADE = {
+    herz: '<path d="M20.8 4.6a5.5 5.5 0 0 0-7.8 0L12 5.7l-1-1.1a5.5 5.5 0 1 0-7.8 7.8l1.1 1L12 21l7.7-7.6 1.1-1a5.5 5.5 0 0 0 0-7.8z"/>',
+    stern: '<path d="m12 2.6 2.9 6 6.6.9-4.8 4.6 1.2 6.5L12 17.5l-5.9 3.1 1.2-6.5L2.5 9.5l6.6-.9z"/>',
+    paket: '<path d="M20 12v9H4v-9"/><path d="M2 7h20v5H2z"/><path d="M12 21V7"/><path d="M12 7H7.5a2.5 2.5 0 0 1 0-5C11 2 12 7 12 7z"/><path d="M12 7h4.5a2.5 2.5 0 0 0 0-5C13 2 12 7 12 7z"/>',
+    diamant: '<path d="M6 3h12l4 6-10 12L2 9z"/><path d="M2 9h20"/><path d="m11 3-3 6 4 12 4-12-3-6"/>',
+    fahne: '<path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V4s-1 1-4 1-5-2-8-2-4 1-4 1z"/><path d="M4 22V4"/>',
+    alle: '<path d="M4 6h16M4 12h16M4 18h10"/>'
+  };
+  function ikone(name) {
+    var span = document.createElement("span");
+    span.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">' + PFADE[name] + "</svg>";
+    var svg = span.firstChild;
+    svg.setAttribute("aria-hidden", "true");
+    return svg;
+  }
+
+  var params = new URLSearchParams(location.search);
+  var token = params.get("t") || "";
+  // Die Adresse ist so geheim wie der Stream-Key. OBS legt sie im Klartext in
+  // der Szenensammlung ab und zeigt sie in den Eigenschaften; wer sie einmal
+  // im normalen Browser oeffnet, hat sie im Verlauf und in der
+  // Browser-Synchronisation stehen. Nach dem Lesen kommt sie deshalb aus der
+  // Adresszeile heraus. Fuer den Rueckweg (Neuladen im OBS-Browser) bleibt sie
+  // in sessionStorage, das nur zu diesem Fenster gehoert.
+  try {
+    if (!token && window.sessionStorage) { token = sessionStorage.getItem("uplink_dock_token") || ""; }
+    if (token && window.sessionStorage) { sessionStorage.setItem("uplink_dock_token", token); }
+    if (params.get("t") && window.history && history.replaceState) {
+      params.delete("t");
+      var rest = params.toString();
+      history.replaceState(null, "", location.pathname + (rest ? "?" + rest : ""));
+    }
+  } catch (e) { /* privater Modus ohne sessionStorage: dann bleibt es wie bisher */ }
+  var liste = document.getElementById("liste");
+  var leer = document.getElementById("leer");
+  var leertext = document.getElementById("leertext");
+  var meldung = document.getElementById("meldung");
+  var verbindung = document.getElementById("verbindung");
+  var plattformen = document.getElementById("plattformen");
+  var filterreihe = document.getElementById("filter");
+  var fehlend = document.getElementById("fehlend");
+
+  var letzteId = 0;
+  var generation = 0;
+  var ohneStatus = 0;
+  var OHNE_STATUS_MAX = 3;
+  var statusGesehen = false;
+  var gesehen = {};
+  var gesehenReihe = [];
+  var MAX_ZEILEN = 200;
+  /* Beim Oeffnen nur der Nachlauf der letzten Viertelstunde: was laenger her
+     ist, hilft dem Streamer nicht mehr und schiebt Neues aus dem Bild.
+     Die Grenze gilt ausschliesslich fuer diesen ersten Schwung. Alles, was
+     das Fenster spaeter per `seit=` nachfordert, hat es verpasst und bekommt
+     es, egal wie alt es ist. */
+  var NACHLAUF_MS = 15 * 60 * 1000;
+  /* So lange nach dem ersten Verbinden greift die Altersgrenze. Danach nie
+     wieder, auch nicht nach einem Abriss. */
+  var NACHLAUF_FENSTER_MS = 2000;
+  var nachlaufBis = 0;
+  /* So frisch gilt ein Ereignis als eben passiert und bekommt den Schimmer. */
+  var FRISCH_MS = 20 * 1000;
+  var sock = null;
+  var wartezeit = 1000;
+  var filterAktiv = "alle";
+  /* Letzter Stand vom Server. Nach einem Abriss bleiben die Plattformen
+     stehen, aber keine davon leuchtet mehr gruen. */
+  var letzterStand = [];
+
+  var GRUPPEN = [
+    { id: "alle", name: "Alle", symbol: "alle" },
+    { id: "follow", name: "Follows", symbol: "herz" },
+    { id: "abo", name: "Abos", symbol: "stern" },
+    { id: "geschenk", name: "Geschenke", symbol: "paket" },
+    { id: "bits", name: "Bits", symbol: "diamant" },
+    { id: "raid", name: "Raids", symbol: "fahne" }
+  ];
+
+  GRUPPEN.forEach(function (g) {
+    var knopf = document.createElement("button");
+    knopf.className = "chip";
+    knopf.type = "button";
+    knopf.setAttribute("data-gruppe", g.id);
+    knopf.setAttribute("aria-pressed", g.id === "alle" ? "true" : "false");
+    knopf.appendChild(ikone(g.symbol));
+    knopf.appendChild(document.createTextNode(g.name));
+    knopf.addEventListener("click", function () { filterSetzen(g.id); });
+    filterreihe.appendChild(knopf);
+  });
+
+  function filterSetzen(id) {
+    filterAktiv = id;
+    var knoepfe = filterreihe.querySelectorAll(".chip");
+    for (var i = 0; i < knoepfe.length; i++) {
+      knoepfe[i].setAttribute("aria-pressed", knoepfe[i].getAttribute("data-gruppe") === id ? "true" : "false");
+    }
+    var eintraege = liste.querySelectorAll(".eintrag");
+    for (var j = 0; j < eintraege.length; j++) {
+      var passt = id === "alle" || eintraege[j].getAttribute("data-gruppe") === id;
+      eintraege[j].style.display = passt ? "" : "none";
+    }
+    leerPruefen();
+  }
+
+  function sichtbare() {
+    var eintraege = liste.querySelectorAll(".eintrag");
+    var n = 0;
+    for (var i = 0; i < eintraege.length; i++) if (eintraege[i].style.display !== "none") n += 1;
+    return n;
+  }
+
+  function leerPruefen() {
+    if (sichtbare() > 0) {
+      if (leer) { leer.remove(); leer = null; leertext = null; }
+      return;
+    }
+    if (!leer) {
+      leer = document.createElement("div");
+      leer.className = "leerzustand";
+      leertext = document.createElement("p");
+      leertext.className = "willkommen";
+      leer.appendChild(leertext);
+      liste.appendChild(leer);
+    }
+    leertext.textContent = filterAktiv === "alle" || !liste.querySelector(".eintrag")
+      ? "Follows, Abos, Bits und Raids erscheinen hier."
+      : "Für diesen Filter ist gerade nichts dabei.";
+  }
+
+  function basis() { return location.pathname.replace(/\/dock\/[a-z-]+\/?$/, ""); }
+  function wsUrl() {
+    var proto = location.protocol === "https:" ? "wss:" : "ws:";
+    return proto + "//" + location.host + basis() + "/v1/chat/ws?t=" + encodeURIComponent(token) + "&arten=activity&seit=" + letzteId + (generation ? "&gen=" + generation : "");
+  }
+  function anzeige(p) { return { twitch: "Twitch", kick: "Kick", youtube: "YouTube", tiktok: "TikTok" }[p] || p; }
+  function lage(text, art) { verbindung.textContent = text; verbindung.setAttribute("data-lage", art); }
+
+  /* Mitternacht des lokalen Tages, in dem der Zeitpunkt liegt. */
+  function tagesBeginn(ms) {
+    var d = new Date(ms);
+    d.setHours(0, 0, 0, 0);
+    return d.getTime();
+  }
+  /* Kalendertage zwischen zwei Zeitpunkten. Das Runden faengt die Tage mit
+     23 oder 25 Stunden ab, die bei der Zeitumstellung entstehen. */
+  function tageDazwischen(vonMs, bisMs) {
+    return Math.max(0, Math.round((tagesBeginn(bisMs) - tagesBeginn(vonMs)) / 86400000));
+  }
+
+  function relativ(iso) {
+    var d = new Date(iso).getTime();
+    if (isNaN(d)) return "";
+    var jetzt = Date.now();
+    var s = Math.max(0, Math.round((jetzt - d) / 1000));
+    if (s < 45) return "gerade eben";
+    var m = Math.round(s / 60);
+    if (m < 60) return "vor " + m + " Min.";
+    /* Ob etwas gestern war, entscheidet der Kalender und nicht die Stundenzahl:
+       Montag 23:00 und Mittwoch 09:00 liegen keine 48 Stunden auseinander, sind
+       aber zwei Tage. Darum beide Zeitpunkte auf lokale Mitternacht ziehen. */
+    var t = tageDazwischen(d, jetzt);
+    if (t === 0) {
+      /* Am selben Tag koennen 23 Stunden und 55 Minuten auf 24 aufrunden. Das
+         waere ein voller Tag und passt nicht zu etwas, das heute war. */
+      var h = Math.round(m / 60);
+      return "vor " + (h > 23 ? 23 : h) + " Std.";
+    }
+    /* Wie bei Twitch: die ersten beiden Tage haben ein eigenes Wort. */
+    if (t === 1) return "gestern";
+    if (t === 2) return "vorgestern";
+    return "vor " + t + " Tagen";
+  }
+
+  function stufe(tier) {
+    if (tier === "Prime" || tier === "prime") return "Prime";
+    if (tier === "2000") return "Stufe 2";
+    if (tier === "3000") return "Stufe 3";
+    if (tier === "1000") return "Stufe 1";
+    return null;
+  }
+  function aufStufe(tier) {
+    var s = stufe(tier);
+    if (!s) return "";
+    return s === "Prime" ? " mit Prime" : " auf " + s;
+  }
+
+  /* Satz je Art, wie ihn ein Streamer lesen wuerde. */
+  function beschreibung(e) {
+    var wer = e.actor ? (e.actor.display || e.actor.login) : "Anonym";
+    switch (e.art) {
+      case "follow":
+        return { gruppe: "follow", symbol: "herz", wer: wer, satz: "Ist dir gefolgt." };
+      case "subscribe":
+        return {
+          gruppe: "abo", symbol: "stern", wer: wer,
+          satz: e.is_gift
+            ? "Hat ein geschenktes Abo" + aufStufe(e.tier) + " bekommen."
+            : "Hat" + (aufStufe(e.tier) || "") + " abonniert."
+        };
+      case "resub": {
+        var monate = e.months || 1;
+        var satz = "Hat erneut für " + monate + (monate === 1 ? " Monat" : " Monate") + aufStufe(e.tier) + " abonniert.";
+        if (e.streak) satz += " " + e.streak + (e.streak === 1 ? " Monat" : " Monate") + " am Stück.";
+        return { gruppe: "abo", symbol: "stern", wer: wer, satz: satz, notiz: e.message || "" };
+      }
+      case "sub_gift": {
+        var anzahl = e.count || 1;
+        return {
+          gruppe: "geschenk", symbol: "paket", wer: wer,
+          satz: anzahl === 1
+            ? "Hat ein Abo" + aufStufe(e.tier) + " verschenkt."
+            : "Hat " + anzahl + " Abos" + aufStufe(e.tier) + " verschenkt."
+        };
+      }
+      case "cheer": {
+        var bits = e.bits || 0;
+        return {
+          gruppe: "bits", symbol: "diamant", wer: wer,
+          satz: bits === 1 ? "Hat 1 Bit geschickt." : "Hat " + bits + " Bits geschickt.",
+          notiz: e.message || ""
+        };
+      }
+      case "raid": {
+        var zuschauer = e.viewers || 0;
+        return {
+          gruppe: "raid", symbol: "fahne", wer: e.actor ? wer : (e.from || wer),
+          satz: zuschauer === 1
+            ? "Hat dich mit 1 Zuschauer geraidet."
+            : "Hat dich mit " + zuschauer + " Zuschauern geraidet."
+        };
+      }
+      /* Stream-Start, Stream-Ende und geaenderte Stream-Infos gehoeren nicht
+         in diesen Strom: die ersten beiden werden gar nicht abonniert, die
+         dritte laeuft als `info` ins Stream-Info-Fenster. */
+      default:
+        return null;
+    }
+  }
+
+  function eintragBauen(e, frisch) {
+    var b = beschreibung(e);
+    if (!b) return null;
+    var gross = b.gruppe === "raid" || b.gruppe === "geschenk";
+    var div = document.createElement("div");
+    div.className = "eintrag" + (gross ? " gross" : "") + (frisch ? " frisch" : "");
+    div.setAttribute("data-platform", e.platform || "");
+    div.setAttribute("data-gruppe", b.gruppe);
+
+    var marke = document.createElement("span");
+    marke.className = "marke";
+    marke.title = anzeige(e.platform);
+    div.appendChild(marke);
+
+    var symbol = document.createElement("span");
+    symbol.className = "symbol";
+    symbol.appendChild(ikone(b.symbol));
+    div.appendChild(symbol);
+
+    /* Aufbau wie in der Twitch-Aktivitaet: Name in der ersten Zeile, der
+       Satz und die Zeitangabe darunter. */
+    var inhalt = document.createElement("div");
+    inhalt.className = "inhalt";
+    var wer = document.createElement("span");
+    wer.className = "wer";
+    wer.textContent = b.wer;
+    inhalt.appendChild(wer);
+
+    var unten = document.createElement("span");
+    unten.className = "untenzeile";
+    var satz = document.createElement("span");
+    satz.className = "satz";
+    satz.textContent = b.satz;
+    unten.appendChild(satz);
+    var trenner = document.createElement("span");
+    trenner.className = "trenner";
+    trenner.textContent = "\u00b7";
+    unten.appendChild(trenner);
+    var z = document.createElement("span");
+    z.className = "zeit";
+    z.setAttribute("data-ts", e.occurred_at || "");
+    z.textContent = relativ(e.occurred_at);
+    unten.appendChild(z);
+    inhalt.appendChild(unten);
+
+    if (b.notiz) {
+      var notiz = document.createElement("span");
+      notiz.className = "notiz";
+      notiz.textContent = b.notiz;
+      inhalt.appendChild(notiz);
+    }
+    div.appendChild(inhalt);
+    return div;
+  }
+
+  function zeitenNachziehen() {
+    var alle = liste.querySelectorAll(".zeit[data-ts]");
+    for (var i = 0; i < alle.length; i++) alle[i].textContent = relativ(alle[i].getAttribute("data-ts"));
+  }
+  setInterval(zeitenNachziehen, 30000);
+
+  function anhaengen(rahmen) {
+    if (!rahmen || !rahmen.ereignis || rahmen.ereignis.typ !== "activity") return;
+    var e = rahmen.ereignis;
+    if (typeof rahmen.id === "number" && rahmen.id > letzteId) letzteId = rahmen.id;
+    var alter = Date.now() - new Date(e.occurred_at).getTime();
+    if (isNaN(alter)) alter = 0;
+    if (Date.now() < nachlaufBis && alter > NACHLAUF_MS) return;
+    var key = e.dedupe_key || ((e.platform || "") + ":" + (e.channel_id || "") + ":" + e.art + ":" + e.occurred_at);
+    if (gesehen[key]) return;
+    gesehen[key] = true;
+    gesehenReihe.push(key);
+    if (gesehenReihe.length > 2000) delete gesehen[gesehenReihe.shift()];
+    var eintrag = eintragBauen(e, alter <= FRISCH_MS);
+    if (!eintrag) return;
+    if (filterAktiv !== "alle" && eintrag.getAttribute("data-gruppe") !== filterAktiv) eintrag.style.display = "none";
+    if (leer) { leer.remove(); leer = null; leertext = null; }
+    /* Wer nach unten gescrollt hat, liest gerade etwas. Neue Zeilen oben
+       duerfen ihm den Text nicht unter dem Blick wegschieben. */
+    var obenVorher = liste.scrollTop;
+    var hoeheVorher = liste.scrollHeight;
+    liste.insertBefore(eintrag, liste.firstChild);
+    while (liste.children.length > MAX_ZEILEN) liste.removeChild(liste.lastChild);
+    if (obenVorher > 0) liste.scrollTop = obenVorher + (liste.scrollHeight - hoeheVorher);
+    leerPruefen();
+  }
+
+  var SCOPE_NAMEN = {
+    "moderator:read:followers": "Follows",
+    "channel:read:subscriptions": "Abos",
+    "bits:read": "Bits",
+    "channel:read:redemptions": "Kanalpunkte"
+  };
+
+  function pilleBauen(p) {
+    var span = document.createElement("span");
+    span.className = "pille" + (p.verbunden ? " live" : "");
+    span.setAttribute("data-platform", p.platform);
+    span.appendChild(document.createTextNode(anzeige(p.platform)));
+    var punkt = document.createElement("span");
+    punkt.className = "punkt";
+    span.appendChild(punkt);
+    span.title = p.verbunden ? "Stream läuft" : (p.hinweis || "Stream läuft gerade nicht");
+    return span;
+  }
+
+  function statusAnzeigen(stand) {
+    if (stand) letzterStand = stand;
+    var sichtbar = letzterStand.filter(function (p) { return p.eingerichtet || p.verbunden; });
+    if (!stand) {
+      sichtbar = sichtbar.map(function (p) {
+        return { platform: p.platform, eingerichtet: true, verbunden: false, hinweis: "Verbindung zu Uplink kommt gerade zurück", fehlende_scopes: p.fehlende_scopes };
+      });
+    }
+    plattformen.textContent = "";
+    if (!sichtbar.length) {
+      var hinweis = document.createElement("span");
+      hinweis.className = "pille leer";
+      hinweis.textContent = "Noch keine Plattform verbunden";
+      plattformen.appendChild(hinweis);
+    } else {
+      sichtbar.forEach(function (p) { plattformen.appendChild(pilleBauen(p)); });
+    }
+    document.body.classList.toggle("mehrere", sichtbar.filter(function (p) { return p.verbunden; }).length > 1);
+
+    var fehlt = [];
+    sichtbar.forEach(function (p) {
+      (p.fehlende_scopes || []).forEach(function (s) {
+        var n = SCOPE_NAMEN[s];
+        if (n && fehlt.indexOf(n) < 0) fehlt.push(n);
+      });
+    });
+    if (fehlt.length) {
+      fehlend.textContent = fehlt.join(", ") + " fehlen noch. Im Dashboard unter Uplink die Plattform neu verbinden.";
+      fehlend.style.display = "block";
+    } else {
+      fehlend.style.display = "none";
+    }
+  }
+
+  function verbinden() {
+    if (!statusGesehen) lage("verbindet", "verbindet");
+    /* Nur der erste Verbindungsaufbau holt den ganzen Puffer und darf kuerzen.
+       Jeder spaetere nennt ein `seit=` und bekommt gezielt das Verpasste. */
+    nachlaufBis = letzteId === 0 ? Date.now() + NACHLAUF_FENSTER_MS : 0;
+    try { sock = new WebSocket(wsUrl()); } catch (e) { neuVerbinden(); return; }
+    sock.onopen = function () { wartezeit = 1000; statusGesehen = false; };
+    sock.onmessage = function (ev) {
+      var daten;
+      try { daten = JSON.parse(ev.data); } catch (e) { return; }
+      if (daten && daten.typ === "status") {
+        statusGesehen = true;
+        ohneStatus = 0;
+        lage("verbunden", "verbunden");
+        if (typeof daten.generation === "number" && daten.generation !== generation) {
+          if (generation !== 0) letzteId = 0;
+          generation = daten.generation;
+        }
+        statusAnzeigen(daten.plattformen);
+        return;
+      }
+      anhaengen(daten);
+    };
+    sock.onclose = function (ev) {
+      if (ev && ev.code === 1012) { wartezeit = 1000; neuVerbinden("verbindet neu"); return; }
+      if (ev && ev.code === 1008) {
+        /* Der Server hat dieses Fenster ausdruecklich beendet: entweder gilt
+           die Adresse nicht mehr, oder es waren zu viele Fenster offen. Beides
+           aendert sich nicht dadurch, dass wir es gleich noch einmal
+           versuchen. Frueher fiel dieser Fall in den Standardzweig: das
+           ausgeworfene Fenster war nach einer Sekunde zurueck und warf das
+           naechste hinaus, und das lief endlos so weiter. */
+        aufgeben(ev.reason);
+        return;
+      }
+      if (!statusGesehen) ohneStatus += 1;
+      if (ohneStatus >= OHNE_STATUS_MAX) { neuVerbinden("Diese Adresse gilt nicht mehr oder Uplink ist gerade nicht erreichbar", "fehler"); return; }
+      neuVerbinden("verbindet neu");
+    };
+    sock.onerror = function () { try { sock.close(); } catch (e) {} };
+  }
+
+  /* Ende ohne Rueckweg. Kein neuer Versuch, dafuer der Grund im Klartext. */
+  function aufgeben(grund) {
+    statusGesehen = false;
+    lage(grund || "Dieses Fenster wurde geschlossen", "fehler");
+    statusAnzeigen(null);
+  }
+
+  function neuVerbinden(text, art) {
+    lage(text || "verbindet neu", art || "neu");
+    statusAnzeigen(null);
+    setTimeout(verbinden, wartezeit);
+    wartezeit = Math.min(wartezeit * 2, 30000);
+  }
+
+  if (!token) {
+    lage("Adresse ungültig", "fehler");
+    meldung.textContent = "Diese Adresse hat keinen Zugang. Im Dashboard unter Uplink die Adresse für dieses Fenster kopieren.";
+    statusAnzeigen([]);
+  } else {
+    statusAnzeigen([]);
+    verbinden();
+  }
+})();
+</script>
+</body>
+</html>

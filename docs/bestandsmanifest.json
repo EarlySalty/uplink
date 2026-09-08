@@ -1,0 +1,136 @@
+{
+  "version": 1,
+  "erfasst_am": "2026-09-08",
+  "status": "Quellassets gesichert; nicht an den neuen Dienst angebunden; kein Funktionsnachweis",
+  "quelle": {
+    "repository": "EarlySalty/rs-relay",
+    "commit": "78c6b4ab7ec65ba0f6f074ae1467f592d7ffd79c"
+  },
+  "kopierte_dateien": [
+    {
+      "quelle": "static/dock/chat.html",
+      "ziel": "web/docks/chat.html",
+      "bytes": 49275,
+      "sha256": "78065a9d6f95ce57ab2d1121c7be3c16dc1d01fc6a291bffefae54f48420c7e0",
+      "git_blob": "31b3a8db362b5f6d35cca7bb771fc848a04426fc",
+      "veraendert": false
+    },
+    {
+      "quelle": "static/dock/activity.html",
+      "ziel": "web/docks/activity.html",
+      "bytes": 27897,
+      "sha256": "7ac4a68ec7eb91cbdcfa371201c4977570a96fbb047a45e2add323e5919b7705",
+      "git_blob": "9d8692ddbcfd04909f5e36baa1127ac265496d97",
+      "veraendert": false
+    },
+    {
+      "quelle": "static/dock/points.html",
+      "ziel": "web/docks/points.html",
+      "bytes": 23338,
+      "sha256": "3e3552966290b194b6de721283fdc66e2fbce3c23ee1f0c87e9b3b8cae73308f",
+      "git_blob": "95b479ca7177767e0c879b1694e97cd02851baa7",
+      "veraendert": false
+    },
+    {
+      "quelle": "static/dock/stream-info.html",
+      "ziel": "web/docks/stream-info.html",
+      "bytes": 37825,
+      "sha256": "ddba6ac75d2e18e6abf49405007b44191b9835fe61869549301ef1eb43a46b4b",
+      "git_blob": "bfa30efb7a15956f4788cd7451f99c63aa85ec11",
+      "veraendert": false
+    }
+  ],
+  "externe_bestandsorte": [
+    {
+      "repository": "EarlySalty/Deadlock-Twitch-Bot",
+      "commit": "020f1c9182722c1c24de63682586a7962b244603",
+      "pfad": "bot/dashboard_v2/src/pages/Uplink.tsx",
+      "sha256": "ddfd00d01e10cde55e425e3eb2bc52dc40c92b5d237e74b6d6df880d1e23c17e",
+      "kopiert": false
+    },
+    {
+      "repository": "EarlySalty/Deadlock-Twitch-Bot",
+      "commit": "020f1c9182722c1c24de63682586a7962b244603",
+      "pfad": "bot/dashboard_v2/src/pages/UplinkZiel.tsx",
+      "sha256": "af4635f21dee6adc3cccf0a4a7a7fefa1a8efe301cfb760cebba1795d653e7f6",
+      "kopiert": false
+    },
+    {
+      "repository": "EarlySalty/Deadlock-Twitch-Bot",
+      "commit": "020f1c9182722c1c24de63682586a7962b244603",
+      "pfad": "bot/dashboard_v2/src/api/uplink.ts",
+      "sha256": "e4124a785d9ef3589d6dc269bff2cea0b7fa9ff1f3f78c10598f30f6532a9a03",
+      "kopiert": false
+    },
+    {
+      "repository": "EarlySalty/Deadlock-Twitch-Bot",
+      "commit": "020f1c9182722c1c24de63682586a7962b244603",
+      "pfad": "bot/dashboard_v2/src/pages/OverlayBuilder.tsx",
+      "sha256": "7d280a36bdafe77040346bb78357e96583b30b29cc9c4bf5cc9d356363d9fe42",
+      "kopiert": false
+    },
+    {
+      "repository": "EarlySalty/Deadlock-Twitch-Bot",
+      "commit": "020f1c9182722c1c24de63682586a7962b244603",
+      "pfad": "bot/dashboard_v2/src/components/verwaltung/OverlayBuilderSection.tsx",
+      "sha256": "8520a18b9d2ba5eca02c34b7b956eb4a083bd81134fdbb3cc3d20466ada04ec8",
+      "kopiert": false
+    },
+    {
+      "repository": "EarlySalty/Deadlock-Twitch-Bot",
+      "commit": "020f1c9182722c1c24de63682586a7962b244603",
+      "pfad": "rust/crates/tb-dashboard-api/src/handlers/overlay.rs",
+      "sha256": "fe65fac6b830602dd716bb8c7b0a75b4fa72a06ceade112bec7ee29235eb1c5a",
+      "kopiert": false
+    },
+    {
+      "repository": "EarlySalty/Deadlock-Twitch-Bot",
+      "commit": "020f1c9182722c1c24de63682586a7962b244603",
+      "pfad": "rust/crates/tb-dashboard-api/src/handlers/uplink.rs",
+      "sha256": "5c95c3bcacc037228389f5e6a75054d4e2d4eebcff58ec815d495e78e1eecab2",
+      "kopiert": false
+    },
+    {
+      "repository": "EarlySalty/Deadlock-Twitch-Bot",
+      "commit": "020f1c9182722c1c24de63682586a7962b244603",
+      "pfad": "rust/crates/tb-dashboard-api/src/handlers/platform_token.rs",
+      "sha256": "ccdd35a8e9cf0b5882302a885b2296d31b7f4fc3ab030ff3ef1d7be51f861479",
+      "kopiert": false
+    },
+    {
+      "repository": "EarlySalty/Deadlock-Twitch-Bot",
+      "commit": "020f1c9182722c1c24de63682586a7962b244603",
+      "pfad": "rust/crates/tb-dashboard-api/src/handlers/platform_store.rs",
+      "sha256": "7d80f0791747479fcd49b68dbdf0dbb854587a85f308de2d30bd23b54e68779e",
+      "kopiert": false
+    },
+    {
+      "repository": "EarlySalty/Deadlock-Twitch-Bot",
+      "commit": "020f1c9182722c1c24de63682586a7962b244603",
+      "pfad": "rust/crates/tb-dashboard-api/src/handlers/plattform_connect.rs",
+      "sha256": "2b10c0b6ba264a45604f374e15205da739f494c46b0fa84d5c6a35ac51da466f",
+      "kopiert": false
+    },
+    {
+      "repository": "EarlySalty/Deadlock-Twitch-Bot",
+      "commit": "020f1c9182722c1c24de63682586a7962b244603",
+      "pfad": "rust/crates/tb-dashboard-api/src/handlers/plattform_oauth.rs",
+      "sha256": "39be3b84b385b275daea5c3725bc2a8ae4d2dae02cfa966a981b7f9127f67b4a",
+      "kopiert": false
+    }
+  ],
+  "ausgeschlossen": [
+    "Alter Medienkern: src/ingest, src/session, src/transcode, src/twitch_eb.rs, src/gate.rs, src/monitor.rs",
+    "Alter Anwendungszustand, Konfiguration, Datenbankmigrationen, Tokenwerte, Laufzeitdaten, Logs, Medienaufnahmen, .git, target",
+    "Chatcode bleibt referenzierter Bestand bis zum Entkoppeln und Prüfen; keine unkompilierte Kopie"
+  ],
+  "pruefungen": {
+    "datum": "2026-09-08",
+    "bytevergleich": "4 von 4 Dateien entsprechen dem festgehaltenen Commit",
+    "sha256": "4 von 4 stimmen",
+    "browser_javascript_syntax": "4 Inline-Skripte mit node:vm ohne Ausführung geparst",
+    "secret_scan": "gitleaks detect --no-git --redact über web/docks, Exit 0; keine Treffer",
+    "browser_live_test": false,
+    "plattform_live_test": false
+  }
+}

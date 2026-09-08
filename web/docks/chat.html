@@ -1,0 +1,1303 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<!-- Die Adresse enthaelt den geheimen Teil im Query-Teil. Kein Referrer,
+     damit keine eingebundene Fremdadresse (etwa Twitch-Boxart) ihn
+     mitgeschickt bekommt. -->
+<meta name="referrer" content="no-referrer">
+<title>Uplink Chat</title>
+<style>
+/* Marke: dunkel mit Gold, Farbwerte und Schriften aus dem Dashboard
+   (shared-theme/industrial-gold.css). Plattformfarben nur als schmales
+   Kennzeichen, nie als Flaeche. */
+@font-face { font-family: "Manrope"; src: url("/brand/fonts/manrope-latin.woff2") format("woff2"); font-weight: 400 800; font-display: swap; }
+@font-face { font-family: "Sora"; src: url("/brand/fonts/sora-latin.woff2") format("woff2"); font-weight: 400 800; font-display: swap; }
+:root {
+  --ink: #0b0b0b;
+  --flaeche: #101010;
+  --leiste: #161616;
+  --karte: rgba(28, 28, 28, .82);
+  --gold: #c5a059;
+  --gold-hell: #f1d299;
+  --messing: #e0be86;
+  --auf-gold: #241a12;
+  --text: #f2eee6;
+  --dim: #9d968a;
+  --blass: #6f6a61;
+  --linie: rgba(255, 255, 255, .08);
+  --linie-stark: rgba(255, 255, 255, .18);
+  --gruen: #43b581;
+  --warn: #e8a33d;
+  --rot: #ff5a3c;
+  --twitch: #9146ff;
+  --kick: #53fc18;
+  --youtube: #ff0033;
+  --tiktok: #69c9d0;
+  --aus: cubic-bezier(.23, 1, .32, 1);
+  --schrift: "Manrope", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --anzeige: "Sora", "Manrope", system-ui, sans-serif;
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+html { color-scheme: dark; }
+::selection { background: rgba(197, 160, 89, .32); color: var(--text); }
+input { caret-color: var(--gold); }
+/* Grundmass fuer jedes Symbol. Ohne das nimmt ein SVG ohne eigene Groesse
+   die volle Breite seines Kastens und sprengt die Zeile. */
+svg { width: 1em; height: 1em; display: inline-block; vertical-align: -.13em; }
+body {
+  background: linear-gradient(180deg, #121211, #0e0e0d);
+  color: var(--text);
+  font: 14px/1.5 var(--schrift);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Kopfzeile wie im Twitch-Chatfenster: der Name des Bereichs mittig, die
+   Schalter am Rand. Plattform und Verbindung stehen in der Zeile darunter. */
+header {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 10px 40px;
+  border-bottom: 1px solid var(--linie);
+}
+header .titel {
+  font-size: 14px; font-weight: 700; color: var(--text);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.leiste-oben {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--linie);
+}
+#plattformen { display: flex; gap: 6px; flex-wrap: wrap; min-width: 0; }
+.pille {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--linie);
+  background: rgba(255, 255, 255, .03);
+  font-size: 12px;
+  color: var(--dim);
+  transition: color 220ms var(--aus), border-color 220ms var(--aus), background-color 220ms var(--aus);
+}
+.pille .punkt {
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: #4a463f;
+  transition: background-color 220ms var(--aus), box-shadow 220ms var(--aus);
+}
+.pille.live { color: var(--text); border-color: var(--linie-stark); background: rgba(255, 255, 255, .06); }
+.pille.live .punkt { background: var(--gruen); animation: atmen 2.8s ease-in-out infinite; }
+.pille.leer { color: var(--blass); }
+@keyframes atmen { 0%, 100% { opacity: 1; } 50% { opacity: .55; } }
+
+.stand {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  color: var(--blass);
+  white-space: nowrap;
+}
+.stand::before { content: ""; width: 5px; height: 5px; border-radius: 50%; background: currentColor; opacity: .75; }
+.stand[data-lage="verbindet"] { color: var(--gold); }
+.stand[data-lage="neu"] { color: var(--warn); }
+.stand[data-lage="fehler"] { color: var(--rot); }
+.kopfknopf {
+  position: absolute; right: 8px; top: 50%; transform: translateY(-50%);
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 26px; height: 26px; padding: 0;
+  border-radius: 6px; border: 1px solid transparent;
+  background: none; color: var(--dim); cursor: pointer;
+  transition: color 180ms var(--aus), background-color 180ms var(--aus), border-color 180ms var(--aus);
+}
+.kopfknopf svg { width: 14px; height: 14px; }
+.kopfknopf:hover { background: rgba(255, 255, 255, .07); color: var(--text); }
+.kopfknopf[aria-pressed="true"] { color: var(--gold-hell); background: rgba(197, 160, 89, .12); border-color: var(--linie); }
+@media (hover: hover) and (pointer: fine) { .kopfknopf:hover { color: var(--messing); } }
+
+/* Kennzahlen als ruhige Leiste, nicht als Kasten: eine Zeile Titel, darunter
+   der Wert. Geblaettert wird ueber die Punkte rechts. */
+#bits {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 9px 12px 10px;
+  border-bottom: 1px solid var(--linie);
+  font-size: 13px;
+}
+#bits .zeile-kopf {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+#bits .kopf {
+  flex: 1;
+  min-width: 0;
+  font-size: 13px; font-weight: 600; letter-spacing: 0; text-transform: none;
+  color: var(--text);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.rang {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 1px 0;
+  animation: einblenden 220ms var(--aus) both;
+}
+.rang .platz {
+  width: 16px; height: 16px; flex: none;
+  display: inline-flex; align-items: center; justify-content: center;
+  border-radius: 5px;
+  font-size: 10px; font-weight: 800;
+  color: var(--auf-gold);
+}
+.rang[data-platz="1"] .platz { background: linear-gradient(135deg, #f1d299, #c5a059); }
+.rang[data-platz="2"] .platz { background: linear-gradient(135deg, #e0be86, #9a7c42); }
+.rang[data-platz="3"] .platz { background: linear-gradient(135deg, #a98c56, #806534); }
+.rang .wer {
+  flex: 1; min-width: 0;
+  color: var(--text); font-weight: 700;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.rang .menge { flex: none; color: var(--gold-hell); font-variant-numeric: tabular-nums; font-size: 13px; }
+
+/* Liste */
+#listenraum { position: relative; flex: 1; min-height: 0; display: flex; flex-direction: column; }
+#liste {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+  padding: 6px 8px 8px;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, .16) transparent;
+}
+#liste::-webkit-scrollbar { width: 8px; }
+#liste::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, .14); border-radius: 999px; }
+.zeile {
+  position: relative;
+  display: flex;
+  gap: 7px;
+  padding: 4px 10px;
+  margin-bottom: 1px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  word-break: break-word;
+  animation: einblenden 220ms var(--aus) both;
+}
+@keyframes einblenden { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+.zeile .inhalt { flex: 1; min-width: 0; }
+.zeile .name { font-weight: 700; color: var(--messing); margin-right: 2px; }
+.zeile .doppel { color: var(--blass); margin-right: 4px; }
+.zeile .zeit { flex: none; font-size: 12px; color: var(--blass); margin-top: 2px; font-variant-numeric: tabular-nums; }
+
+/* Erwaehnung des Streamers: goldener Balken links, warme Flaeche. */
+.zeile.erwaehnt {
+  background: linear-gradient(90deg, rgba(197, 160, 89, .14), rgba(197, 160, 89, .02) 62%, transparent);
+}
+.zeile.erwaehnt::before {
+  content: "";
+  position: absolute; left: 0; top: 3px; bottom: 3px; width: 3px;
+  border-radius: 2px;
+  background: linear-gradient(180deg, var(--gold-hell), var(--gold));
+}
+/* Eigene Nachricht: feiner Goldrand. */
+.zeile.eigene { border-color: rgba(197, 160, 89, .34); background: rgba(197, 160, 89, .06); }
+
+/* Plattform-Kennzeichen nur, wenn mehr als eine Plattform sendet. */
+.zeile .marke { display: none; flex: none; width: 3px; border-radius: 2px; align-self: stretch; background: #4a463f; opacity: .8; }
+body.mehrere .zeile .marke { display: block; }
+.zeile[data-platform="twitch"] .marke { background: var(--twitch); }
+.zeile[data-platform="kick"] .marke { background: var(--kick); }
+.zeile[data-platform="youtube"] .marke { background: var(--youtube); }
+.zeile[data-platform="tiktok"] .marke { background: var(--tiktok); }
+
+.abz {
+  display: inline-flex; align-items: center; gap: 3px;
+  height: 15px; padding: 0 5px; margin-right: 4px;
+  border-radius: 4px; border: 1px solid transparent;
+  font-size: 9.5px; font-weight: 800; letter-spacing: .03em;
+  vertical-align: 1px;
+}
+.abz svg { width: 9px; height: 9px; }
+.abz img { width: 15px; height: 15px; border-radius: 3px; display: block; }
+.abz.bild { padding: 0; border: 0; background: none; }
+.abz.moderator { color: #7fe0b0; background: rgba(67, 181, 129, .16); border-color: rgba(67, 181, 129, .34); }
+.abz.broadcaster { color: #ffc4b6; background: rgba(255, 90, 60, .16); border-color: rgba(255, 90, 60, .34); }
+.abz.subscriber, .abz.founder { color: var(--gold-hell); background: rgba(197, 160, 89, .18); border-color: rgba(197, 160, 89, .40); }
+.abz.vip { color: #e5b6ff; background: rgba(196, 120, 255, .14); border-color: rgba(196, 120, 255, .32); }
+.abz.staff, .abz.admin, .abz.global_mod { color: #b9c6ff; background: rgba(140, 160, 255, .14); border-color: rgba(140, 160, 255, .30); }
+
+.emote {
+  height: 22px; width: auto;
+  vertical-align: -5px;
+  margin: 0 1px;
+  transform-origin: center bottom;
+  transition: transform 170ms var(--aus);
+}
+@media (hover: hover) and (pointer: fine) { .emote:hover { transform: scale(1.4); } }
+.erw { color: var(--messing); font-weight: 600; }
+.erw.mich { color: var(--gold-hell); background: rgba(197, 160, 89, .20); border-radius: 4px; padding: 0 3px; }
+.bits { color: var(--gold-hell); font-weight: 700; }
+.bits svg { width: 11px; height: 11px; }
+.aktion { font-style: italic; color: var(--messing); }
+
+.antwort {
+  display: block;
+  position: relative;
+  margin-bottom: 1px;
+  padding-left: 13px;
+  font-size: 12.5px;
+  color: var(--blass);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.antwort::before {
+  content: "";
+  position: absolute; left: 3px; top: 6px; width: 6px; height: 6px;
+  border-left: 1px solid var(--linie-stark);
+  border-top: 1px solid var(--linie-stark);
+  border-radius: 3px 0 0 0;
+}
+
+.leerzustand { flex: none; padding: 12px 10px 6px; }
+.willkommen {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--dim);
+}
+
+/* Fusszeile: das Feld als Pille, der Sendeknopf in Gold daneben. */
+footer {
+  position: relative;
+  padding: 10px 12px 12px;
+  border-top: 1px solid var(--linie);
+}
+.feld { display: flex; align-items: center; gap: 8px; }
+#eingabe {
+  flex: 1; min-width: 0;
+  height: 38px;
+  background: rgba(255, 255, 255, .05);
+  color: var(--text);
+  border: 1px solid var(--linie);
+  border-radius: 999px;
+  padding: 0 16px;
+  font: inherit;
+  font-size: 14px;
+  transition: border-color 180ms var(--aus), background-color 180ms var(--aus);
+}
+#eingabe::placeholder { color: var(--blass); }
+#eingabe:hover { border-color: var(--linie-stark); }
+#eingabe:focus { outline: none; border-color: var(--gold); background: rgba(255, 255, 255, .07); }
+#eingabe:disabled { opacity: .6; }
+#senden {
+  flex: none;
+  display: inline-flex; align-items: center; justify-content: center;
+  height: 38px;
+  background: var(--gold);
+  color: var(--auf-gold);
+  border: 0; border-radius: 999px;
+  padding: 0 20px;
+  font: inherit; font-weight: 700; font-size: 14px;
+  cursor: pointer;
+  transition: background-color 160ms var(--aus), opacity 180ms var(--aus);
+}
+#senden:hover { background: var(--gold-hell); }
+#senden:disabled { opacity: .4; cursor: default; background: var(--gold); }
+.zaehlerzeile { display: flex; align-items: center; gap: 8px; margin-top: 6px; min-height: 15px; }
+#zaehler { margin-left: auto; font-size: 12px; color: var(--blass); font-variant-numeric: tabular-nums; }
+#zaehler.nah { color: var(--warn); }
+#zaehler.voll { color: var(--rot); }
+
+/* Sendefeedback je Plattform, verschwindet nach drei Sekunden. */
+#rueckmeldung { display: flex; flex-wrap: wrap; gap: 4px 10px; font-size: 12px; }
+#rueckmeldung .melde {
+  display: inline-flex; align-items: center; gap: 4px;
+  color: var(--dim);
+  opacity: 1;
+  transform: none;
+  transition: opacity 260ms var(--aus), transform 260ms var(--aus);
+}
+#rueckmeldung .melde svg { width: 11px; height: 11px; }
+#rueckmeldung .melde.ok { color: var(--gruen); }
+#rueckmeldung .melde.schief { color: var(--rot); }
+#rueckmeldung .melde.geht { opacity: 0; transform: translateY(-3px); }
+
+#unten {
+  position: absolute; left: 50%; transform: translateX(-50%) translateY(4px);
+  bottom: 10px;
+  display: none;
+  align-items: center; gap: 5px;
+  background: var(--gold);
+  color: var(--auf-gold);
+  border: 0; border-radius: 999px;
+  padding: 5px 13px;
+  font: inherit; font-size: 12px; font-weight: 700;
+  cursor: pointer;
+  box-shadow: 0 10px 22px rgba(0, 0, 0, .55);
+  opacity: 0;
+  transition: opacity 200ms var(--aus), transform 200ms var(--aus);
+}
+#unten svg { width: 11px; height: 11px; }
+#unten.da { display: inline-flex; opacity: 1; transform: translateX(-50%) translateY(0); }
+#unten:active { transform: translateX(-50%) scale(.97); }
+
+#meldung { font-size: 12px; padding: 0 12px 6px; color: var(--rot); background: transparent; }
+#meldung:empty { display: none; }
+
+/* Karussell: dieselbe Leiste, eine Karte nach der anderen. */
+#bits .karte { display: flex; flex-direction: column; gap: 2px; min-width: 0; width: 100%; transition: opacity 150ms var(--aus); }
+#bits.wechsel .karte { opacity: 0; }
+#bits .kopf .zeitraum { color: var(--dim); font-weight: 400; margin-left: 6px; }
+#bits .kopf .quelle {
+  margin-left: 6px;
+  padding: 0 4px;
+  border: 1px solid var(--linie);
+  border-radius: 4px;
+  color: var(--dim);
+  font-weight: 400; font-size: 12px;
+}
+#bits .satz { color: var(--text); font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#bits .satz.platzhalter { color: var(--dim); }
+/* Die Pfeile sitzen rechts neben den Punkten und bleiben blass, bis man
+   sie anfasst. Sie sollen nicht mit der Zahl um Aufmerksamkeit ringen. */
+#bits .pfeil {
+  flex: none;
+  width: 16px; height: 16px; padding: 0;
+  border: 0; border-radius: 4px;
+  background: none;
+  color: var(--blass);
+  font: inherit; font-size: 8px; line-height: 1;
+  cursor: pointer;
+  transition: color 150ms var(--aus);
+}
+#bits .pfeil:hover { color: var(--text); }
+#bits .punkte { display: flex; gap: 4px; align-items: center; flex: none; }
+#bits .punkte button {
+  width: 5px; height: 5px; padding: 0;
+  border: 0; border-radius: 50%;
+  background: rgba(255, 255, 255, .22);
+  cursor: pointer;
+  transition: background-color 150ms var(--aus);
+}
+#bits .punkte button.an { background: var(--gold); }
+
+/* Hervorhebungen: Erstchatter Gold, Raider Gold auf Schwarz, beides
+   zugleich holografisch (GRILLME C5). */
+.zeile.hh .kopfzeile {
+  display: block;
+  font-family: var(--anzeige);
+  font-size: 9px; font-weight: 700; letter-spacing: .10em; text-transform: uppercase;
+  margin-bottom: 2px;
+}
+.zeile.hh-erstchat {
+  background: rgba(197, 160, 89, .13);
+  border-color: rgba(197, 160, 89, .45);
+}
+.zeile.hh-erstchat .kopfzeile { color: var(--gold-hell); }
+.zeile.hh-raider {
+  background: #000;
+  border-color: var(--gold);
+}
+.zeile.hh-raider .kopfzeile { color: var(--gold-hell); }
+.zeile.hh-raider .name { color: var(--gold-hell); }
+.zeile.hh-raider_erstchat {
+  border-color: var(--gold-hell);
+  background-image: linear-gradient(110deg, #12100b, #3d2f0e, #4b2f6b, #10514f, #3d2f0e, #12100b);
+  background-size: 300% 100%;
+  animation: holo 9s linear infinite;
+}
+.zeile.hh-raider_erstchat .kopfzeile { color: #ffe9a8; }
+.zeile.hh-raider_erstchat .name { color: #ffe9a8; }
+@keyframes holo { from { background-position: 0% 50%; } to { background-position: 300% 50%; } }
+
+@media (prefers-reduced-motion: reduce) {
+  .zeile, .rang { animation: none; }
+  .zeile.hh-raider_erstchat { animation: none; background-position: 30% 50%; }
+  #bits .karte { transition: none; }
+  .pille.live .punkt { animation: none; }
+  .emote { transition: none; }
+  #unten, #rueckmeldung .melde { transition-duration: 1ms; }
+}
+</style>
+</head>
+<body>
+<header>
+  <span class="titel">Stream-Chat</span>
+  <button class="kopfknopf" id="zeitschalter" type="button" aria-pressed="false" title="Uhrzeit je Nachricht zeigen" aria-label="Uhrzeit je Nachricht zeigen"></button>
+</header>
+<div class="leiste-oben">
+  <div id="plattformen"></div>
+  <span class="stand" id="verbindung" data-lage="verbindet" aria-live="polite">verbindet</span>
+</div>
+<div id="bits" aria-label="Zahlen zum Stream">
+  <span class="kopf">Kennzahlen</span>
+  <span class="satz platzhalter">Sobald Zuschauer da sind</span>
+</div>
+<div id="listenraum">
+<div id="liste" role="log">
+  <div class="leerzustand" id="leer">
+    <p class="willkommen" id="willkommen">Herzlich willkommen im Chatraum!</p>
+  </div>
+</div>
+<button id="unten" type="button"></button>
+</div>
+<footer>
+  <div class="feld">
+    <input id="eingabe" type="text" maxlength="500" placeholder="Nachricht an alle Plattformen" autocomplete="off" aria-label="Nachricht">
+    <button id="senden" type="button"></button>
+  </div>
+  <div class="zaehlerzeile">
+    <div id="rueckmeldung"></div>
+    <span id="zaehler">0/500</span>
+  </div>
+</footer>
+<div id="meldung" role="status"></div>
+<script>
+(function () {
+  "use strict";
+
+  /* Symbole als eingebettetes SVG. Nur feste Zeichenketten, nie Nutzertext. */
+  var PFADE = {
+    haken: '<path d="M20 6 9 17l-5-5"/>',
+    kreuz: '<path d="M18 6 6 18M6 6l12 12"/>',
+    pfeilunten: '<path d="M12 5v14M19 12l-7 7-7-7"/>',
+    uhr: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2"/>',
+    schild: '<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>',
+    stern: '<path d="m12 2.6 2.9 6 6.6.9-4.8 4.6 1.2 6.5L12 17.5l-5.9 3.1 1.2-6.5L2.5 9.5l6.6-.9z"/>',
+    diamant: '<path d="M12 2 22 12 12 22 2 12z"/>',
+    krone: '<path d="M3 6l4 5 5-7 5 7 4-5v12H3z"/>'
+  };
+  function ikone(name, klasse) {
+    var span = document.createElement("span");
+    span.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">' + PFADE[name] + "</svg>";
+    var svg = span.firstChild;
+    if (klasse) svg.setAttribute("class", klasse);
+    svg.setAttribute("aria-hidden", "true");
+    return svg;
+  }
+
+  var params = new URLSearchParams(location.search);
+  var token = params.get("t") || "";
+  // Die Adresse ist so geheim wie der Stream-Key. OBS legt sie im Klartext in
+  // der Szenensammlung ab und zeigt sie in den Eigenschaften; wer sie einmal
+  // im normalen Browser oeffnet, hat sie im Verlauf und in der
+  // Browser-Synchronisation stehen. Nach dem Lesen kommt sie deshalb aus der
+  // Adresszeile heraus. Fuer den Rueckweg (Neuladen im OBS-Browser) bleibt sie
+  // in sessionStorage, das nur zu diesem Fenster gehoert.
+  try {
+    if (!token && window.sessionStorage) { token = sessionStorage.getItem("uplink_dock_token") || ""; }
+    if (token && window.sessionStorage) { sessionStorage.setItem("uplink_dock_token", token); }
+    if (params.get("t") && window.history && history.replaceState) {
+      params.delete("t");
+      var rest = params.toString();
+      history.replaceState(null, "", location.pathname + (rest ? "?" + rest : ""));
+    }
+  } catch (e) { /* privater Modus ohne sessionStorage: dann bleibt es wie bisher */ }
+  var liste = document.getElementById("liste");
+  var leer = document.getElementById("leer");
+  var eingabe = document.getElementById("eingabe");
+  var sendenKnopf = document.getElementById("senden");
+  var zaehler = document.getElementById("zaehler");
+  var rueckmeldung = document.getElementById("rueckmeldung");
+  var meldung = document.getElementById("meldung");
+  var verbindung = document.getElementById("verbindung");
+  var plattformen = document.getElementById("plattformen");
+  var untenKnopf = document.getElementById("unten");
+  var zeitschalter = document.getElementById("zeitschalter");
+  var willkommen = document.getElementById("willkommen");
+  var bitsLeiste = document.getElementById("bits");
+  var TEXT_MAX = 500;
+
+  var letzteId = 0;
+  var generation = 0;
+  /* Verbindungen, die ohne einen einzigen Statusrahmen wieder zu waren.
+     Der Server lehnt eine falsche Adresse vor dem Upgrade ab, der Browser
+     meldet dafuer nur 1006; nach ein paar Versuchen zeigen wir das an. */
+  var ohneStatus = 0;
+  var OHNE_STATUS_MAX = 3;
+  var statusGesehen = false;
+  var gesehen = {};
+  var gesehenReihe = [];
+  var MAX_ZEILEN = 300;
+  var sock = null;
+  var wartezeit = 1000;
+  var amEnde = true;
+  var meinLogin = "";
+  var zeitAn = false;
+  /* Letzter Stand vom Server. Nach einem Abriss bleiben die Plattformen
+     stehen, aber keine davon leuchtet mehr gruen. */
+  var letzterStand = [];
+  var hatLive = false;
+  /* Bits je Zuschauer, solange dieses Fenster offen ist. Mehr behauptet die
+     Leiste auch nicht; der Hinweis dazu steht als Titel daran. */
+  var bitsJeWer = {};
+  // Karussell in der Leiste: je Kennzahl eine Karte fuer den laufenden Stream
+  // und eine ueber alle Streams (GRILLME C4-A1). Die Bits-Bestenliste ist
+  // eine Karte davon und keine eigene Leiste mehr.
+  var karten = [];
+  var kIndex = 0;
+  var kTakt = null;
+  var kBlende = null;
+  var kErwartung = null;
+  var kRuht = false;
+  var letzteKennzahlen = null;
+  var K_WECHSEL = 8000;
+  var K_ERWARTUNG = 3000;
+
+  zeitschalter.appendChild(ikone("uhr"));
+  sendenKnopf.appendChild(document.createTextNode("Senden"));
+  untenKnopf.appendChild(ikone("pfeilunten"));
+  untenKnopf.appendChild(document.createTextNode("Neue Nachrichten"));
+
+  /* Der Name des Kanals steht erst an der ersten Nachricht. Damit die
+     Begruessung ihn auch beim naechsten Oeffnen schon kennt, bleibt er im
+     Browser liegen und nicht nur in dieser Sitzung. */
+  function kanalMerken(name) {
+    if (!name || name === meinLogin) return;
+    meinLogin = name;
+    willkommenZeigen(name);
+    try { localStorage.setItem("uplink_dock_kanal", name); } catch (e) {}
+  }
+  function willkommenZeigen(name) {
+    if (!willkommen) return;
+    willkommen.textContent = name
+      ? "Herzlich willkommen im Chatraum von " + name + "!"
+      : "Herzlich willkommen im Chatraum!";
+  }
+  try {
+    willkommenZeigen(localStorage.getItem("uplink_dock_kanal") || "");
+  } catch (e) {}
+
+  try { zeitAn = localStorage.getItem("uplink-dock-zeit") === "1"; } catch (e) { zeitAn = false; }
+  zeitschalter.setAttribute("aria-pressed", zeitAn ? "true" : "false");
+
+  function basis() { return location.pathname.replace(/\/dock\/[a-z-]+\/?$/, ""); }
+  function wsUrl() {
+    var proto = location.protocol === "https:" ? "wss:" : "ws:";
+    return proto + "//" + location.host + basis() + "/v1/chat/ws?t=" + encodeURIComponent(token) + "&arten=chat,activity&seit=" + letzteId + (generation ? "&gen=" + generation : "");
+  }
+  function sendeUrl() { return basis() + "/v1/chat/send"; }
+
+  function anzeige(p) {
+    return { twitch: "Twitch", kick: "Kick", youtube: "YouTube", tiktok: "TikTok" }[p] || p;
+  }
+  function lage(text, art) {
+    verbindung.textContent = text;
+    verbindung.setAttribute("data-lage", art);
+  }
+  function setzeMeldung(text) { meldung.textContent = text || ""; }
+
+  function zeit(iso) {
+    var d = new Date(iso);
+    if (isNaN(d.getTime())) return "";
+    return d.toLocaleTimeString("de-DE", { hour: "2-digit", minute: "2-digit" });
+  }
+
+  /* Nur Bilder vom Twitch-CDN. Alles andere faellt auf Text zurueck, damit
+     keine fremde Adresse aus einer Nutzlast ins Fenster kommt. */
+  var BILD_HOST = "https://static-cdn.jtvnw.net/";
+  function emoteBild(id) {
+    return BILD_HOST + "emoticons/v2/" + encodeURIComponent(id) + "/default/dark/1.0";
+  }
+  function erlaubtesBild(url) {
+    return typeof url === "string" && url.indexOf(BILD_HOST) === 0;
+  }
+
+  var ABZEICHEN = {
+    moderator: { text: "MOD", symbol: "schild" },
+    broadcaster: { text: "STREAM", symbol: "krone" },
+    subscriber: { text: "ABO", symbol: "stern" },
+    founder: { text: "ABO", symbol: "stern" },
+    vip: { text: "VIP", symbol: "diamant" },
+    staff: { text: "TEAM", symbol: "schild" },
+    admin: { text: "TEAM", symbol: "schild" },
+    global_mod: { text: "TEAM", symbol: "schild" }
+  };
+
+  function abzeichenBauen(b) {
+    var span = document.createElement("span");
+    if (erlaubtesBild(b.image_url)) {
+      span.className = "abz bild";
+      var img = document.createElement("img");
+      img.src = b.image_url;
+      img.alt = b.set_id || "";
+      img.loading = "lazy";
+      span.appendChild(img);
+      return span;
+    }
+    var eintrag = ABZEICHEN[b.set_id];
+    if (!eintrag) return null;
+    span.className = "abz " + b.set_id;
+    span.appendChild(ikone(eintrag.symbol));
+    span.appendChild(document.createTextNode(eintrag.text));
+    span.title = eintrag.text === "ABO" && b.info ? b.info + " Monate" : eintrag.text;
+    return span;
+  }
+
+  function fragmentAnhaengen(ziel, f, meinName) {
+    if (!f || typeof f !== "object") return;
+    if (f.art === "emote" && f.emote_id) {
+      var img = document.createElement("img");
+      img.className = "emote";
+      img.src = emoteBild(f.emote_id);
+      img.alt = f.text || "";
+      img.title = f.text || "";
+      img.loading = "lazy";
+      /* Faellt das Bild aus, bleibt der Name stehen statt einer Luecke. */
+      img.addEventListener("error", function () {
+        var ersatz = document.createTextNode(f.text || "");
+        if (img.parentNode) img.parentNode.replaceChild(ersatz, img);
+      });
+      ziel.appendChild(img);
+      return;
+    }
+    if (f.art === "mention") {
+      var m = document.createElement("span");
+      m.className = "erw" + (meinName && (f.user_login || "").toLowerCase() === meinName ? " mich" : "");
+      m.textContent = f.text || "";
+      ziel.appendChild(m);
+      return;
+    }
+    if (f.art === "cheermote") {
+      var c = document.createElement("span");
+      c.className = "bits";
+      c.appendChild(ikone("diamant"));
+      c.appendChild(document.createTextNode(" " + (f.text || "")));
+      ziel.appendChild(c);
+      return;
+    }
+    ziel.appendChild(document.createTextNode(typeof f.text === "string" ? f.text : ""));
+  }
+
+  function erwaehntMich(n, meinName) {
+    if (!meinName) return false;
+    return (n.fragments || []).some(function (f) {
+      return f && f.art === "mention" && (f.user_login || "").toLowerCase() === meinName;
+    });
+  }
+
+  function zeileBauen(n) {
+    var meinName = (n.channel_login || meinLogin || "").toLowerCase();
+    var div = document.createElement("div");
+    var art = hervorhebungsArt(n);
+    div.className = "zeile" + (n.eigene ? " eigene" : "")
+      + (erwaehntMich(n, meinName) ? " erwaehnt" : "")
+      + (art ? " hh hh-" + art : "");
+    div.setAttribute("data-platform", n.platform || "");
+
+    var marke = document.createElement("span");
+    marke.className = "marke";
+    marke.title = anzeige(n.platform);
+    div.appendChild(marke);
+
+    var inhalt = document.createElement("div");
+    inhalt.className = "inhalt";
+
+    if (art) {
+      var kopfzeile = document.createElement("span");
+      kopfzeile.className = "kopfzeile";
+      kopfzeile.textContent = hervorhebungsText(art, n.hervorhebung.raid_von);
+      inhalt.appendChild(kopfzeile);
+    }
+
+    if (n.reply_to && n.reply_to.sender_display) {
+      var antwort = document.createElement("span");
+      antwort.className = "antwort";
+      antwort.textContent = "antwortet auf " + n.reply_to.sender_display + ": " + (n.reply_to.text || "");
+      antwort.title = antwort.textContent;
+      inhalt.appendChild(antwort);
+    }
+
+    (n.badges || []).forEach(function (b) {
+      var abz = abzeichenBauen(b);
+      if (abz) inhalt.appendChild(abz);
+    });
+
+    var name = document.createElement("span");
+    name.className = "name";
+    name.textContent = n.sender_display || n.sender_login || "?";
+    if (typeof n.color === "string" && /^#[0-9a-fA-F]{6}$/.test(n.color)) name.style.color = n.color;
+    inhalt.appendChild(name);
+
+    if (!n.is_action) {
+      var doppel = document.createElement("span");
+      doppel.className = "doppel";
+      doppel.textContent = ":";
+      inhalt.appendChild(doppel);
+    }
+
+    var text = document.createElement("span");
+    if (n.is_action) text.className = "aktion";
+    (n.fragments || []).forEach(function (f) { fragmentAnhaengen(text, f, meinName); });
+    inhalt.appendChild(text);
+    div.appendChild(inhalt);
+
+    var z = document.createElement("span");
+    z.className = "zeit";
+    z.textContent = zeit(n.sent_at);
+    z.style.display = zeitAn ? "" : "none";
+    div.appendChild(z);
+    return div;
+  }
+
+  function zeitenZeigen() {
+    var alle = liste.querySelectorAll(".zeit");
+    for (var i = 0; i < alle.length; i++) alle[i].style.display = zeitAn ? "" : "none";
+  }
+
+  // ── Karussell in der Kopfleiste ─────────────────────────────────────────
+
+  function zahlwort(n, eins, viele) { return n === 1 ? eins : viele; }
+
+  function minutenText(minuten) {
+    var m = Math.round(minuten || 0);
+    if (m < 60) return m + " " + zahlwort(m, "Minute", "Minuten");
+    var std = Math.floor(m / 60);
+    var rest = m % 60;
+    if (!rest) return std + " " + zahlwort(std, "Stunde", "Stunden");
+    return std + " " + zahlwort(std, "Stunde", "Stunden") + " " + rest + " Min";
+  }
+
+  function anteilText(anteil) { return Math.round((anteil || 0) * 100) + " Prozent"; }
+
+  function gefuellt(wert) { return wert && wert.length ? wert : null; }
+
+  function bitsReihe() {
+    var reihe = Object.keys(bitsJeWer).map(function (k) { return bitsJeWer[k]; });
+    reihe.sort(function (a, b) {
+      return b.bits - a.bits || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
+    });
+    return reihe;
+  }
+
+  // Baut aus dem Kennzahlenrahmen und den mitgezaehlten Bits die Karten, die
+  // wirklich Werte haben. Leere Sichten fallen weg.
+  function kartenBauen(k) {
+    var neu = [];
+    var top = (k && k.top_chatter) || {};
+    var lang = (k && k.laengster_zuschauer) || {};
+    var haeufig = (k && k.haeufigster_zuschauer) || {};
+    var lurker = (k && k.lurker) || null;
+    var zuschauer = (k && k.zuschauer) || null;
+
+    function nachrichten(e) {
+      return e.nachrichten.toLocaleString("de-DE");
+    }
+    function minuten(e) { return minutenText(e.minuten); }
+    function sessions(e) { return e.sessions + " " + zahlwort(e.sessions, "Stream", "Streams"); }
+
+    if (gefuellt(top.session)) {
+      // Der einzige Wert, der aus dem laufenden Chat selbst kommt. Er gilt
+      // fuer alle Plattformen und traegt deshalb kein Twitch-Kuerzel.
+      neu.push({ titel: "Top-Chatter", zeitraum: "dieser Stream", twitch: false,
+                 werte: top.session, text: nachrichten });
+    }
+    if (gefuellt(top.gesamt)) {
+      neu.push({ titel: "Top-Chatter", zeitraum: "gesamt", twitch: true,
+                 werte: top.gesamt, text: nachrichten });
+    }
+    if (gefuellt(lang.session)) {
+      neu.push({ titel: "Am längsten dabei", zeitraum: "dieser Stream", twitch: true,
+                 werte: lang.session, text: minuten });
+    }
+    if (gefuellt(lang.gesamt)) {
+      neu.push({ titel: "Am längsten dabei", zeitraum: "gesamt", twitch: true,
+                 werte: lang.gesamt, text: minuten });
+    }
+    if (gefuellt(haeufig.gesamt)) {
+      neu.push({ titel: "Am häufigsten dabei", zeitraum: "gesamt", twitch: true,
+                 werte: haeufig.gesamt, text: sessions });
+    }
+    if (zuschauer && (zuschauer.jetzt > 0 || zuschauer.spitze_session > 0)) {
+      neu.push({ titel: "Zuschauer", zeitraum: "dieser Stream", twitch: true,
+                 satz: zuschauer.jetzt + " gerade, Bestwert " + zuschauer.spitze_session });
+    }
+    if (zuschauer && zuschauer.spitze_gesamt > 0) {
+      neu.push({ titel: "Zuschauer", zeitraum: "gesamt", twitch: true,
+                 satz: "Bestwert " + zuschauer.spitze_gesamt });
+    }
+    if (lurker && lurker.session && lurker.session.anwesend > 0) {
+      neu.push({ titel: "Nur am Zuschauen", zeitraum: "dieser Stream", twitch: true,
+                 satz: anteilText(lurker.session.anteil) + ", " + lurker.session.still
+                       + " von " + lurker.session.anwesend });
+    }
+    if (lurker && lurker.gesamt && lurker.gesamt.anteil_durchschnitt > 0) {
+      neu.push({ titel: "Nur am Zuschauen", zeitraum: "gesamt", twitch: true,
+                 satz: anteilText(lurker.gesamt.anteil_durchschnitt) + " im Schnitt" });
+    }
+    var bits = bitsReihe();
+    if (bits.length) {
+      // Zaehlt dieses Fenster selbst mit, seit es offen ist.
+      neu.push({ titel: "Top-Bits", zeitraum: "seit dem Öffnen", twitch: true,
+                 werte: bits.map(function (e) { return { name: e.name, bits: e.bits }; }),
+                 text: function (e) { return e.bits.toLocaleString("de-DE"); } });
+    }
+    return neu;
+  }
+
+  function punkteBauen() {
+    var punkte = document.createElement("span");
+    punkte.className = "punkte";
+    if (karten.length < 2) return punkte;
+    karten.forEach(function (karte, i) {
+      var knopf = document.createElement("button");
+      knopf.type = "button";
+      knopf.className = i === kIndex ? "an" : "";
+      knopf.setAttribute("aria-label", karte.titel + ", " + karte.zeitraum);
+      knopf.addEventListener("click", function () { karteWechseln(i, true); });
+      punkte.appendChild(knopf);
+    });
+    return punkte;
+  }
+
+  function bitsLeer() {
+    bitsLeiste.textContent = "";
+    var kopf = document.createElement("span");
+    kopf.className = "kopf";
+    kopf.textContent = "Kennzahlen";
+    var satz = document.createElement("span");
+    satz.className = "satz platzhalter";
+    satz.textContent = "Sobald Zuschauer da sind";
+    bitsLeiste.appendChild(kopf);
+    bitsLeiste.appendChild(satz);
+  }
+
+  function karteZeichnen() {
+    bitsLeiste.textContent = "";
+    if (!karten.length) {
+      bitsLeer();
+      return;
+    }
+    kIndex = ((kIndex % karten.length) + karten.length) % karten.length;
+    var karte = karten[kIndex];
+
+    /* Titel links, die Bedienung gesammelt rechts. So steht ueber der Zahl
+       eine Zeile und kein Bedienfeld. */
+    var kopfzeile = document.createElement("div");
+    kopfzeile.className = "zeile-kopf";
+    var kopf = document.createElement("span");
+    kopf.className = "kopf";
+    kopf.textContent = karte.titel;
+    var zeitraum = document.createElement("span");
+    zeitraum.className = "zeitraum";
+    zeitraum.textContent = karte.zeitraum;
+    kopf.appendChild(zeitraum);
+    kopfzeile.appendChild(kopf);
+    kopfzeile.appendChild(punkteBauen());
+    if (karten.length > 1) {
+      var zurueck = document.createElement("button");
+      zurueck.type = "button";
+      zurueck.className = "pfeil";
+      zurueck.textContent = "\u25C0";
+      zurueck.setAttribute("aria-label", "Vorherige Zahl");
+      zurueck.addEventListener("click", function () { karteWechseln(kIndex - 1, true); });
+      kopfzeile.appendChild(zurueck);
+      var vor = document.createElement("button");
+      vor.type = "button";
+      vor.className = "pfeil";
+      vor.textContent = "\u25B6";
+      vor.setAttribute("aria-label", "Nächste Zahl");
+      vor.addEventListener("click", function () { karteWechseln(kIndex + 1, true); });
+      kopfzeile.appendChild(vor);
+    }
+    bitsLeiste.appendChild(kopfzeile);
+
+    var inhalt = document.createElement("div");
+    inhalt.className = "karte";
+    if (karte.werte) {
+      karte.werte.slice(0, 3).forEach(function (e, i) {
+        var rang = document.createElement("div");
+        rang.className = "rang";
+        rang.setAttribute("data-platz", String(i + 1));
+        var platz = document.createElement("span");
+        platz.className = "platz";
+        platz.textContent = String(i + 1);
+        rang.appendChild(platz);
+        var wer = document.createElement("span");
+        wer.className = "wer";
+        wer.textContent = e.name || "";
+        wer.title = e.name || "";
+        rang.appendChild(wer);
+        var menge = document.createElement("span");
+        menge.className = "menge";
+        menge.textContent = karte.text(e);
+        rang.appendChild(menge);
+        inhalt.appendChild(rang);
+      });
+    } else {
+      var satz = document.createElement("span");
+      satz.className = "satz";
+      satz.textContent = karte.satz;
+      inhalt.appendChild(satz);
+    }
+    bitsLeiste.appendChild(inhalt);
+    bitsLeiste.classList.add("da");
+  }
+
+  function karteWechseln(i, sofort) {
+    if (!karten.length) return;
+    if (kBlende) { clearTimeout(kBlende); kBlende = null; }
+    if (sofort) {
+      bitsLeiste.classList.remove("wechsel");
+      kIndex = i;
+      karteZeichnen();
+      kTaktStarten();
+      return;
+    }
+    bitsLeiste.classList.add("wechsel");
+    kBlende = setTimeout(function () {
+      kBlende = null;
+      kIndex = i;
+      karteZeichnen();
+      bitsLeiste.classList.remove("wechsel");
+    }, 150);
+  }
+
+  function kTaktStoppen() {
+    if (kTakt) { clearInterval(kTakt); kTakt = null; }
+  }
+
+  function kTaktStarten() {
+    kTaktStoppen();
+    if (karten.length < 2) return;
+    kTakt = setInterval(function () {
+      if (kRuht) return;
+      karteWechseln(kIndex + 1);
+    }, K_WECHSEL);
+  }
+
+  // Baut die Leiste neu und bleibt dabei auf derselben Karte stehen, damit
+  // ein Rahmen alle dreissig Sekunden nicht mitten im Lesen umblaettert.
+  function karussellZeichnen() {
+    var vorher = karten.length ? karten[kIndex].titel + "|" + karten[kIndex].zeitraum : null;
+    karten = kartenBauen(letzteKennzahlen);
+    if (!karten.length) {
+      kIndex = 0;
+      kTaktStoppen();
+      karteZeichnen();
+      return;
+    }
+    kIndex = 0;
+    if (vorher) {
+      for (var i = 0; i < karten.length; i++) {
+        if (karten[i].titel + "|" + karten[i].zeitraum === vorher) { kIndex = i; break; }
+      }
+    }
+    karteZeichnen();
+    kTaktStarten();
+  }
+
+  function kennzahlenAnzeigen(k) {
+    if (kErwartung) { clearTimeout(kErwartung); kErwartung = null; }
+    letzteKennzahlen = k;
+    karussellZeichnen();
+  }
+
+  // Nach dem Status kommt sofort der Kennzahlenrahmen, solange ein Stream
+  // laeuft. Bleibt er aus, ist der Stream vorbei: die Zahlen des Bots gehen
+  // weg, die selbst gezaehlten Bits bleiben.
+  function kennzahlenErwarten() {
+    if (kErwartung) clearTimeout(kErwartung);
+    kErwartung = setTimeout(function () {
+      kErwartung = null;
+      letzteKennzahlen = null;
+      karussellZeichnen();
+    }, K_ERWARTUNG);
+  }
+
+  bitsLeiste.addEventListener("mouseenter", function () { kRuht = true; });
+  bitsLeiste.addEventListener("mouseleave", function () { kRuht = false; });
+
+  // ── Hervorhebungen ──────────────────────────────────────────────────────
+
+  // Nur diese drei Arten kennt das Fenster. Alles andere bleibt eine normale
+  // Zeile, damit ein neuer Wert von der Gegenstelle hier nichts kaputt macht.
+  function hervorhebungsArt(n) {
+    var hh = n && n.hervorhebung;
+    if (!hh || !hh.art) return "";
+    if (hh.art === "erstchat" || hh.art === "raider" || hh.art === "raider_erstchat") {
+      return hh.art;
+    }
+    return "";
+  }
+
+  function hervorhebungsText(art, raidVon) {
+    var von = raidVon ? "Raid von " + raidVon : "Aus einem Raid";
+    if (art === "erstchat") return "Schreibt hier zum ersten Mal";
+    if (art === "raider") return von;
+    return von + ", schreibt hier zum ersten Mal";
+  }
+
+  function bitsZaehlen(e) {
+    if (e.art !== "cheer") return;
+    var key = e.dedupe_key || "";
+    if (key) {
+      if (gesehen[key]) return;
+      gesehen[key] = true;
+      gesehenReihe.push(key);
+      if (gesehenReihe.length > 2000) delete gesehen[gesehenReihe.shift()];
+    }
+    var name = e.actor ? (e.actor.display || e.actor.login) : "Anonym";
+    var eintrag = bitsJeWer[name] || (bitsJeWer[name] = { name: name, bits: 0 });
+    eintrag.bits += e.bits || 0;
+    karussellZeichnen();
+  }
+
+  function dedupeKey(n) {
+    return (n.platform || "") + ":" + (n.channel_id || "") + ":" + (n.message_id || "");
+  }
+
+  function anhaengen(rahmen) {
+    if (!rahmen || !rahmen.ereignis) return;
+    if (rahmen.ereignis.typ === "activity") {
+      if (typeof rahmen.id === "number" && rahmen.id > letzteId) letzteId = rahmen.id;
+      bitsZaehlen(rahmen.ereignis);
+      return;
+    }
+    if (rahmen.ereignis.typ !== "chat") return;
+    var n = rahmen.ereignis;
+    if (typeof rahmen.id === "number" && rahmen.id > letzteId) letzteId = rahmen.id;
+    var key = dedupeKey(n);
+    if (gesehen[key]) return;
+    gesehen[key] = true;
+    gesehenReihe.push(key);
+    if (gesehenReihe.length > 2000) delete gesehen[gesehenReihe.shift()];
+    if (n.channel_login) kanalMerken(n.channel_login);
+    if (leer) { leer.remove(); leer = null; }
+    liste.appendChild(zeileBauen(n));
+    while (liste.children.length > MAX_ZEILEN) liste.removeChild(liste.firstChild);
+    if (amEnde) {
+      liste.scrollTop = liste.scrollHeight;
+    } else {
+      untenKnopf.classList.add("da");
+    }
+  }
+
+  function pilleBauen(p) {
+    var span = document.createElement("span");
+    span.className = "pille" + (p.verbunden ? " live" : "");
+    span.setAttribute("data-platform", p.platform);
+    span.appendChild(document.createTextNode(anzeige(p.platform)));
+    var punkt = document.createElement("span");
+    punkt.className = "punkt";
+    span.appendChild(punkt);
+    span.title = p.verbunden ? "Stream läuft" : (p.hinweis || "Stream läuft gerade nicht");
+    return span;
+  }
+
+  function statusAnzeigen(stand) {
+    /* Nur Plattformen, die der Streamer verbunden hat. `verbunden` faengt
+       einen Server ab, der `eingerichtet` noch nicht schickt. */
+    if (stand) letzterStand = stand;
+    var sichtbar = letzterStand.filter(function (p) { return p.eingerichtet || p.verbunden; });
+    if (!stand) {
+      /* Kein frischer Stand: alles bleibt stehen, nichts ist mehr live. */
+      sichtbar = sichtbar.map(function (p) {
+        return { platform: p.platform, eingerichtet: true, verbunden: false, hinweis: "Verbindung zu Uplink kommt gerade zurück" };
+      });
+    }
+    plattformen.textContent = "";
+    if (!sichtbar.length) {
+      var hinweis = document.createElement("span");
+      hinweis.className = "pille leer";
+      hinweis.textContent = "Noch keine Plattform verbunden";
+      plattformen.appendChild(hinweis);
+    } else {
+      sichtbar.forEach(function (p) { plattformen.appendChild(pilleBauen(p)); });
+    }
+    var live = sichtbar.filter(function (p) { return p.verbunden; });
+    hatLive = live.length > 0;
+    document.body.classList.toggle("mehrere", live.length > 1);
+    sendenKnopf.disabled = !hatLive;
+    // Das Feld bleibt bedienbar. Ein `disabled` nimmt dem Streamer beim
+    // naechsten Abriss den Fokus mitten im Satz, und ein Abriss kommt genau
+    // dann, wenn der Chat voll laeuft.
+    eingabe.placeholder = live.length
+      ? "Nachricht an alle Plattformen"
+      : "Erst während des Streams";
+  }
+
+  function melden(text, art) {
+    var span = document.createElement("span");
+    span.className = "melde " + art;
+    span.appendChild(ikone(art === "ok" ? "haken" : "kreuz"));
+    span.appendChild(document.createTextNode(text));
+    rueckmeldung.appendChild(span);
+    setTimeout(function () {
+      span.classList.add("geht");
+      setTimeout(function () { if (span.parentNode) span.remove(); }, 300);
+    }, 3000);
+  }
+
+  function verbinden() {
+    if (!statusGesehen) lage("verbindet", "verbindet");
+    try {
+      sock = new WebSocket(wsUrl());
+    } catch (e) {
+      neuVerbinden();
+      return;
+    }
+    sock.onopen = function () { wartezeit = 1000; statusGesehen = false; };
+    sock.onmessage = function (ev) {
+      var daten;
+      try { daten = JSON.parse(ev.data); } catch (e) { return; }
+      if (daten && daten.typ === "status") {
+        statusGesehen = true;
+        ohneStatus = 0;
+        lage("verbunden", "verbunden");
+        if (typeof daten.generation === "number" && daten.generation !== generation) {
+          /* Neuer Serverprozess, die Nummern zaehlen wieder ab 1. */
+          if (generation !== 0) letzteId = 0;
+          generation = daten.generation;
+        }
+        statusAnzeigen(daten.plattformen);
+        kennzahlenErwarten();
+        return;
+      }
+      if (daten && daten.typ === "kennzahlen") {
+        kennzahlenAnzeigen(daten);
+        return;
+      }
+      anhaengen(daten);
+    };
+    sock.onclose = function (ev) {
+      if (ev && ev.code === 1012) {
+        /* Server: zu langsam gelesen, sofort neu, der Nachlauf holt den Rest. */
+        wartezeit = 1000;
+        neuVerbinden("verbindet neu");
+        return;
+      }
+      if (ev && ev.code === 1008) {
+        /* Der Server hat dieses Fenster ausdruecklich beendet: entweder gilt
+           die Adresse nicht mehr, oder es waren zu viele Fenster offen. Beides
+           aendert sich nicht dadurch, dass wir es gleich noch einmal
+           versuchen. Frueher fiel dieser Fall in den Standardzweig: das
+           ausgeworfene Fenster war nach einer Sekunde zurueck und warf das
+           naechste hinaus, und das lief endlos so weiter. */
+        aufgeben(ev.reason);
+        return;
+      }
+      if (!statusGesehen) ohneStatus += 1;
+      if (ohneStatus >= OHNE_STATUS_MAX) {
+        neuVerbinden("Diese Adresse gilt nicht mehr oder Uplink ist gerade nicht erreichbar", "fehler");
+        return;
+      }
+      neuVerbinden("verbindet neu");
+    };
+    sock.onerror = function () { try { sock.close(); } catch (e) {} };
+  }
+
+  /* Ende ohne Rueckweg. Kein neuer Versuch, dafuer der Grund im Klartext. */
+  function aufgeben(grund) {
+    statusGesehen = false;
+    lage(grund || "Dieses Fenster wurde geschlossen", "fehler");
+    statusAnzeigen(null);
+  }
+
+  function neuVerbinden(text, art) {
+    lage(text || "verbindet neu", art || "neu");
+    statusAnzeigen(null);
+    // Ohne Verbindung sind die Zahlen des Bots von eben nur noch geraten.
+    if (kErwartung) { clearTimeout(kErwartung); kErwartung = null; }
+    letzteKennzahlen = null;
+    karussellZeichnen();
+    setTimeout(verbinden, wartezeit);
+    wartezeit = Math.min(wartezeit * 2, 30000);
+  }
+
+  function senden() {
+    var text = eingabe.value.trim();
+    if (!text) return;
+    sendenKnopf.disabled = true;
+    fetch(sendeUrl(), {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Dock-Token": token },
+      body: JSON.stringify({ text: text })
+    }).then(function (r) {
+      return r.json().then(function (j) { return { status: r.status, json: j }; }, function () { return { status: r.status, json: {} }; });
+    }).then(function (antwort) {
+      if (antwort.status === 200) {
+        eingabe.value = "";
+        zaehlerZeigen();
+        setzeMeldung("");
+        (antwort.json.ergebnisse || []).forEach(function (e) {
+          if (e.ok) melden("Auf " + anzeige(e.platform) + " gesendet", "ok");
+          else melden(e.hinweis || (anzeige(e.platform) + " hat nicht angenommen"), "schief");
+        });
+      } else if (antwort.status === 401) {
+        setzeMeldung("Diese Adresse gilt nicht mehr. Im Dashboard unter Uplink eine neue erzeugen.");
+      } else {
+        setzeMeldung((antwort.json && antwort.json.error) || "Senden hat nicht geklappt");
+      }
+    }).catch(function () {
+      setzeMeldung("Senden hat nicht geklappt, keine Verbindung");
+    }).then(function () {
+      /* Nur freigeben, wenn ueberhaupt noch eine Plattform live ist. */
+      sendenKnopf.disabled = !hatLive;
+      eingabe.focus();
+    });
+  }
+
+  function zaehlerZeigen() {
+    var n = eingabe.value.length;
+    zaehler.textContent = n + "/" + TEXT_MAX;
+    zaehler.className = n >= TEXT_MAX ? "voll" : (n >= TEXT_MAX - 60 ? "nah" : "");
+  }
+
+  eingabe.addEventListener("input", zaehlerZeigen);
+  eingabe.addEventListener("keydown", function (ev) {
+    if (ev.key !== "Enter" || ev.shiftKey) return;
+    ev.preventDefault();
+    if (sendenKnopf.disabled) return;
+    senden();
+  });
+  sendenKnopf.addEventListener("click", senden);
+  zeitschalter.addEventListener("click", function () {
+    zeitAn = !zeitAn;
+    zeitschalter.setAttribute("aria-pressed", zeitAn ? "true" : "false");
+    try { localStorage.setItem("uplink-dock-zeit", zeitAn ? "1" : "0"); } catch (e) { /* ohne Speicher halt nur diese Sitzung */ }
+    zeitenZeigen();
+  });
+  liste.addEventListener("scroll", function () {
+    amEnde = liste.scrollTop + liste.clientHeight >= liste.scrollHeight - 24;
+    if (amEnde) untenKnopf.classList.remove("da");
+  });
+  untenKnopf.addEventListener("click", function () {
+    liste.scrollTop = liste.scrollHeight;
+    untenKnopf.classList.remove("da");
+    amEnde = true;
+  });
+
+  zaehlerZeigen();
+  if (!token) {
+    lage("Adresse ungültig", "fehler");
+    setzeMeldung("Diese Adresse hat keinen Zugang. Im Dashboard unter Uplink die Adresse für dieses Fenster kopieren.");
+    sendenKnopf.disabled = true;
+    eingabe.disabled = true;
+    statusAnzeigen([]);
+  } else {
+    statusAnzeigen([]);
+    verbinden();
+  }
+})();
+</script>
+</body>
+</html>
