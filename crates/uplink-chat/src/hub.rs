@@ -16,9 +16,9 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{Semaphore, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DockUser {
@@ -49,7 +49,6 @@ pub struct ChatHub {
     pub(crate) config: ChatConfig,
     pub(crate) identity: Arc<dyn DockIdentity>,
     pub(crate) users: Mutex<HashMap<u64, Arc<User>>>,
-    pub(crate) generation: u64,
     pub(crate) kick: Arc<KickDrehkreuz>,
     pub(crate) info: Arc<crate::streaminfo::StreamInfoDienst>,
     pub(crate) points: Arc<dyn crate::punkte::PunkteDienst>,
@@ -61,6 +60,8 @@ pub struct ChatHub {
 }
 pub(crate) struct User {
     pub id: u64,
+    pub generation: String,
+    pub access: watch::Sender<bool>,
     pub bus: Bus,
     pub adapters: Mutex<HashMap<Platform, Arc<dyn ChatAdapter>>>,
     pub errors: Mutex<HashMap<Platform, ChatFehler>>,
@@ -73,6 +74,31 @@ pub(crate) struct User {
     pub actions: Arc<Semaphore>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     pub metrics: Mutex<Option<crate::kennzahlen::Kennzahlen>>,
+}
+/// Eine Berechtigungsabfrage gilt ausschließlich für diese Hubinstanz.
+#[derive(Clone)]
+pub struct IdentityCheck {
+    pub streamer_id: u64,
+    pub generation: String,
+    pub active: bool,
+}
+impl User {
+    pub fn access_confirmed(&self) -> bool {
+        *self.access.borrow()
+    }
+    pub fn resume(
+        &self,
+        generation: Option<&str>,
+        since: Option<u64>,
+    ) -> (
+        tokio::sync::broadcast::Receiver<crate::nachricht::Rahmen>,
+        Vec<crate::nachricht::Rahmen>,
+        bool,
+    ) {
+        let matches = generation == Some(self.generation.as_str());
+        let (receiver, replay, gap) = self.bus.subscribe(if matches { since } else { None });
+        (receiver, replay, gap || (generation.is_some() && !matches))
+    }
 }
 impl Drop for User {
     fn drop(&mut self) {
@@ -114,6 +140,43 @@ impl ChatHub {
     pub fn user_ids(&self) -> Vec<u64> {
         self.users.lock().expect("Nutzer").keys().copied().collect()
     }
+    pub fn identity_checks(&self) -> Vec<IdentityCheck> {
+        self.users
+            .lock()
+            .expect("Nutzer")
+            .values()
+            .map(|user| IdentityCheck {
+                streamer_id: user.id,
+                generation: user.generation.clone(),
+                active: user.active.load(Ordering::Acquire),
+            })
+            .collect()
+    }
+    /// None ist ein unbekanntes Abfrageergebnis, Some(false) eine bestätigte Sperre.
+    pub fn identity_checked(&self, check: &IdentityCheck, allowed: Option<bool>) {
+        let mut users = self.users.lock().expect("Nutzer");
+        let Some(user) = users
+            .get(&check.streamer_id)
+            .filter(|user| user.generation == check.generation)
+        else {
+            return;
+        };
+        if allowed == Some(false) {
+            let user = users.remove(&check.streamer_id).expect("Geprüfter Nutzer");
+            user.cancel.cancel();
+            self.source.forget(check.streamer_id as i64);
+            return;
+        }
+        let allowed = allowed == Some(true);
+        if user.access_confirmed() != allowed {
+            let mut sockets = user.socket_cancel.lock().expect("Dockverbindungen");
+            sockets.cancel();
+            if allowed {
+                *sockets = user.cancel.child_token();
+            }
+            user.access.send_replace(allowed);
+        }
+    }
     /// Nach Nutzersperre bestehende Adapter und
     /// Websockets abbrechen; neue Zugriffe müssen die neue Identität prüfen.
     pub fn invalidate(&self, id: u64) {
@@ -152,10 +215,6 @@ impl ChatHub {
             config,
             identity,
             users: Mutex::new(HashMap::new()),
-            generation: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(|_| "Systemzeit ist ungültig")?
-                .as_micros() as u64,
             kick,
             info: crate::streaminfo::StreamInfoDienst::new(Arc::new(
                 crate::streaminfo::twitch::TwitchStreamInfoFabrik::new(helix.clone()),
@@ -182,8 +241,16 @@ impl ChatHub {
             return Err("Chat ist ausgelastet");
         }
         let cancel = self.cancel.child_token();
+        use ring::rand::SecureRandom;
+        let mut nonce = [0_u8; 16];
+        ring::rand::SystemRandom::new()
+            .fill(&mut nonce)
+            .map_err(|_| "Chatgeneration konnte nicht erzeugt werden")?;
+        let generation = nonce.iter().map(|byte| format!("{byte:02x}")).collect();
         let u = Arc::new(User {
             id,
+            generation,
+            access: watch::channel(true).0,
             bus: Bus::new(),
             adapters: Mutex::new(HashMap::new()),
             errors: Mutex::new(HashMap::new()),
@@ -217,11 +284,13 @@ impl ChatHub {
                 let mut tick = tokio::time::interval(Duration::from_secs(30));
                 loop {
                     tokio::select! {biased;_=cancel.cancelled()=>break,event=events.recv()=>{let Some(mut event)=event else{break};let Some(user)=user.upgrade()else{break};
+                      if !user.access_confirmed(){continue}
                       sync_session(&user,&mut session_epoch,&counts,&highlighter);
                       if user.bus.is_duplicate(&event){continue}
                       let _=tokio::time::timeout(Duration::from_secs(2),highlighter.anreichern(id as i64,&mut event)).await;
                       match user.bus.publish(event.clone()){Ok(Some(_))=>counts.zaehlen(id as i64,&event),Ok(None)=>{},Err(_)=>{user.cancel.cancel();break}}
                     },_=tick.tick()=>{let Some(user)=user.upgrade()else{break};if user.sockets.load(Ordering::Relaxed)==0&&!user.active.load(Ordering::Relaxed)&&user.last_seen.lock().expect("Aktivität").elapsed()>idle{user.cancel.cancel();break}
+                      if !user.access_confirmed(){continue}
                       sync_session(&user,&mut session_epoch,&counts,&highlighter);
                       let(bot,at)=tokio::time::timeout(Duration::from_secs(3),source.stand(id as i64)).await.unwrap_or((None,None));
                       let frame=crate::kennzahlen::rahmen_bauen(counts.seit(id as i64).unwrap_or_else(chrono::Utc::now),user.active.load(Ordering::Relaxed),counts.top(id as i64,3),&counts.anzeigenamen(id as i64),bot.as_ref(),at);*user.metrics.lock().expect("Kennzahlen")=Some(frame);
@@ -229,10 +298,35 @@ impl ChatHub {
                 }
             })
         };
+        let mut access = u.access.subscribe();
         let driver = tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(30));
             loop {
-                tokio::select! {biased;_=cancel.cancelled()=>break,_=tick.tick()=>{let Some(hub)=weak.upgrade()else{break};let Some(user)=user.upgrade()else{break};let mut starts=FuturesUnordered::new();for p in Platform::ALL{let h=hub.clone();let u=user.clone();let t=t.clone();starts.push(async move{h.reconcile(&u,p,t).await;});}tokio::select!{_=cancel.cancelled()=>break,_=async{while starts.next().await.is_some(){}}=>{}}}}
+                tokio::select! {biased;_=cancel.cancelled()=>break,_=access.changed()=>{},_=tick.tick()=>{}}
+                let Some(hub) = weak.upgrade() else { break };
+                let Some(user) = user.upgrade() else { break };
+                if !user.access_confirmed() {
+                    let adapters: Vec<_> = user
+                        .adapters
+                        .lock()
+                        .expect("Adapter")
+                        .drain()
+                        .map(|(_, adapter)| adapter)
+                        .collect();
+                    futures::future::join_all(adapters.iter().map(|adapter| adapter.trennen()))
+                        .await;
+                    continue;
+                }
+                let mut starts = FuturesUnordered::new();
+                for p in Platform::ALL {
+                    let h = hub.clone();
+                    let u = user.clone();
+                    let t = t.clone();
+                    starts.push(async move {
+                        h.reconcile(&u, p, t).await;
+                    });
+                }
+                tokio::select! {biased;_=cancel.cancelled()=>break,_=access.changed()=>{tick.reset_immediately()},_=async{while starts.next().await.is_some(){}}=>{}}
             }
             if let Some(user) = user.upgrade() {
                 let adapters: Vec<_> = user
@@ -257,6 +351,9 @@ impl ChatHub {
         p: Platform,
         input: mpsc::Sender<crate::nachricht::Ereignis>,
     ) {
+        if !user.access_confirmed() {
+            return;
+        }
         if p == Platform::TikTok {
             user.errors
                 .lock()
@@ -357,6 +454,9 @@ impl ChatHub {
         }
     }
     pub(crate) fn status(&self, u: &User) -> Vec<Status> {
+        if !u.access_confirmed() {
+            return Platform::ALL.into_iter().map(|platform| Status {platform,eingerichtet:false,verbunden:false,hinweis:Some("Chatzugang konnte gerade nicht geprüft werden. Verbindung pausiert; Wiederanlauf erfolgt automatisch.".into()),fehlende_scopes:vec![],zustand:"access_unconfirmed"}).collect();
+        }
         let adapters = u.adapters.lock().expect("Adapter");
         let errors = u.errors.lock().expect("Fehler");
         Platform::ALL
@@ -464,5 +564,104 @@ mod rotation_tests {
         assert!(current.socket_cancel.lock().unwrap().is_cancelled());
         assert!(hub.user_ids().is_empty());
         hub.shutdown().await;
+    }
+    #[tokio::test]
+    async fn unknown_identity_pauses_but_preserves_the_active_generation() {
+        let hub =
+            ChatHub::new(ChatConfig::default(), Arc::new(Offline), Arc::new(Offline)).unwrap();
+        hub.set_active(7, true).unwrap();
+        let user = hub.ensure(7).unwrap();
+        let epoch = user.session_epoch.load(Ordering::Acquire);
+        let check = hub.identity_checks().pop().unwrap();
+        let old_socket = user.socket_cancel.lock().unwrap().clone();
+        let frame = crate::kennzahlen::rahmen_bauen(
+            chrono::Utc::now(),
+            true,
+            vec![],
+            &HashMap::new(),
+            None,
+            None,
+        );
+        *user.metrics.lock().unwrap() = Some(frame.clone());
+        hub.identity_checked(&check, None);
+        assert!(old_socket.is_cancelled());
+        assert!(!user.access_confirmed());
+        assert!(user.active.load(Ordering::Acquire));
+        assert!(Arc::ptr_eq(&user, &hub.ensure(7).unwrap()));
+        assert_eq!(*user.metrics.lock().unwrap(), Some(frame.clone()));
+        assert!(
+            hub.status_for(7)
+                .unwrap()
+                .iter()
+                .all(|status| !status.verbunden && status.zustand == "access_unconfirmed")
+        );
+        hub.identity_checked(&check, Some(true));
+        assert!(user.access_confirmed());
+        assert!(!user.socket_cancel.lock().unwrap().is_cancelled());
+        assert_eq!(user.session_epoch.load(Ordering::Acquire), epoch);
+        assert_eq!(*user.metrics.lock().unwrap(), Some(frame));
+        hub.identity_checked(&check, Some(false));
+        assert!(user.cancel.is_cancelled());
+        let replacement = hub.ensure(7).unwrap();
+        hub.identity_checked(&check, Some(false));
+        hub.identity_checked(&check, None);
+        assert!(replacement.access_confirmed());
+        assert!(!replacement.cancel.is_cancelled());
+        assert_ne!(replacement.generation, check.generation);
+        hub.shutdown().await;
+    }
+}
+
+#[cfg(test)]
+mod independent_review_probes {
+    use super::*;
+    struct Offline;
+    impl DockIdentity for Offline {
+        fn resolve(&self, _: [u8; 32]) -> BoxFuture<'_, Result<Option<DockUser>, BrokerError>> {
+            Box::pin(async { Ok(None) })
+        }
+    }
+    impl PlatformBroker for Offline {
+        fn grant(
+            &self,
+            _: u64,
+            _: Platform,
+            _: bool,
+        ) -> BoxFuture<'_, Result<crate::Grant, BrokerError>> {
+            Box::pin(async { Err(BrokerError::Disconnected) })
+        }
+    }
+    #[tokio::test]
+    async fn review_recreated_user_must_not_accept_previous_bus_cursor() {
+        let hub =
+            ChatHub::new(ChatConfig::default(), Arc::new(Offline), Arc::new(Offline)).unwrap();
+        let previous = hub.ensure(7).unwrap();
+        let previous_generation = previous.generation.clone();
+        let event = |title| {
+            crate::nachricht::Ereignis::Info(
+                serde_json::from_value(
+                    serde_json::json!({"platform":"twitch","channel_id":"7","title":title}),
+                )
+                .unwrap(),
+            )
+        };
+        for title in ["old A", "old B", "old C"] {
+            previous.bus.publish(event(title)).unwrap();
+        }
+        let old_cursor = 3;
+        hub.invalidate(7);
+        let current = hub.ensure(7).unwrap();
+        for title in ["new A", "new B", "new C", "new D"] {
+            current.bus.publish(event(title)).unwrap();
+        }
+        let same_generation = current.generation == previous_generation;
+        let (_, replay, gap) = current.resume(Some(&previous_generation), Some(old_cursor));
+        let replay_len = replay.len();
+        hub.shutdown().await;
+        assert!(
+            !same_generation || gap || replay_len == 4,
+            "Recreated bus reused generation; old cursor silently discarded {} new events",
+            4 - replay_len
+        );
     }
 }

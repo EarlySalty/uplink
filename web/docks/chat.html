@@ -527,7 +527,7 @@ footer {
   var TEXT_MAX = 500;
 
   var letzteId = 0;
-  var generation = 0;
+  var generation = null;
   /* Verbindungen, die ohne einen einzigen Statusrahmen wieder zu waren.
      Der Server lehnt eine falsche Adresse vor dem Upgrade ab, der Browser
      meldet dafuer nur 1006; nach ein paar Versuchen zeigen wir das an. */
@@ -1193,9 +1193,9 @@ footer {
         statusGesehen = true;
         ohneStatus = 0;
         lage("verbunden", "verbunden");
-        if (typeof daten.generation === "number" && daten.generation !== generation) {
-          /* Neuer Serverprozess, die Nummern zaehlen wieder ab 1. */
-          if (generation !== 0) letzteId = 0;
+        if (typeof daten.generation === "string" && /^[0-9a-f]{32}$/.test(daten.generation) && daten.generation !== generation) {
+          /* Neuer Ereignispuffer: Alte Nummern gelten nicht mehr. */
+          if (generation !== null) letzteId = 0;
           generation = daten.generation;
         }
         statusAnzeigen(daten.plattformen);

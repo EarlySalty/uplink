@@ -1635,3 +1635,87 @@ async fn admission_does_not_overwrite_a_key_rotated_after_validation() {
     driver.await.unwrap();
     database.stop().await;
 }
+
+#[tokio::test]
+#[ignore = "Benötigt isoliertes PostgreSQL und tatsächliche 10-s-Laufzeitprüfung."]
+async fn review_transient_database_error_recovers_active_chat_user() {
+    use futures::future::BoxFuture;
+    use uplink_chat::{BrokerError, DockIdentity, DockUser, Grant, Platform, PlatformBroker};
+    struct Offline;
+    impl DockIdentity for Offline {
+        fn resolve(&self, _: [u8; 32]) -> BoxFuture<'_, Result<Option<DockUser>, BrokerError>> {
+            Box::pin(async { Ok(None) })
+        }
+    }
+    impl PlatformBroker for Offline {
+        fn grant(&self, _: u64, _: Platform, _: bool) -> BoxFuture<'_, Result<Grant, BrokerError>> {
+            Box::pin(async { Err(BrokerError::Disconnected) })
+        }
+    }
+    let (database, mut state) = fixture().await;
+    let hub = uplink_chat::ChatHub::new(
+        uplink_chat::ChatConfig::default(),
+        Arc::new(Offline),
+        Arc::new(Offline),
+    )
+    .unwrap();
+    Arc::get_mut(&mut state).unwrap().chat = Some(hub.clone());
+    let reservation = state.registry.reserve(11).unwrap();
+    hub.set_active(11, true).unwrap();
+    let generation = hub.identity_checks()[0].generation.clone();
+    let certificates = tls::test_tls();
+    let (ready, bound) = tokio::sync::oneshot::channel();
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(uplink_service::runtime::serve_with_ready(
+        state.clone(),
+        certificates.server,
+        Arc::new(Collector(Arc::new(std::sync::Mutex::new(Vec::new())))),
+        async {
+            let _ = stopped.await;
+        },
+        Some(ready),
+    ));
+    bound.await.unwrap();
+    state
+        .store
+        .query("ALTER TABLE relay.users RENAME TO users_fault", &[])
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while !hub
+            .status_for(11)
+            .unwrap()
+            .iter()
+            .all(|status| status.zustand == "access_unconfirmed")
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(state.registry.active_count(), 1);
+    state
+        .store
+        .query("ALTER TABLE relay.users_fault RENAME TO users", &[])
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(12)).await;
+    let recovered = hub
+        .identity_checks()
+        .iter()
+        .any(|check| check.streamer_id == 11 && check.generation == generation && check.active)
+        && hub
+            .status_for(11)
+            .unwrap()
+            .iter()
+            .any(|status| status.zustand != "access_unconfirmed");
+    let still_active = state.registry.active_count();
+    drop(reservation);
+    stop.send(()).unwrap();
+    task.await.unwrap().unwrap();
+    database.stop().await;
+    assert!(
+        recovered,
+        "The real runtime removed the active chat user after one SQL error and did not recover it; media reservations still active: {still_active}"
+    );
+}

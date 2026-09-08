@@ -14,6 +14,9 @@ use crate::kick_webhook::KickDrehkreuz;
 use crate::nachricht::Ereignis;
 use crate::token::TokenQuelle;
 
+#[path = "kick_subscriptions.rs"]
+mod subscriptions;
+
 const KICK_API: &str = "https://api.kick.com";
 const FRIST: Duration = Duration::from_secs(10);
 const SENDE_ABSTAND: Duration = Duration::from_millis(300);
@@ -41,6 +44,7 @@ impl Default for KickEndpunkte {
 }
 
 pub struct KickFabrik {
+    abos: Arc<subscriptions::Verwaltung>,
     quelle: Arc<TokenQuelle>,
     endpunkte: KickEndpunkte,
     drehkreuz: Arc<KickDrehkreuz>,
@@ -60,6 +64,7 @@ impl KickFabrik {
         endpunkte: KickEndpunkte,
     ) -> Self {
         Self {
+            abos: subscriptions::Verwaltung::new(),
             quelle,
             endpunkte,
             drehkreuz,
@@ -136,16 +141,24 @@ impl AdapterFabrik for KickFabrik {
                     "Kick-Konto ohne gültige Nutzer-ID. Chat ist nicht möglich.".into(),
                 ));
             }
+            let abos = self
+                .abos
+                .belegen(
+                    streamer_id,
+                    zugang.platform_user_id.clone(),
+                    self.quelle.clone(),
+                    self.endpunkte.clone(),
+                    self.http.clone(),
+                )
+                .await?;
             let adapter: Arc<dyn ChatAdapter> = Arc::new(KickAdapter {
+                abos,
                 streamer_id,
                 broadcaster_user_id: zugang.platform_user_id.clone(),
                 channel_login: zugang.platform_login.clone(),
                 quelle: self.quelle.clone(),
-                endpunkte: self.endpunkte.clone(),
-                http: self.http.clone(),
                 drehkreuz: self.drehkreuz.clone(),
                 eingang,
-                abo_ids: Mutex::new(Vec::new()),
                 verbunden: AtomicBool::new(false),
                 zuletzt_gesendet: Mutex::new(None),
                 ende_grund: std::sync::Mutex::new(None),
@@ -157,15 +170,13 @@ impl AdapterFabrik for KickFabrik {
 }
 
 pub struct KickAdapter {
+    abos: Arc<subscriptions::Besitzer>,
     streamer_id: i64,
     broadcaster_user_id: String,
     channel_login: String,
     quelle: Arc<TokenQuelle>,
-    endpunkte: KickEndpunkte,
-    http: reqwest::Client,
     drehkreuz: Arc<KickDrehkreuz>,
     eingang: mpsc::Sender<Ereignis>,
-    abo_ids: Mutex<Vec<String>>,
     verbunden: AtomicBool,
     zuletzt_gesendet: Mutex<Option<tokio::time::Instant>>,
     ende_grund: std::sync::Mutex<Option<ChatFehler>>,
@@ -173,167 +184,6 @@ pub struct KickAdapter {
 }
 
 impl KickAdapter {
-    async fn anfrage(
-        &self,
-        method: Method,
-        pfad: &str,
-        query: &[(&str, String)],
-        body: Option<&Value>,
-    ) -> Result<(StatusCode, Value), ChatFehler> {
-        for versuch in 0..2 {
-            let token = self
-                .quelle
-                .zugang(self.streamer_id, Platform::Kick)
-                .await
-                .map_err(fehler_aus_token)?
-                .access_token
-                .clone();
-            let mut bau = self
-                .http
-                .request(method.clone(), format!("{}{}", self.endpunkte.api, pfad))
-                .header("Authorization", format!("Bearer {token}"))
-                .query(query);
-            if let Some(body) = body {
-                bau = bau.json(body);
-            }
-            let antwort = bau
-                .send()
-                .await
-                .map_err(|_| ChatFehler::Netz("Plattformverbindung fehlgeschlagen".into()))?;
-            let status = antwort.status();
-            if status == StatusCode::UNAUTHORIZED {
-                if versuch == 0 {
-                    self.quelle.invalidieren(self.streamer_id, Platform::Kick);
-                    continue;
-                }
-                return Err(ChatFehler::NeuAnmeldungNoetig(Platform::Kick));
-            }
-            let text = String::from_utf8(crate::http::bytes(antwort).await?)
-                .map_err(|_| ChatFehler::Netz("Plattformantwort ist nicht lesbar".into()))?;
-            let koerper = if text.trim().is_empty() {
-                Value::Null
-            } else {
-                serde_json::from_str(&text).unwrap_or(Value::String(text))
-            };
-            return Ok((status, koerper));
-        }
-        Err(ChatFehler::NeuAnmeldungNoetig(Platform::Kick))
-    }
-
-    async fn abonnieren(&self) -> Result<Vec<String>, ChatFehler> {
-        let events: Vec<Value> = ABOS
-            .iter()
-            .map(|(name, version)| json!({ "name": name, "version": version }))
-            .collect();
-        let mut koerper = json!({ "method": "webhook", "events": events });
-        if let Ok(id) = self.broadcaster_user_id.parse::<i64>() {
-            koerper["broadcaster_user_id"] = json!(id);
-        }
-        let (status, antwort) = self
-            .anfrage(
-                Method::POST,
-                "/public/v1/events/subscriptions",
-                &[],
-                Some(&koerper),
-            )
-            .await?;
-        match status {
-            s if s.is_success() => {}
-            StatusCode::FORBIDDEN => return Err(ChatFehler::NeuAnmeldungNoetig(Platform::Kick)),
-            sonst => {
-                return Err(ChatFehler::Netz(format!(
-                    "events/subscriptions: HTTP {sonst}"
-                )));
-            }
-        }
-        let leer = Vec::new();
-        let data = antwort
-            .pointer("/data")
-            .and_then(Value::as_array)
-            .unwrap_or(&leer);
-        let mut ids = Vec::new();
-        let mut chat_ok = false;
-        let mut chat_grund: Option<String> = None;
-        let mut fehlende_activity: Vec<String> = Vec::new();
-        for eintrag in data {
-            let name = eintrag
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let sub_id = eintrag
-                .get("subscription_id")
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty());
-            let grund = eintrag
-                .get("error")
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty());
-            match sub_id {
-                Some(id) => {
-                    ids.push(id.to_string());
-                    if name == "chat.message.sent" {
-                        chat_ok = true;
-                    }
-                }
-                None if name == "chat.message.sent" => {
-                    chat_grund = Some(grund.unwrap_or("kein subscription_id").to_string());
-                }
-                None => fehlende_activity.push(name.to_string()),
-            }
-        }
-        if !chat_ok {
-            return Err(match chat_grund {
-                Some(_) => ChatFehler::Abgelehnt("Kick hat den Chat-Zugang nicht eingerichtet. Bitte die Verbindung im Dashboard prüfen.".into()),
-                None => ChatFehler::Netz(
-                    "events/subscriptions: chat.message.sent nicht abonniert".into(),
-                ),
-            });
-        }
-        if !fehlende_activity.is_empty() {
-            tracing::warn!(
-                streamer_id = self.streamer_id,
-                fehlend = %fehlende_activity.join(","),
-                "Kick-Chat: Aktivitaets-Abos fehlen, Chat laeuft trotzdem"
-            );
-        }
-        Ok(ids)
-    }
-
-    async fn abos_loeschen(&self) {
-        let ids: Vec<String> = self.abo_ids.lock().await.clone();
-        if ids.is_empty() {
-            return;
-        }
-        let query: Vec<(&str, String)> = ids.iter().map(|id| ("id", id.clone())).collect();
-        match self
-            .anfrage(
-                Method::DELETE,
-                "/public/v1/events/subscriptions",
-                &query,
-                None,
-            )
-            .await
-        {
-            Ok((status, _)) if status.is_success() => {
-                self.abo_ids.lock().await.retain(|id| !ids.contains(id));
-            }
-            Ok((status, _)) => {
-                tracing::warn!(
-                    streamer_id = self.streamer_id,
-                    %status,
-                    "Kick-Chat: Abos nicht abbestellt, bleiben fuer den naechsten Versuch"
-                );
-            }
-            Err(fehler) => {
-                tracing::warn!(
-                    streamer_id = self.streamer_id,
-                    %fehler,
-                    "Kick-Chat: Abos nicht abbestellt, bleiben fuer den naechsten Versuch"
-                );
-            }
-        }
-    }
-
     async fn drosseln(&self) {
         let mut zuletzt = self.zuletzt_gesendet.lock().await;
         if let Some(vorher) = *zuletzt {
@@ -370,6 +220,7 @@ impl KickAdapter {
             koerper["broadcaster_user_id"] = json!(id);
         }
         let (status, antwort) = self
+            .abos
             .anfrage(Method::POST, "/public/v1/chat", &[], Some(&koerper))
             .await?;
         match status {
@@ -407,9 +258,8 @@ impl ChatAdapter for KickAdapter {
                 &self.channel_login,
             );
             self.registrierungs_token.store(token, Ordering::SeqCst);
-            match self.abonnieren().await {
-                Ok(ids) => {
-                    *self.abo_ids.lock().await = ids;
+            match self.abos.verbinden().await {
+                Ok(()) => {
                     self.verbunden.store(true, Ordering::SeqCst);
                     tracing::info!(
                         streamer_id = self.streamer_id,
@@ -431,8 +281,8 @@ impl ChatAdapter for KickAdapter {
         Box::pin(async move {
             let token = self.registrierungs_token.load(Ordering::SeqCst);
             self.drehkreuz.abmelden(&self.broadcaster_user_id, token);
-            self.abos_loeschen().await;
             self.verbunden.store(false, Ordering::SeqCst);
+            self.abos.trennen().await;
         })
     }
 
@@ -459,8 +309,15 @@ impl ChatAdapter for KickAdapter {
     }
 }
 
+impl Drop for KickFabrik {
+    fn drop(&mut self) {
+        self.abos.stoppen();
+    }
+}
+
 impl Drop for KickAdapter {
     fn drop(&mut self) {
+        self.abos.freigeben();
         self.drehkreuz.abmelden(
             &self.broadcaster_user_id,
             self.registrierungs_token.load(Ordering::Acquire),
@@ -478,6 +335,7 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     async fn bot_mit_kick_token(server: &MockServer, erwartet: u64) {
+        initial_abgleich(server).await;
         Mock::given(method("GET"))
             .and(path(PFAD))
             .and(query_param("platform", "kick"))
@@ -491,6 +349,34 @@ mod tests {
             .expect(erwartet)
             .mount(server)
             .await;
+    }
+
+    pub(super) async fn initial_abgleich(server: &MockServer) {
+        Mock::given(method("POST"))
+            .and(path("/oauth/token/introspect"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"data":{"active":true,"client_id":"our-app","token_type":"user"}}),
+            ))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/public/v1/events/subscriptions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":[]})))
+            .with_priority(10)
+            .mount(server)
+            .await;
+    }
+
+    async fn bestand_nach_erster_liste(server: &MockServer, id: &str) {
+        let id = id.to_owned();
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        Mock::given(method("GET")).and(path("/public/v1/events/subscriptions"))
+            .respond_with(move |_: &wiremock::Request| {
+                let rows = if calls.fetch_add(1, Ordering::SeqCst) == 0 { json!([]) } else {
+                    json!([{"id":id,"app_id":"our-app","broadcaster_user_id":123,"event":"chat.message.sent","method":"webhook","version":1}])
+                };
+                ResponseTemplate::new(200).set_body_json(json!({"data":rows}))
+            }).mount(server).await;
     }
 
     fn fabrik(server: &MockServer) -> KickFabrik {
@@ -592,6 +478,7 @@ mod tests {
     async fn abos_bleiben_bei_fehlgeschlagenem_delete_erhalten() {
         let server = MockServer::start().await;
         bot_mit_kick_token(&server, 1).await;
+        bestand_nach_erster_liste(&server, "s-1").await;
         Mock::given(method("POST"))
             .and(path("/public/v1/events/subscriptions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -620,6 +507,272 @@ mod tests {
         adapter.trennen().await;
         adapter.trennen().await;
         server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn verworfener_adapter_behaelt_cleanup_besitzer() {
+        let server = MockServer::start().await;
+        bot_mit_kick_token(&server, 1).await;
+        bestand_nach_erster_liste(&server, "retained").await;
+        Mock::given(method("POST")).and(path("/public/v1/events/subscriptions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":[{"name":"chat.message.sent","version":1,"subscription_id":"retained"}]})))
+            .mount(&server).await;
+        Mock::given(method("DELETE"))
+            .and(path("/public/v1/events/subscriptions"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let factory = fabrik(&server);
+        let (tx, _rx) = mpsc::channel(4);
+        let adapter = factory.bauen(7, Platform::Kick, tx).await.unwrap();
+        adapter.verbinden().await.unwrap();
+        adapter.trennen().await;
+        drop(adapter);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let deletes = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.method == "DELETE")
+            .count();
+        assert!(deletes > 1, "Cleanup must outlive the discarded adapter");
+    }
+
+    fn remote_abo(id: &str, app: &str, konto: i64, event: &str) -> Value {
+        json!({"id":id,"app_id":app,"broadcaster_user_id":konto,"event":event,"method":"webhook","version":1})
+    }
+
+    #[tokio::test]
+    async fn unklare_post_antwort_wird_vor_neuem_post_abgeglichen() {
+        let server = MockServer::start().await;
+        bot_mit_kick_token(&server, 1).await;
+        let remote = Arc::new(AtomicBool::new(false));
+        let r = remote.clone();
+        Mock::given(method("GET"))
+            .and(path("/public/v1/events/subscriptions"))
+            .respond_with(move |_: &wiremock::Request| {
+                let mut rows = vec![
+                    remote_abo("foreign-app", "other-app", 123, "chat.message.sent"),
+                    remote_abo("foreign-user", "our-app", 456, "chat.message.sent"),
+                    remote_abo("foreign-event", "our-app", 123, "livestream.status.updated"),
+                ];
+                if r.load(Ordering::SeqCst) {
+                    rows.push(remote_abo("uncertain", "our-app", 123, "chat.message.sent"));
+                }
+                ResponseTemplate::new(200).set_body_json(json!({"data":rows}))
+            })
+            .mount(&server)
+            .await;
+        let posts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let p = posts.clone();
+        let r = remote.clone();
+        Mock::given(method("POST")).and(path("/public/v1/events/subscriptions"))
+            .respond_with(move |_: &wiremock::Request| {
+                assert!(!r.swap(true, Ordering::SeqCst), "No create before confirmed cleanup");
+                if p.fetch_add(1, Ordering::SeqCst) == 0 { ResponseTemplate::new(500) } else {
+                    ResponseTemplate::new(200).set_body_json(json!({"data":[{"name":"chat.message.sent","subscription_id":"uncertain"}]}))
+                }
+            }).mount(&server).await;
+        let r = remote.clone();
+        Mock::given(method("DELETE"))
+            .and(path("/public/v1/events/subscriptions"))
+            .respond_with(move |request: &wiremock::Request| {
+                let ids: Vec<_> = request
+                    .url
+                    .query_pairs()
+                    .filter(|(k, _)| k == "id")
+                    .map(|(_, v)| v.into_owned())
+                    .collect();
+                assert_eq!(ids, ["uncertain"]);
+                r.store(false, Ordering::SeqCst);
+                ResponseTemplate::new(204)
+            })
+            .mount(&server)
+            .await;
+        let factory = fabrik(&server);
+        let (tx, _rx) = mpsc::channel(4);
+        let adapter = factory.bauen(7, Platform::Kick, tx).await.unwrap();
+        assert!(adapter.verbinden().await.is_err());
+        adapter.verbinden().await.unwrap();
+        assert_eq!(posts.load(Ordering::SeqCst), 2);
+        assert!(adapter.verbunden());
+        adapter.trennen().await;
+    }
+
+    #[tokio::test]
+    async fn verlorene_delete_antwort_wird_durch_remote_leerstand_geklaert() {
+        let server = MockServer::start().await;
+        bot_mit_kick_token(&server, 1).await;
+        Mock::given(method("POST"))
+            .and(path("/public/v1/events/subscriptions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"data":[{"name":"chat.message.sent","subscription_id":"gone"}]}),
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/public/v1/events/subscriptions"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let factory = fabrik(&server);
+        let (tx, _rx) = mpsc::channel(4);
+        let adapter = factory.bauen(7, Platform::Kick, tx).await.unwrap();
+        adapter.verbinden().await.unwrap();
+        adapter.trennen().await;
+        drop(adapter);
+        // Initial GET and reconciliation return an authoritative empty list.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let requests = server.received_requests().await.unwrap();
+        assert!(
+            requests
+                .iter()
+                .filter(|r| r.method == "GET" && r.url.path() == "/public/v1/events/subscriptions")
+                .count()
+                >= 2
+        );
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn abgebrochener_post_behaelt_remote_cleanup_besitzer() {
+        let server = MockServer::start().await;
+        bot_mit_kick_token(&server, 1).await;
+        let accepted = Arc::new(AtomicBool::new(false));
+        let r = accepted.clone();
+        Mock::given(method("POST")).and(path("/public/v1/events/subscriptions"))
+            .respond_with(move |_: &wiremock::Request| {
+                r.store(true,Ordering::SeqCst);
+                ResponseTemplate::new(200).set_delay(Duration::from_secs(3)).set_body_json(json!({"data":[{"name":"chat.message.sent","subscription_id":"cancelled"}]}))
+            }).expect(1).mount(&server).await;
+        let r = accepted.clone();
+        Mock::given(method("GET")).and(path("/public/v1/events/subscriptions"))
+            .respond_with(move |_: &wiremock::Request| ResponseTemplate::new(200).set_body_json(json!({"data":if r.load(Ordering::SeqCst) {vec![remote_abo("cancelled","our-app",123,"chat.message.sent")]} else {vec![]}})))
+            .mount(&server).await;
+        Mock::given(method("DELETE"))
+            .and(path("/public/v1/events/subscriptions"))
+            .and(query_param("id", "cancelled"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let factory = fabrik(&server);
+        let (tx, _rx) = mpsc::channel(4);
+        let adapter = factory.bauen(7, Platform::Kick, tx).await.unwrap();
+        let task = tokio::spawn(async move { adapter.verbinden().await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !accepted.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if server
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|r| r.method == "DELETE")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn unbekannter_remote_bestand_sperrt_erneute_anlage() {
+        let server = MockServer::start().await;
+        bot_mit_kick_token(&server, 1).await;
+        Mock::given(method("GET"))
+            .and(path("/public/v1/events/subscriptions"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let factory = fabrik(&server);
+        let (tx, _rx) = mpsc::channel(4);
+        let adapter = factory.bauen(7, Platform::Kick, tx).await.unwrap();
+        assert!(adapter.verbinden().await.is_err());
+        assert!(adapter.verbinden().await.is_err());
+        assert!(
+            !server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .any(|r| r.method == "POST" && r.url.path() == "/public/v1/events/subscriptions")
+        );
+    }
+
+    #[tokio::test]
+    async fn geaenderte_app_uebernimmt_keine_alten_abos() {
+        let server = MockServer::start().await;
+        bot_mit_kick_token(&server, 1).await;
+        let changed = Arc::new(AtomicBool::new(false));
+        let c = changed.clone();
+        Mock::given(method("POST")).and(path("/oauth/token/introspect"))
+            .respond_with(move |_: &wiremock::Request| ResponseTemplate::new(200).set_body_json(json!({"data":{"active":true,"client_id":if c.load(Ordering::SeqCst){"new-app"}else{"our-app"},"token_type":"user"}})))
+            .with_priority(1).mount(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/public/v1/events/subscriptions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"data":[{"name":"chat.message.sent","subscription_id":"old-app-id"}]}),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let factory = fabrik(&server);
+        let (tx, _rx) = mpsc::channel(4);
+        let adapter = factory.bauen(7, Platform::Kick, tx).await.unwrap();
+        adapter.verbinden().await.unwrap();
+        changed.store(true, Ordering::SeqCst);
+        adapter.trennen().await;
+        assert!(adapter.verbinden().await.is_err());
+        assert!(
+            !server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .any(|r| r.method == "DELETE")
+        );
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn zu_grosse_abonnementliste_loest_keine_mutation_aus() {
+        let server = MockServer::start().await;
+        bot_mit_kick_token(&server, 1).await;
+        let rows: Vec<_> = (0..257)
+            .map(|i| remote_abo(&format!("id-{i}"), "our-app", 123, "chat.message.sent"))
+            .collect();
+        Mock::given(method("GET"))
+            .and(path("/public/v1/events/subscriptions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":rows})))
+            .mount(&server)
+            .await;
+        let factory = fabrik(&server);
+        let (tx, _rx) = mpsc::channel(4);
+        let adapter = factory.bauen(7, Platform::Kick, tx).await.unwrap();
+        assert!(adapter.verbinden().await.is_err());
+        assert!(
+            !server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .any(|r| r.url.path() == "/public/v1/events/subscriptions" && r.method != "GET")
+        );
     }
 
     #[tokio::test]
@@ -735,5 +888,59 @@ mod tests {
             .await
             .expect("Adapter");
         assert!(adapter.senden("moin").await.is_err());
+    }
+}
+
+#[cfg(test)]
+mod independent_review_probes {
+    use super::*;
+    use crate::{BrokerError, Grant, PlatformBroker};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    struct Broker;
+    impl PlatformBroker for Broker {
+        fn grant(&self, _: u64, _: Platform, _: bool) -> BoxFuture<'_, Result<Grant, BrokerError>> {
+            Box::pin(async {
+                Ok(Grant {
+                    access_token: "synthetic-kick-token".into(),
+                    expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+                    platform_user_id: "123".into(),
+                    platform_login: "synthetic".into(),
+                    scopes: vec!["events:subscribe".into()],
+                })
+            })
+        }
+    }
+    #[tokio::test]
+    async fn review_failed_chat_subscription_must_cleanup_successful_activity_subscription() {
+        let server = MockServer::start().await;
+        super::tests::initial_abgleich(&server).await;
+        Mock::given(method("POST")).and(path("/public/v1/events/subscriptions")).respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":[{"name":"channel.followed","subscription_id":"allocated-follow"},{"name":"chat.message.sent","error":"denied"}]}))).mount(&server).await;
+        Mock::given(method("DELETE"))
+            .and(path("/public/v1/events/subscriptions"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let factory = KickFabrik::mit_endpunkten(
+            Arc::new(TokenQuelle::from_broker(Arc::new(Broker))),
+            Arc::new(KickDrehkreuz::new("http://127.0.0.1:0")),
+            KickEndpunkte { api: server.uri() },
+        );
+        let (sender, _receiver) = mpsc::channel(10);
+        let adapter = factory.bauen(7, Platform::Kick, sender).await.unwrap();
+        assert!(adapter.verbinden().await.is_err());
+        adapter.trennen().await;
+        drop(adapter);
+        let requests = server.received_requests().await.unwrap();
+        let deleted = requests.iter().any(|r| {
+            r.method == "DELETE"
+                && r.url
+                    .query_pairs()
+                    .any(|(key, value)| key == "id" && value == "allocated-follow")
+        });
+        assert!(
+            deleted,
+            "Successful partial remote subscription was forgotten even after explicit disconnect and adapter drop"
+        );
     }
 }

@@ -138,7 +138,8 @@ pub async fn serve_with_ready<P: SessionProcessor>(
     });
     let mut tasks = JoinSet::new();
     // Auch geöffnete Dashboards ohne Socket dürfen Chat nach einer Sperre
-    // nicht unbegrenzt weiterbetreiben. DBfehler schließen den Zugang sicher.
+    // nicht unbegrenzt weiterbetreiben. Unbekannte DBergebnisse pausieren den
+    // Zugang, behalten aber die zur laufenden Session gehörige Zuordnung.
     let chat_check = async {
         let Some(hub) = &chat else {
             std::future::pending::<()>().await;
@@ -147,24 +148,28 @@ pub async fn serve_with_ready<P: SessionProcessor>(
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(10));
         loop {
             tick.tick().await;
-            let ids = hub.user_ids();
-            if ids.is_empty() {
+            let checks = hub.identity_checks();
+            if checks.is_empty() {
                 continue;
             }
-            let ids: Vec<i64> = ids
-                .into_iter()
-                .filter_map(|id| i64::try_from(id).ok())
+            let ids: Vec<i64> = checks
+                .iter()
+                .filter_map(|check| i64::try_from(check.streamer_id).ok())
                 .collect();
             let allowed=chat_store.query("SELECT streamer_id FROM relay.users WHERE streamer_id=ANY($1) AND enabled=true", &[&ids]).await;
-            let allowed: std::collections::HashSet<i64> = allowed
-                .unwrap_or_default()
-                .iter()
-                .filter_map(|row| row.try_get(0).ok())
-                .collect();
-            for id in ids {
-                if !allowed.contains(&id) {
-                    hub.invalidate(id as u64);
-                }
+            let allowed = allowed.ok().and_then(|rows| {
+                rows.iter()
+                    .map(|row| row.try_get::<_, i64>(0))
+                    .collect::<Result<std::collections::HashSet<_>, _>>()
+                    .ok()
+            });
+            for check in checks {
+                hub.identity_checked(
+                    &check,
+                    allowed
+                        .as_ref()
+                        .map(|ids| ids.contains(&(check.streamer_id as i64))),
+                );
             }
         }
     };
