@@ -230,7 +230,10 @@ impl MediaEngine {
                     .iter()
                     .position(|track| *track == event.identity.track)
                     .ok_or(MediaError::MissingTrack)?;
-                tag = tag.with_audio_track(canonical as u8, self.config.limits.max_tag_bytes)?;
+                tag = tag.with_audio_track(
+                    canonical as u8,
+                    self.config.limits.routing_limits().max_tag_bytes,
+                )?;
             }
             tag.write_to(&mut flv).await?;
             if flv.len() > self.config.limits.queue_bytes + HEADER.len() + prefix.len() * 5 {

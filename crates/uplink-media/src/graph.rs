@@ -223,6 +223,20 @@ impl Graph {
     }
 
     pub(crate) fn observed(source: &SourceObservation, outputs: &[DesiredOutput]) -> Result<Self> {
+        let selected = outputs
+            .iter()
+            .flat_map(|output| {
+                std::iter::once(output.live_audio_track).chain(output.vod_audio_track)
+            })
+            .collect();
+        Self::observed_selected(source, outputs, &selected)
+    }
+
+    fn observed_selected(
+        source: &SourceObservation,
+        outputs: &[DesiredOutput],
+        selected: &HashSet<u8>,
+    ) -> Result<Self> {
         use uplink_core::{Color, FrameRate, Gop, RateControl};
         if source.pixel_format != "yuv420p"
             || !matches!(source.codec.as_str(), "av1" | "h264" | "hevc")
@@ -257,7 +271,11 @@ impl Graph {
             },
         )]);
         let mut input_audio = HashMap::new();
-        for (index, audio) in source.audio.iter().enumerate() {
+        let selected_audio = source
+            .audio
+            .iter()
+            .filter(|audio| selected.contains(&audio.wire_track));
+        for (index, audio) in selected_audio.enumerate() {
             if audio.codec != "aac"
                 || audio.sample_rate != 48000
                 || !(1..=2).contains(&audio.channels)
@@ -411,7 +429,11 @@ impl Graph {
         source: &SourceObservation,
         outputs: &[crate::ProgramOutput],
     ) -> Result<Self> {
-        let mut graph = Self::observed(source, &[])?;
+        let selected = outputs
+            .iter()
+            .flat_map(|output| output.audio.iter().map(|audio| audio.source_wire_track))
+            .collect();
+        let mut graph = Self::observed_selected(source, &[], &selected)?;
         let source_fps = uplink_core::FrameRate::new(source.fps_numerator, source.fps_denominator)
             .map_err(|_| MediaError::InvalidMedia)?;
         let mut target_ids = HashSet::new();
@@ -908,6 +930,24 @@ mod tests {
             .unwrap();
         assert!(!args.iter().any(|v| v == "-color_primaries"));
     }
+
+    #[test]
+    fn unused_auxiliary_audio_does_not_block_selected_mix() {
+        let mut source = source();
+        source.audio[0].sample_rate = 44100;
+        let graph = Graph::observed(&source, &[output("selected", 1, None)]).unwrap();
+        assert_eq!(graph.routes[0].failure, None);
+        assert_eq!(graph.input_audio.len(), 1);
+        assert!(!graph.expected_tracks.contains(&WireTrack {
+            kind: MediaKind::Audio,
+            wire_id: 0
+        }));
+        assert_eq!(graph.routes[0].audio, vec![(0, 0)]);
+        assert!(matches!(
+            Graph::observed(&source, &[output("invalid", 0, None)]),
+            Err(MediaError::UnsupportedProfile)
+        ));
+    }
     #[test]
     fn observed_hdr_missing_audio_and_unapproved_upscale_are_rejected() {
         let mut hdr = source();
@@ -930,6 +970,12 @@ mod tests {
     fn multivideo_shares_profiles_but_keeps_one_audio_anchor_and_unique_track_ids() {
         use crate::{ProgramAudio, ProgramOutput, ProgramVideo};
         let mut source = source();
+        source.audio.push(AudioObservation {
+            wire_track: 8,
+            codec: "aac".into(),
+            sample_rate: 44100,
+            channels: 1,
+        });
         source.color_primaries = Some("bt709".into());
         source.color_transfer = Some("bt709".into());
         source.color_matrix = Some("bt709".into());

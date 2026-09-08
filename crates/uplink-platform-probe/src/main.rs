@@ -7,7 +7,7 @@ use uplink_media::{
     EngineConfig, MediaLimits, PublishSecret,
     platform::{
         hardware,
-        twitch::{Canvas, GoLiveClient, GoLiveProbe, Preferences, Rational},
+        twitch::{Canvas, GoLiveClient, GoLiveError, GoLiveProbe, Preferences, Rational},
     },
 };
 use uplink_service::{
@@ -426,10 +426,10 @@ async fn run(args: Arguments) -> Result<()> {
         .map_err(|_| "Lokale Hardware- oder Encodermessung ist fehlgeschlagen.")?;
     let requested = preferences();
     let configuration = GoLiveClient::new()
-        .map_err(|_| "Twitch-Konfigurationsclient ist nicht verfügbar.")?
+        .map_err(GoLiveError::message)?
         .probe(&authentication, &hardware, &requested)
         .await
-        .map_err(|_| "Twitch-Konfiguration konnte nicht sicher geprüft werden.")?;
+        .map_err(GoLiveError::message)?;
     emit(&Summary {
         broker_identity_matches: identity_matches,
         chat_identity_broker_status: if identity_matches.is_some() {

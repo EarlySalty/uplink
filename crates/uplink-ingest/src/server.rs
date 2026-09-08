@@ -559,10 +559,17 @@ impl<A: Authorizer> Handler<A> {
         report.received_bytes += size as u64;
         report.track_count = self.tracks.len();
         report.max_queued_bytes = report.max_queued_bytes.max(observed_budget);
-        self.status.send_replace(Activity {
-            published: true,
-            last_media: Instant::now(),
-        });
+        // Metadaten adressieren eine Spur, belegen aber keinen abspielbaren
+        // Medienfluss. Sie und ein Sequenzende verlängern die Frist nicht.
+        if matches!(
+            parsed.event_kind,
+            EventKind::SequenceHeader | EventKind::Frame
+        ) {
+            self.status.send_replace(Activity {
+                published: true,
+                last_media: Instant::now(),
+            });
+        }
         Ok(())
     }
 }
