@@ -282,7 +282,9 @@ impl ChatAdapter for KickAdapter {
             let token = self.registrierungs_token.load(Ordering::SeqCst);
             self.drehkreuz.abmelden(&self.broadcaster_user_id, token);
             self.verbunden.store(false, Ordering::SeqCst);
-            self.abos.trennen().await;
+            if let Err(error) = self.abos.trennen().await {
+                *self.ende_grund.lock().expect("ende_grund") = Some(error);
+            }
         })
     }
 
@@ -944,3 +946,7 @@ mod independent_review_probes {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "kick_disconnect_tests.rs"]
+mod coupled_disconnect_review;

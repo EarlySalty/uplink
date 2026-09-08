@@ -14,7 +14,8 @@ use super::{ABOS, KickEndpunkte};
 use crate::Platform;
 use crate::adapter::ChatFehler;
 use crate::helix::fehler_aus_token;
-use crate::token::TokenQuelle;
+use crate::token::{Grant, GrantAbo, TokenQuelle};
+use zeroize::Zeroizing;
 
 const PFAD: &str = "/public/v1/events/subscriptions";
 const MAX_BESITZER: usize = 512;
@@ -34,6 +35,21 @@ struct Zustand {
     ids: Vec<String>,
     unklar: bool,
     app_id: Option<String>,
+    cleanup: Option<CleanupZugang>,
+    cleanup_reported: bool,
+}
+
+/// Nur RAM und nur für die bereits verantworteten Abos. Kein Refresh-Token,
+/// keine Rückgabe an den Broker und kein Zugriff aus Chat-/Anlagepfaden.
+struct CleanupZugang {
+    token: Zeroizing<String>,
+    expires_at: chrono::DateTime<chrono::Utc>,
+}
+
+enum CleanupAnfrage<'a> {
+    Introspect,
+    Bestand,
+    Loeschen(&'a [String]),
 }
 
 pub(super) struct Besitzer {
@@ -43,6 +59,7 @@ pub(super) struct Besitzer {
     endpunkte: KickEndpunkte,
     http: reqwest::Client,
     zustand: Mutex<Zustand>,
+    grant_wechsel: std::sync::Mutex<Option<Arc<GrantAbo>>>,
     belegt: AtomicBool,
     abbauen: AtomicBool,
     wecken: Arc<Notify>,
@@ -127,6 +144,7 @@ impl Verwaltung {
                 unklar: true,
                 ..Zustand::default()
             }),
+            grant_wechsel: std::sync::Mutex::new(None),
             belegt: AtomicBool::new(true),
             abbauen: AtomicBool::new(false),
             wecken: self.wecken.clone(),
@@ -164,8 +182,20 @@ impl Verwaltung {
 impl Besitzer {
     pub fn freigeben(&self) {
         self.abbauen.store(true, Ordering::Release);
+        self.grant_wechsel_stoppen();
         self.belegt.store(false, Ordering::Release);
         self.wecken.notify_one();
+    }
+
+    fn grant_wechsel_stoppen(&self) {
+        if let Some(abo) = self
+            .grant_wechsel
+            .lock()
+            .expect("Kick-Grant-Wechsel")
+            .as_ref()
+        {
+            abo.stoppen();
+        }
     }
 
     pub async fn anfrage(
@@ -175,6 +205,10 @@ impl Besitzer {
         query: &[(&str, String)],
         body: Option<&Value>,
     ) -> Result<(StatusCode, Value), ChatFehler> {
+        // Der normale Schreibweg besitzt keinen Zugriff auf CleanupZugang.
+        if method != Method::POST || pfad != "/public/v1/chat" {
+            return Err(unklar());
+        }
         for versuch in 0..2 {
             let zugang = self
                 .quelle
@@ -222,10 +256,55 @@ impl Besitzer {
         Err(ChatFehler::NeuAnmeldungNoetig(Platform::Kick))
     }
 
-    async fn app_pruefen(&self, state: &mut Zustand) -> Result<(), ChatFehler> {
-        let (status, antwort) = self
-            .anfrage(Method::POST, "/oauth/token/introspect", &[], None)
-            .await?;
+    async fn live_zugang(&self) -> Result<Grant, ChatFehler> {
+        let grant = self
+            .quelle
+            .zugang(self.streamer_id, Platform::Kick)
+            .await
+            .map_err(fehler_aus_token)?;
+        if grant.platform_user_id != self.konto
+            || !grant.scopes.iter().any(|scope| scope == "events:subscribe")
+        {
+            return Err(ChatFehler::NeuAnmeldungNoetig(Platform::Kick));
+        }
+        Ok(grant)
+    }
+
+    async fn http_anfrage(
+        &self,
+        token: &str,
+        method: Method,
+        pfad: &str,
+        query: &[(&str, String)],
+        body: Option<&Value>,
+    ) -> Result<(StatusCode, Value), ChatFehler> {
+        let mut request = self
+            .http
+            .request(method, format!("{}{}", self.endpunkte.api, pfad))
+            .bearer_auth(token)
+            .query(query);
+        if let Some(body) = body {
+            request = request.json(body);
+        }
+        let response = request.send().await.map_err(|_| unklar())?;
+        let status = response.status();
+        if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+            return Err(ChatFehler::NeuAnmeldungNoetig(Platform::Kick));
+        }
+        let bytes = crate::http::bytes(response).await?;
+        let value = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).map_err(|_| unklar())?
+        };
+        Ok((status, value))
+    }
+
+    fn app_bestaetigen(
+        state: &mut Zustand,
+        status: StatusCode,
+        antwort: &Value,
+    ) -> Result<(), ChatFehler> {
         let app = antwort
             .pointer("/data/client_id")
             .and_then(Value::as_str)
@@ -245,15 +324,63 @@ impl Besitzer {
         Ok(())
     }
 
-    async fn abgleichen(&self, state: &mut Zustand) -> Result<(), ChatFehler> {
-        let (status, antwort) = self
-            .anfrage(
-                Method::GET,
-                PFAD,
-                &[("broadcaster_user_id", self.konto.clone())],
+    async fn cleanup_autorisieren(
+        &self,
+        state: &mut Zustand,
+        grant: &Grant,
+    ) -> Result<(), ChatFehler> {
+        let (status, value) = self
+            .http_anfrage(
+                &grant.access_token,
+                Method::POST,
+                "/oauth/token/introspect",
+                &[],
                 None,
             )
             .await?;
+        Self::app_bestaetigen(state, status, &value)?;
+        state.cleanup = Some(CleanupZugang {
+            token: Zeroizing::new(grant.access_token.clone()),
+            expires_at: grant.expires_at,
+        });
+        Ok(())
+    }
+
+    async fn cleanup_anfrage(
+        &self,
+        state: &Zustand,
+        operation: CleanupAnfrage<'_>,
+    ) -> Result<(StatusCode, Value), ChatFehler> {
+        let access = state
+            .cleanup
+            .as_ref()
+            .filter(|access| access.expires_at > chrono::Utc::now())
+            .ok_or(ChatFehler::NeuAnmeldungNoetig(Platform::Kick))?;
+        let (method, path, query) = match operation {
+            CleanupAnfrage::Introspect => (Method::POST, "/oauth/token/introspect", vec![]),
+            CleanupAnfrage::Bestand => (
+                Method::GET,
+                PFAD,
+                vec![("broadcaster_user_id", self.konto.clone())],
+            ),
+            CleanupAnfrage::Loeschen(ids) => {
+                if ids.is_empty() || ids.len() > 16 || ids.iter().any(|id| !state.ids.contains(id))
+                {
+                    return Err(unklar());
+                }
+                (
+                    Method::DELETE,
+                    PFAD,
+                    ids.iter().map(|id| ("id", id.clone())).collect(),
+                )
+            }
+        };
+        self.http_anfrage(&access.token, method, path, &query, None)
+            .await
+    }
+
+    async fn abgleichen(&self, state: &mut Zustand) -> Result<(), ChatFehler> {
+        let (status, antwort) = self.cleanup_anfrage(state, CleanupAnfrage::Bestand).await?;
         if !status.is_success() {
             return Err(unklar());
         }
@@ -310,18 +437,15 @@ impl Besitzer {
     async fn loeschen(&self, state: &mut Zustand) -> Result<(), ChatFehler> {
         while !state.ids.is_empty() {
             // Bound URL size as well as the retained list; already confirmed batches can advance.
-            let query: Vec<_> = state
-                .ids
-                .iter()
-                .take(16)
-                .map(|id| ("id", id.clone()))
-                .collect();
+            let ids: Vec<_> = state.ids.iter().take(16).cloned().collect();
             state.unklar = true;
-            let (status, _) = self.anfrage(Method::DELETE, PFAD, &query, None).await?;
+            let (status, _) = self
+                .cleanup_anfrage(state, CleanupAnfrage::Loeschen(&ids))
+                .await?;
             if !status.is_success() {
                 return Err(unklar());
             }
-            state.ids.drain(..query.len());
+            state.ids.drain(..ids.len());
             state.unklar = false;
         }
         Ok(())
@@ -330,18 +454,37 @@ impl Besitzer {
     pub async fn verbinden(&self) -> Result<(), ChatFehler> {
         let mut state = self.zustand.lock().await;
         self.abbauen.store(true, Ordering::Release);
-        self.app_pruefen(&mut state).await?;
+        self.grant_wechsel_stoppen();
+        let grant = self.live_zugang().await?;
+        self.cleanup_autorisieren(&mut state, &grant).await?;
         if state.unklar {
             self.abgleichen(&mut state).await?;
         }
         self.loeschen(&mut state).await?;
         let body = json!({"method":"webhook", "broadcaster_user_id":self.konto.parse::<i64>().map_err(|_| unklar())?,
             "events":ABOS.iter().map(|(name, version)| json!({"name":name,"version":version})).collect::<Vec<_>>()});
-        state.unklar = true;
-        let (status, antwort) = self.anfrage(Method::POST, PFAD, &[], Some(&body)).await?;
-        if status == StatusCode::FORBIDDEN {
-            return Err(ChatFehler::NeuAnmeldungNoetig(Platform::Kick));
+        // Neue Anlage benötigt weiterhin den regulär erlaubten Brokergrant.
+        // Cleanup-Zugang allein kann diesen Pfad niemals öffnen.
+        let current = self.live_zugang().await?;
+        if current.access_token != grant.access_token {
+            self.cleanup_autorisieren(&mut state, &current).await?;
         }
+        // Jeder neue Besitzerdurchlauf erhält einen eigenen Empfänger. Alte
+        // Empfänger sind vor Abbau/Neuanlage gestoppt und werden ersetzt.
+        *self.grant_wechsel.lock().expect("Kick-Grant-Wechsel") = Some(
+            self.quelle
+                .grant_wechsel(
+                    self.streamer_id,
+                    Platform::Kick,
+                    self.konto.clone(),
+                    "events:subscribe",
+                )
+                .map_err(fehler_aus_token)?,
+        );
+        state.unklar = true;
+        let (status, antwort) = self
+            .http_anfrage(&current.access_token, Method::POST, PFAD, &[], Some(&body))
+            .await?;
         if !status.is_success() {
             return Err(unklar());
         }
@@ -382,31 +525,118 @@ impl Besitzer {
         Ok(())
     }
 
-    pub async fn trennen(&self) {
+    pub async fn trennen(&self) -> Result<(), ChatFehler> {
         self.abbauen.store(true, Ordering::Release);
-        let _ = tokio::time::timeout(CLEANUP_FRIST, self.aufraeumen()).await;
+        self.grant_wechsel_stoppen();
+        let result = tokio::time::timeout(CLEANUP_FRIST, self.aufraeumen()).await
+            .unwrap_or_else(|_| Err(ChatFehler::Netz("Kick-Bereinigung hat ihre Frist überschritten. Die offenen Abos bleiben zur Wiederholung vorgemerkt.".into())));
         self.wecken.notify_one();
+        result
     }
 
     async fn aufraeumen(&self) -> Result<(), ChatFehler> {
         let mut state = self.zustand.lock().await;
+        let result = self.cleanup_locked(&mut state).await;
+        if let Err(error) = &result {
+            if !state.cleanup_reported {
+                tracing::warn!(streamer_id=self.streamer_id, %error, "Kick-Abos konnten nicht bereinigt werden; offene Zuständigkeit bleibt erhalten");
+                state.cleanup_reported = true;
+            }
+        } else {
+            state.cleanup_reported = false;
+        }
+        result
+    }
+
+    async fn cleanup_locked(&self, state: &mut Zustand) -> Result<(), ChatFehler> {
         if !self.abbauen.load(Ordering::Acquire) {
             return Ok(());
         }
         if state.ids.is_empty() && !state.unklar {
+            state.cleanup = None;
+            self.grant_wechsel
+                .lock()
+                .expect("Kick-Grant-Wechsel")
+                .take();
             return Ok(());
         }
-        self.app_pruefen(&mut state).await?;
-        if state.unklar {
-            self.abgleichen(&mut state).await?;
+        let normal_erneuert = self
+            .grant_wechsel
+            .lock()
+            .expect("Kick-Grant-Wechsel")
+            .as_ref()
+            .and_then(|abo| abo.letzter());
+        if let Some(grant) = normal_erneuert.filter(|grant| grant.expires_at > chrono::Utc::now()) {
+            // Der Empfänger prüft Konto und Scope, dieser vorhandene Owner
+            // bestätigt zusätzlich seine unveränderte App vor der Übernahme.
+            self.cleanup_autorisieren(state, &grant).await?;
         }
-        self.loeschen(&mut state).await
+        if state
+            .cleanup
+            .as_ref()
+            .is_some_and(|access| access.expires_at <= chrono::Utc::now())
+        {
+            state.cleanup = None;
+            self.grant_wechsel
+                .lock()
+                .expect("Kick-Grant-Wechsel")
+                .take();
+            return Err(ChatFehler::NeuAnmeldungNoetig(Platform::Kick));
+        }
+        let (status, value) = self
+            .cleanup_anfrage(state, CleanupAnfrage::Introspect)
+            .await?;
+        Self::app_bestaetigen(state, status, &value)?;
+        if state.unklar {
+            self.abgleichen(state).await?;
+        }
+        self.loeschen(state).await?;
+        state.cleanup = None;
+        self.grant_wechsel
+            .lock()
+            .expect("Kick-Grant-Wechsel")
+            .take();
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn abgelaufener_cleanup_zugang_wird_verworfen_aber_die_schuld_bleibt() {
+        let verwaltung = Verwaltung::new();
+        let owner = verwaltung
+            .belegen(
+                7,
+                "123".into(),
+                Arc::new(TokenQuelle::new("http://127.0.0.1:1", "synthetic")),
+                KickEndpunkte::default(),
+                reqwest::Client::new(),
+            )
+            .await
+            .unwrap();
+        {
+            let mut state = owner.zustand.lock().await;
+            state.ids = vec!["owned-expired".into()];
+            state.unklar = false;
+            state.cleanup = Some(CleanupZugang {
+                token: Zeroizing::new("synthetic-expired".into()),
+                expires_at: chrono::Utc::now() - chrono::Duration::seconds(1),
+            });
+        }
+        owner.freigeben();
+        assert_eq!(
+            owner.aufraeumen().await,
+            Err(ChatFehler::NeuAnmeldungNoetig(Platform::Kick))
+        );
+        let state = owner.zustand.lock().await;
+        assert!(state.cleanup.is_none());
+        assert_eq!(state.ids, ["owned-expired"]);
+        drop(state);
+        verwaltung.stoppen();
+    }
 
     #[tokio::test]
     async fn besitzerlimit_verhindert_unbegrenzte_cleanup_schulden() {
