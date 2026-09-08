@@ -19,4 +19,6 @@ F1–F3 begrenzen die konkrete Aufzeichnung, VOD-Ausführung und Speicherwahl. F
 
 ## Bestätigter Übergabestand
 
-`2c4752d6afbf83a53990d93b31478acaf8f38071` ist auf dem Featurebranch gepusht und in [PR #1](https://github.com/EarlySalty/uplink/pull/1) sichtbar. Native Rust-Nachprüfung und zentraler Gate haben diesen Stand freigegeben. [Pushprüfung](https://github.com/EarlySalty/uplink/actions/runs/34218835484), [PR-Prüfung](https://github.com/EarlySalty/uplink/actions/runs/34218899893) und GitGuardian Secret-Scan sind erfolgreich; der PR meldet `CLEAN`. Es folgen der separate Dokucommit, die Zusammenführung dieses Bausteins nach `main` und die Branchbereinigung. Der Main-Merge ist noch nicht erfolgt.
+[PR #1](https://github.com/EarlySalty/uplink/pull/1) und [PR #2](https://github.com/EarlySalty/uplink/pull/2) sind gemergt. Der geprüfte funktionale Main-Stand nach PR #2 ist `001724fdacded263f16681ba0aec8e5f348de601`; der Dateibaum ist identisch zum geprüften Stand `32653ca0a74d3c6a886d0f1a9b700268953153d2`. Die [Main-CI](https://github.com/EarlySalty/uplink/actions/runs/34221066802) ist erfolgreich. Beide Featurebranches wurden lokal und auf GitHub gelöscht; nur `main` und ein Hauptworktree bleiben. Grundlagen- und isolierter Nachweisbaustein sind abgeschlossen; der produktive Neubau bleibt offen.
+
+Der über PR #2 übernommene Scuffle-Baustein enthält eine portable Testakte, kleine synthetische Fixtures und isolierte Debug-/Release-Prüfung in CI. Die Ergebnisse sind ein begrenzter Offline-Nachweis; eine Produktionsengine ist damit nicht freigegeben.

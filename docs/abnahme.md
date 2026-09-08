@@ -6,9 +6,11 @@ Stand: 8. September 2026. Maßgeblich ist Abschnitt 13 des [Produktvertrags v0.3
 
 `uplink-core` und `uplink-cli` bilden den ersten lokalen Entwicklungsschritt: Profile, Audiozuordnung, Encode-Planung und begrenzte komprimierte Puffer sowie TOML-Prüfung. Der CLI-Eingang wird beschrieben, nicht aus OBS gemessen. Geplante Encode-Gruppen sind kein gemessener Encoderbetrieb. Lokale Tests dürfen deshalb nur die von ihnen tatsächlich geprüfte Fachregel als belegt markieren.
 
-24 lokale Tests sowie Formatierung, Clippy und Release-Build wurden nach dem Planungsfix geprüft. Der [Rust-Review](review-rust.md) gibt den Stand `385ea02` für die lokale Grundlage frei; der [Sicherheitsreview](review-security.md) prüft den Grundstand `0c9bc4e`. Spätere Gate- und Codezustände stehen in [EVIDENCE.md](../.tasks/2026-09-08-uplink-neubau/EVIDENCE.md). Ein grüner Build schließt keine Live-Abnahme automatisch.
+24 lokale Tests sowie Formatierung, Clippy und Release-Build wurden nach dem Planungsfix geprüft. Der [Rust-Review](review-rust.md) bestätigt auch die abschließende Video-Decoderbenennung in `2c4752d`; der [Sicherheitsreview](review-security.md) prüft den Grundstand `0c9bc4e`. Der vollständige Stand `40ef8fa` erhielt Gate-ALLOW und wurde über PR #1 mit identischem Dateibaum nach `main` (`409ae8db498e342a136556efcb3144a15d2e1846`) zusammengeführt. Die [Main-CI](https://github.com/EarlySalty/uplink/actions/runs/34219867812) ist erfolgreich; der Grundlagenbaustein und seine Branchbereinigung sind abgeschlossen. Einzelne Nachweise stehen in [EVIDENCE.md](../.tasks/2026-09-08-uplink-neubau/EVIDENCE.md). Die produktiven Abnahmen bleiben offen.
 
 Zusätzlich belegt der [Offline-Medienversuch](mediennachweis.md) den geprüften Dateiweg mit AV1 bzw. H.264 und zwei AAC-Spuren über FFmpeg 8.1.2. Zeitverschiebung und AAC-Anfangsmetadaten bleiben explizite Einschränkungen. Das ist ein Teilnachweis für die Medienauswahl, kein OBS-/RTMPS- oder Twitch-Audio-Nachweis.
+
+Die [isolierte Scuffle-Probe](scuffle-nachweis.md) ist auf `32653ca` lokal geprüft: 13 Debug-/13 Release-Tests, Formatierung, Clippy, separates Cargo Audit für 43 Crates, Gitleaks und unabhängiger nativer Rust-Review. Ein 35-Byte-AVCC-Header löste einen Abhängigkeitsfehler aus; der Testadapter begrenzt H.264 auf den geprüften Baseline-SequenceHeader. Gate-ALLOW erfolgte ohne verfügbare Repositorywerkzeuge und ersetzt diese Testnachweise nicht. [PR #2](https://github.com/EarlySalty/uplink/pull/2) ist gemergt; `main` auf `001724fdacded263f16681ba0aec8e5f348de601` hat den bestätigten identischen Dateibaum zu `32653ca0a74d3c6a886d0f1a9b700268953153d2`, die [Main-CI](https://github.com/EarlySalty/uplink/actions/runs/34221066802) ist erfolgreich. Beide Featurebranches sind lokal/remote gelöscht, nur `main` und ein Hauptworktree bleiben. Beide Bausteine sind abgeschlossen; die folgenden Produktabnahmen bleiben offen.
 
 | ID | Umfang / zugehörige Anforderungen | Erforderlicher Nachweis | Status / Abhängigkeit |
 | --- | --- | --- | --- |
@@ -46,11 +48,12 @@ Ergebnisse werden als **bestanden**, **fehlgeschlagen**, **nicht ausgeführt** o
 
 ## Archiv-Docks vor Aktivierung prüfen
 
-Die gesicherten Docks werden noch nicht vom neuen Dienst ausgeliefert. Der [Gate-Review](review-gate.md) nennt drei vorhandene UI-Befunde, die vor einer aktiven Anbindung behoben und im Browser nachgeprüft werden müssen:
+Die gesicherten Docks werden noch nicht vom neuen Dienst ausgeliefert. Der [Gate-Review](review-gate.md) nennt vier vorhandene UI-Befunde, die vor einer aktiven Anbindung behoben und im Browser nachgeprüft werden müssen:
 
 - **Chat:** Die Antwort auf einen Sendeaufruf darf keinen Entwurf löschen, der während des laufenden Requests neu getippt wurde. Der Sendeknopf darf eine noch laufende Aktion nicht versehentlich erneut ermöglichen.
 - **Stream-Infos:** Eine verzögert eintreffende Speicherantwort darf jüngere lokale Änderungen nicht überschreiben.
 - **Kanalpunkte:** Auch extern erfüllte oder abgelehnte Einlösungen müssen aus den offenen Karten verschwinden.
+- **Suche:** Das Leeren der Suchanfrage muss offene Requests ungültig machen, damit verspätete Antworten keine alten Treffer erneut einblenden.
 
 Diese Punkte gehören zu A-14. Die Archivübernahme gilt dadurch nicht als fertige Oberfläche; in dieser Arbeitsrunde wird daraus keine ungeprüfte UI-Änderung oder Aktivierung abgeleitet.
 

@@ -4,11 +4,15 @@ Stand: 8. September 2026. Der [Produktvertrag v0.3](produktvertrag-v0.3.md) besc
 
 ## Tatsächlich vorhandene Grundlage
 
+Der Repo-/Rust-Grundlagenbaustein und der isolierte Scuffle-Nachweis sind über [PR #1](https://github.com/EarlySalty/uplink/pull/1) und [PR #2](https://github.com/EarlySalty/uplink/pull/2) gemergt. Der geprüfte funktionale Main-Stand nach PR #2 ist `001724fdacded263f16681ba0aec8e5f348de601`; der Dateibaum entspricht dem geprüften Stand `32653ca0a74d3c6a886d0f1a9b700268953153d2`. Die [Main-CI](https://github.com/EarlySalty/uplink/actions/runs/34221066802) ist erfolgreich. Beide Featurebranches sind lokal und auf GitHub gelöscht; nur `main` und ein Hauptworktree bleiben. Beide Bausteine sind abgeschlossen, der vollständige Live-Neubau bleibt offen.
+
 `uplink-core` enthält lokale Fachregeln für variable Profile mit rational normalisierten Bildraten, getrennte Audiozuordnung, Mandanten-/Session-/Generationstrennung und deklarative Encode-Gruppen. Workerfähigkeiten werden für Decoder, Encoder und Kompositionslayout getrennt geprüft. Bekannte Audioverbote und fehlende Layoutrevisionen lehnen ein Ziel auch dann ab, wenn der Eingang noch aussteht. `shared_video_decode_count` zählt ausschließlich benötigte Video-Decoder; Audioverarbeitung ist darin nicht enthalten. Das Ergebnis ist ein Szenarioplan, kein ausführbarer Mediengraph; konkrete Codec-/Transform-Kompatibilität bleibt nachzuweisen.
 
 Der komprimierte FIFO-Puffer prüft Scope/Track, Byte-, Anzahl- und Ankunftsaltergrenzen sowie monotone DTS. Er ist **kein** fertiger GOP-Cache, Delay-Regler oder Wartebildpfad. `uplink-cli` liest normale TOML-Dateien und zeigt hypothetische Planung: Exit 0 geplant, 2 ungültig, 3 abgelehnt, 4 Eingang ausstehend. Deklarierte Beispielprofile beweisen keinen gemessenen OBS-Eingang und keine Plattformfreigabe.
 
 Der [Offline-Mediennachweis](mediennachweis.md) belegt Dateimuxing/Remuxing und lokale Decodierbarkeit von AV1 bzw. H.264 mit zwei AAC-Spuren in E-FLV mit dem geprüften FFmpeg 8.1.2. Die gemeinsame Zeitverschiebung und verlorene Skip-Samples-Metadaten sind dort ausdrücklich dokumentiert. Das entscheidet nicht über die Produktionsengine und beweist keine OBS-, RTMPS- oder Plattformstrecke.
+
+Die [isolierte Scuffle-Probe](scuffle-nachweis.md) ergänzt 13 Debug-/13 Release-Tests mit kleinen künstlichen Fixtures und statischen FFmpeg-8-Paketmanifesten. Sie verändert das Root-Cargo nicht. Ein 35-Byte-AVCC-Header zeigte einen Abhängigkeitsfehler; deshalb beschränkt der Testadapter H.264 vor Scuffle auf den geprüften Baseline-SequenceHeader. Diese lokale Absicherung ist keine Produktionsfreigabe des Parsers.
 
 Es gibt noch keinen belegten produktiven Ingest, Encoderbetrieb oder vollständigen Plattformausgang. Lokale Prüfergebnisse stehen in der Aufgabenakte; sie schließen keine Live-Abnahme.
 

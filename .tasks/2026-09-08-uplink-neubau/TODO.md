@@ -1,6 +1,6 @@
 # Arbeitsstand
 
-Stand: 8. September 2026, nach Gate-ALLOW für `2c4752d`. Erledigt wird nur angekreuzt, wenn ein entsprechender Nachweis vorliegt.
+Stand: 8. September 2026, nach Merge von PR #1 und PR #2 auf `main` (`001724fdacded263f16681ba0aec8e5f348de601`) und erfolgreicher Main-CI. Grundlagen- und isolierter Nachweisbaustein sind abgeschlossen; der produktive Neubau bleibt offen.
 
 ## Erste Arbeitsrunde
 
@@ -15,12 +15,20 @@ Stand: 8. September 2026, nach Gate-ALLOW für `2c4752d`. Erledigt wird nur ange
 - [x] Decoderzählung eindeutig auf Video begrenzen (`2c4752d`); 24 Tests und echtes CLI-Beispiel erneut grün.
 - [x] Medienkandidaten und Offline-E-FLV-Versuch samt Grenzen dokumentieren; endgültige Enginewahl bleibt offen.
 - [x] Unabhängigen Rust-/Sicherheitsreview abschließen und Planungsbefund nachprüfen; jeweilige Commitgrenzen dokumentiert.
-- [x] Bestehenden Workspace-Gate regulär ausführen: ALLOW für `385ea02` und `2c4752d`.
-- [x] Drei verbleibende Archiv-Dock-Hinweise als Prüfpunkte vor Aktivierung in A-14 festhalten.
+- [x] Bestehenden Workspace-Gate regulär ausführen: ALLOW für `385ea02`, `2c4752d` und vollständigen Stand `40ef8fa`.
+- [x] Vier verbleibende Archiv-Dock-Hinweise als Prüfpunkte vor Aktivierung in A-14 festhalten.
 - [x] Geprüften Code einzeln auf GitHub pushen: `origin/feat/rust-neubau` auf `2c4752d`, PR #1 angelegt.
-- [ ] Ergänzende Abschlussdokumentation separat committen/pushen und endgültiges GitHub-Actions-Ergebnis dokumentieren.
-- [ ] Abschließenden Stand nach `main` zusammenführen und Remote-SHA nachweisen.
-- [ ] Temporären Branch/Worktree nach Abschluss tatsächlich bereinigen.
+- [x] Abschlussdokumentation übernehmen und erfolgreiche [Main-CI](https://github.com/EarlySalty/uplink/actions/runs/34219867812) dokumentieren.
+- [x] Abschließenden Stand nach `main` zusammenführen: PR #1 gemergt, lokaler und entfernter SHA `409ae8db498e342a136556efcb3144a15d2e1846`, Dateibaum identisch zu `40ef8fa`.
+- [x] Temporären Branch `feat/rust-neubau` lokal und auf GitHub löschen.
+
+## Isolierter Nachweisbaustein
+
+- [x] Portable Scuffle-Testakte und isolierte CI auf `test/ertmp-mediennachweis` bauen und als `32653ca` committen.
+- [x] 13 Debug-/13 Release-Tests, Formatierung, Clippy, separates Cargo Audit und Gitleaks prüfen; nativen Rust-Review und Gate-ALLOW mit dokumentierter Aussagegrenze erhalten.
+- [x] Kleine künstliche Fixtures behalten und temporäre Medien löschen; H.264-Abhängigkeitsfehler und Begrenzung des Testadapters dokumentieren.
+- [x] [PR #2](https://github.com/EarlySalty/uplink/pull/2) mergen: `main` auf `001724fdacded263f16681ba0aec8e5f348de601`, Dateibaum identisch zu `32653ca0a74d3c6a886d0f1a9b700268953153d2` bestätigt.
+- [x] Erfolgreiche [Main-CI](https://github.com/EarlySalty/uplink/actions/runs/34221066802) nachweisen und beide Featurebranches lokal/remote löschen; nur `main` und ein Hauptworktree bleiben.
 
 ## Vollständiger Produktumfang
 
