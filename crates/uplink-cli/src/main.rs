@@ -104,9 +104,9 @@ fn show_plan(plan: &Plan, writer: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(
         writer,
-        "Video-Encodes: {}; gemeinsam benötigte Decoder: {}",
+        "Video-Encodes: {}; gemeinsam benötigte Video-Decoder: {}",
         plan.encode_groups.len(),
-        plan.shared_decode_count
+        plan.shared_video_decode_count
     )?;
     for output in &plan.outputs {
         let state = match output.status {

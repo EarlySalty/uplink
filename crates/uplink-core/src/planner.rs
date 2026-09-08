@@ -72,8 +72,9 @@ pub struct EncodeGroup {
 pub struct Plan {
     pub outputs: Vec<OutputPlan>,
     pub encode_groups: Vec<EncodeGroup>,
-    /// Logische Anzahl benötigter Decoder. Kein Nachweis laufender Worker.
-    pub shared_decode_count: usize,
+    /// Logische Anzahl benötigter Video-Decoder. Audio-Decoder werden hier
+    /// nicht gezählt. Kein Nachweis laufender Worker.
+    pub shared_video_decode_count: usize,
 }
 
 fn validate(input: &PlanInput) -> Result<(), Error> {
@@ -196,7 +197,7 @@ pub fn plan(input: &PlanInput) -> Result<Plan, Error> {
     let mut result = Plan {
         outputs: Vec::new(),
         encode_groups: Vec::new(),
-        shared_decode_count: 0,
+        shared_video_decode_count: 0,
     };
     let mut groups: HashMap<EncodeKey, usize> = HashMap::new();
     for request in &input.outputs {
@@ -297,6 +298,6 @@ pub fn plan(input: &PlanInput) -> Result<Plan, Error> {
         }
         result.outputs.push(output);
     }
-    result.shared_decode_count = usize::from(!result.encode_groups.is_empty());
+    result.shared_video_decode_count = usize::from(!result.encode_groups.is_empty());
     Ok(result)
 }

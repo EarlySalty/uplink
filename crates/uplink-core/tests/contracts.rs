@@ -138,7 +138,7 @@ fn different_audio_routes_share_video_encode() {
     let plan = plan(&input(vec![one, two])).unwrap();
     assert_eq!(plan.encode_groups.len(), 1);
     assert_eq!(plan.encode_groups[0].outputs, vec!["twitch", "kick"]);
-    assert_eq!(plan.shared_decode_count, 1);
+    assert_eq!(plan.shared_video_decode_count, 1);
     assert_eq!(plan.outputs[1].live_audio.as_ref().unwrap().source_track, 3);
 }
 
