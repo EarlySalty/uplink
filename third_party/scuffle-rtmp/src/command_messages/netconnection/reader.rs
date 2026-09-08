@@ -57,4 +57,27 @@ mod tests {
             CommandError::Amf0(scuffle_amf0::Amf0Error::Custom(_))
         ));
     }
+
+    #[test]
+    fn connect_reads_enhanced_wire_capabilities() {
+        use crate::command_messages::netconnection::CapsExMask;
+        use scuffle_amf0::Amf0Value;
+        let mut object = Amf0Object::new();
+        object.insert("app".into(), Amf0Value::String("live".into()));
+        object.insert("capsEx".into(), Amf0Value::Number(3.0));
+        let mut bytes = Vec::new();
+        Amf0Encoder::new(&mut bytes).encode_object(&object).unwrap();
+        let mut decoder = Amf0Decoder::from_buf(Bytes::from_owner(bytes));
+        let Some(NetConnectionCommand::Connect(connect)) =
+            NetConnectionCommand::read("connect", &mut decoder).unwrap()
+        else {
+            panic!("connect fehlt")
+        };
+        let caps = connect
+            .caps_ex
+            .expect("capsEx muss im typisierten Feld landen");
+        assert!(caps.contains(CapsExMask::Reconnect));
+        assert!(caps.contains(CapsExMask::Multitrack));
+        assert!(!connect.others.contains_key(&"capsEx".into()));
+    }
 }

@@ -116,6 +116,7 @@ impl fmt::Debug for PublishTarget {
 
 #[derive(Debug, Clone)]
 pub struct MediaLimits {
+    /// Maximaler Tag vor der Spurumschrift; deren E-RTMP-Header braucht bis zu 5 Byte.
     pub max_tag_bytes: usize,
     pub queue_bytes: usize,
     pub queue_events: usize,
@@ -125,6 +126,21 @@ pub struct MediaLimits {
     pub max_outputs: usize,
     pub max_encode_groups: usize,
     pub worker_threads: usize,
+}
+impl MediaLimits {
+    /// Eingang und neu codiertes Video behalten ihre Grenze. Die Drahtumschrift
+    /// erhält Platz für OneTrack; kopiertes AAC behält ihn auch hinter FFmpeg.
+    /// Die Queue zählt weiterhin reale Bytes.
+    pub(crate) fn routing_limits(&self) -> Self {
+        let mut routed = self.clone();
+        routed.max_tag_bytes = self.max_tag_bytes.saturating_add(5).min(0xff_ffff);
+        routed.queue_bytes = self
+            .queue_bytes
+            .saturating_add(5)
+            .min(u32::MAX as usize)
+            .min(tokio::sync::Semaphore::MAX_PERMITS);
+        routed
+    }
 }
 impl Default for MediaLimits {
     fn default() -> Self {

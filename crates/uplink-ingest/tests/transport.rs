@@ -377,6 +377,30 @@ async fn metadata_tracks_consume_the_track_budget_before_any_sequence_header() {
 }
 
 #[tokio::test]
+async fn metadata_does_not_extend_the_missing_media_deadline() {
+    let mut limits = IngestLimits::local_probe();
+    limits.media_idle_timeout = Duration::from_millis(250);
+    let (server, config) = server(true, limits).await;
+    let (mut connection, mut client) = connect(&server, config).await;
+    publish(&mut client).await;
+    let metadata = [0x95, 4, b'm', b'p', b'4', b'a', 1, 1, 1, 0, 0, 0, 4];
+    for _ in 0..4 {
+        message(&mut client, 8, 0, 1, &metadata).await;
+        assert_eq!(
+            connection.next().await.unwrap().event_kind,
+            EventKind::Metadata
+        );
+        tokio::time::sleep(Duration::from_millis(45)).await;
+    }
+    let ended = timeout(Duration::from_millis(120), connection.next()).await;
+    assert!(
+        matches!(ended, Ok(None)),
+        "Metadaten dürfen den Medien-Timeout nicht zurücksetzen"
+    );
+    assert_eq!(connection.finish().await.reason, EndReason::MediaTimeout);
+}
+
+#[tokio::test]
 async fn metadata_cannot_inherit_another_codecs_header_revision() {
     let (server, config) = server(true, IngestLimits::local_probe()).await;
     let (mut connection, mut client) = connect(&server, config).await;

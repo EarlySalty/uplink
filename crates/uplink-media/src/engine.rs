@@ -17,7 +17,7 @@ use tokio::{
     task::{JoinHandle, JoinSet},
     time::{Instant, timeout, timeout_at},
 };
-use uplink_ingest::{EventKind, MediaEvent};
+use uplink_ingest::{EventKind, MediaEvent, MediaKind};
 
 pub struct MediaEngine {
     pub(crate) config: EngineConfig,
@@ -182,6 +182,7 @@ fn update_status(sinks: &Sinks, status: &watch::Sender<MediaStatus>) {
 }
 
 fn distribute(tag: Arc<FlvTag>, group: Option<usize>, sinks: &Sinks, limits: &MediaLimits) {
+    let routed = limits.routing_limits();
     let mut sinks = sinks.lock().unwrap_or_else(|error| error.into_inner());
     for sink in sinks.iter_mut().filter(|sink| sink.failure.is_none()) {
         let Some(pusher) = sink.pusher.as_ref() else {
@@ -196,7 +197,7 @@ fn distribute(tag: Arc<FlvTag>, group: Option<usize>, sinks: &Sinks, limits: &Me
                 .filter(|(source, _)| *source == group)
             {
                 result = tag
-                    .with_video_track(*destination, limits.max_tag_bytes)
+                    .with_video_track(*destination, routed.max_tag_bytes)
                     .and_then(|tag| pusher.try_send(Arc::new(tag)));
                 if result.is_err() {
                     break;
@@ -210,7 +211,7 @@ fn distribute(tag: Arc<FlvTag>, group: Option<usize>, sinks: &Sinks, limits: &Me
                 for (source, destination) in &sink.routing.audio {
                     if Some(*source) == track {
                         pusher.try_send(Arc::new(
-                            tag.with_audio_track(*destination, limits.max_tag_bytes)?,
+                            tag.with_audio_track(*destination, routed.max_tag_bytes)?,
                         ))?;
                     }
                 }
@@ -279,7 +280,7 @@ async fn run(
         }
         let started = match routing.failure {
             Some(reason) => Err(reason),
-            None => RunningPusher::spawn(route.target, config.limits.clone()),
+            None => RunningPusher::spawn(route.target, config.limits.routing_limits()),
         };
         match started {
             Ok(pusher) => sinks
@@ -353,7 +354,7 @@ async fn run(
                 let output_status = status.clone();
                 readers.push(tokio::spawn(async move {
                     let stream = accept_worker(&listener, pid, limits.startup_timeout).await?;
-                    let mut reader = FlvReader::new(stream, limits.max_tag_bytes);
+                    let mut reader = FlvReader::worker_output(stream, &limits);
                     while let Some(tag) = reader.next().await? {
                         distribute(Arc::new(tag), Some(index), &output_sinks, &limits);
                         update_status(&output_sinks, &output_status);
@@ -500,8 +501,15 @@ async fn video_origin(
             }
             if event.identity.session != identity.session
                 || event.identity.generation != identity.generation
-                || !graph.expected_tracks.contains(&event.identity.track)
             {
+                return Err(MediaError::WrongSession);
+            }
+            if event.identity.track.kind == MediaKind::Audio
+                && !graph.expected_tracks.contains(&event.identity.track)
+            {
+                continue;
+            }
+            if !graph.expected_tracks.contains(&event.identity.track) {
                 return Err(MediaError::WrongSession);
             }
             if event.identity.track == graph.video_track && event.event_kind == EventKind::Frame {
@@ -563,8 +571,15 @@ async fn consume(
         };
         if event.identity.session != identity.session
             || event.identity.generation != identity.generation
-            || !graph.expected_tracks.contains(&event.identity.track)
         {
+            return Err(MediaError::WrongSession);
+        }
+        if event.identity.track.kind == MediaKind::Audio
+            && !graph.expected_tracks.contains(&event.identity.track)
+        {
+            continue;
+        }
+        if !graph.expected_tracks.contains(&event.identity.track) {
             return Err(MediaError::WrongSession);
         }
         if event.configuration_revision != 1
@@ -577,7 +592,7 @@ async fn consume(
         }
         let mut tag = FlvTag::from_event(&event, limits.max_tag_bytes)?;
         if let Some(canonical) = graph.input_audio.get(&event.identity.track) {
-            tag = tag.with_audio_track(*canonical, limits.max_tag_bytes)?;
+            tag = tag.with_audio_track(*canonical, limits.routing_limits().max_tag_bytes)?;
         }
         let tag = Arc::new(tag);
         if !started {
@@ -677,6 +692,39 @@ mod tests {
             allowed_hosts: vec!["localhost".into()],
             allow_loopback: true,
             allow_unencrypted: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn maximum_sized_video_and_audio_allow_multitrack_wrappers() {
+        for (kind, mut bytes) in [(9, vec![0x17, 1, 0, 0, 0]), (8, vec![0xaf, 1])] {
+            let limits = MediaLimits {
+                max_tag_bytes: 64,
+                queue_bytes: 4096,
+                ..MediaLimits::default()
+            };
+            bytes.resize(limits.max_tag_bytes, 0x12);
+            let tag = Arc::new(FlvTag::new(kind, 0, bytes.into(), limits.max_tag_bytes).unwrap());
+            let mut target = target("track", 9);
+            target.endpoint = "rtmp://localhost:9/live".into();
+            target.allow_unencrypted = true;
+            let pusher = RunningPusher::spawn(target, limits.routing_limits()).unwrap();
+            let sinks = Arc::new(Mutex::new(vec![Sink {
+                pusher: Some(pusher),
+                routing: crate::graph::Routing {
+                    group: None,
+                    video: vec![(None, 5)],
+                    audio: vec![(0, 3)],
+                    failure: None,
+                },
+                failure: None,
+            }]));
+            distribute(tag, None, &sinks, &limits);
+            assert_eq!(
+                sinks.lock().unwrap()[0].failure,
+                None,
+                "Spurumschrift muss Wrapperplatz haben"
+            );
         }
     }
 

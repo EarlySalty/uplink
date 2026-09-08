@@ -13,6 +13,34 @@ struct MultiCapture {
     headers: BTreeMap<(u8, u8), usize>,
     report: SessionReport,
 }
+
+fn default_track<T>(tracks: &BTreeMap<u8, Vec<T>>) -> ProbeResult<&[T]> {
+    match (tracks.len(), tracks.get(&0)) {
+        (1, Some(packets)) => Ok(packets),
+        _ => Err("Geteilte Ausgabe verwendet nicht genau die erwartete Spur 0"),
+    }
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::default_track;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn wrong_single_wire_id_returns_mapping_error() {
+        for wire_id in [1, 5, 9] {
+            let wrong = BTreeMap::from([(wire_id, vec![1_u8])]);
+            assert_eq!(
+                default_track(&wrong),
+                Err("Geteilte Ausgabe verwendet nicht genau die erwartete Spur 0")
+            );
+        }
+        assert_eq!(
+            default_track(&BTreeMap::from([(0, vec![1_u8])])),
+            Ok(&[1][..])
+        );
+    }
+}
 async fn receive(server: Arc<IngestServer<ProbeAuth>>) -> ProbeResult<MultiCapture> {
     let mut connection = server
         .accept()
@@ -236,14 +264,14 @@ pub(super) async fn run(ffmpeg: &std::path::Path, ffprobe: &std::path::Path) -> 
     {
         return Err("Fehlender VOD-Mix öffnete trotzdem ein Ziel");
     }
+    let right_video = default_track(&right.video)?;
+    let right_audio = default_track(&right.audio)?;
     if left.video.keys().copied().collect::<Vec<_>>() != vec![0, 5]
-        || right.video.len() != 1
-        || left.video[&0] != right.video[&0]
+        || left.video[&0] != right_video
         || left.video[&0].len() != 50
         || left.video[&5].len() != 50
         || left.audio.keys().copied().collect::<Vec<_>>() != vec![2, 9]
-        || right.audio.len() != 1
-        || left.audio[&9] != right.audio[&0]
+        || left.audio[&9] != right_audio
         || left.audio[&2].len() != 95
         || left.audio[&9].len() != 95
         || left.audio[&2]
