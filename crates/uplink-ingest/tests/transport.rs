@@ -12,6 +12,108 @@ use uplink_ingest::*;
 struct Auth {
     allow: bool,
 }
+
+struct LeaseAuth {
+    released: std::sync::atomic::AtomicUsize,
+}
+
+struct RetainedAuth {
+    lease: std::sync::Mutex<Option<Arc<()>>>,
+}
+impl Authorizer for RetainedAuth {
+    async fn authorize(&self, _: &str, _: &str) -> Result<AuthorizedSession, ()> {
+        Ok(AuthorizedSession::new(11, 22).unwrap())
+    }
+    fn retention(&self, _: AuthorizedSession) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
+        self.lease
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|value| value.clone() as Arc<dyn std::any::Any + Send + Sync>)
+    }
+    fn release(&self, _: AuthorizedSession) {
+        self.lease.lock().unwrap().take();
+    }
+}
+
+#[tokio::test]
+async fn queued_media_keeps_tenant_reservation_after_short_publish_ends() {
+    let certificates = tls::test_tls();
+    let lease = Arc::new(());
+    let weak = Arc::downgrade(&lease);
+    let auth = Arc::new(RetainedAuth {
+        lease: std::sync::Mutex::new(Some(lease)),
+    });
+    let server = IngestServer::bind_loopback(
+        0,
+        certificates.server,
+        auth.clone(),
+        IngestLimits::local_probe(),
+    )
+    .await
+    .unwrap();
+    let (mut incoming, mut peer) = connect(&server, certificates.client).await;
+    publish(&mut peer).await;
+    message(&mut peer, 8, 0, 1, &[0xaf, 0, 0x12, 0x10]).await;
+    end(&mut peer).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        auth.lease.lock().unwrap().is_none(),
+        "Producer muss bereits beendet sein"
+    );
+    assert!(
+        weak.upgrade().is_some(),
+        "Eventqueue muss die Reservierung halten"
+    );
+    let event = incoming.next().await.unwrap();
+    let retained = event.authorization_retention().unwrap();
+    drop(event);
+    assert_eq!(incoming.finish().await.reason, EndReason::ExplicitStop);
+    assert!(weak.upgrade().is_some());
+    drop(retained);
+    assert!(weak.upgrade().is_none());
+}
+impl Authorizer for LeaseAuth {
+    async fn authorize(&self, _: &str, _: &str) -> Result<AuthorizedSession, ()> {
+        AuthorizedSession::new(11, 22).map_err(|_| ())
+    }
+    fn release(&self, session: AuthorizedSession) {
+        assert_eq!(session.tenant_id(), 11);
+        assert_eq!(session.session_id(), 22);
+        self.released
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[tokio::test]
+async fn explicit_tls_admission_releases_authorization_on_finish_and_cancellation() {
+    for cancel in [false, true] {
+        let certificates = tls::test_tls();
+        let auth = Arc::new(LeaseAuth {
+            released: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let server = IngestServer::bind_tls(
+            "127.0.0.1:0".parse().unwrap(),
+            certificates.server,
+            auth.clone(),
+            IngestLimits::local_probe(),
+        )
+        .await
+        .unwrap();
+        let (mut incoming, mut peer) = connect(&server, certificates.client).await;
+        publish(&mut peer).await;
+        message(&mut peer, 8, 0, 1, &[0xaf, 0, 0x12, 0x10]).await;
+        drop(incoming.next().await.unwrap());
+        if cancel {
+            drop(incoming);
+        } else {
+            end(&mut peer).await;
+            assert_eq!(incoming.finish().await.reason, EndReason::ExplicitStop);
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(auth.released.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+}
 impl Authorizer for Auth {
     async fn authorize(&self, app: &str, stream: &str) -> Result<AuthorizedSession, ()> {
         if self.allow && app == "live" && stream == "probe" {

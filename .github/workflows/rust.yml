@@ -20,6 +20,11 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -j2 -- -D warnings
       - name: Tests
         run: cargo test --workspace --locked -j2
+      - name: Steuerung gegen isoliertes PostgreSQL
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-16 ffmpeg
+          cargo test -p uplink-service --test database --locked -j2 -- --ignored
       - name: Release-Build
         run: cargo build --workspace --release --locked -j2
       - name: Lokaler RTMPS-Eingang im Releaseprofil
