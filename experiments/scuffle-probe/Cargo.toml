@@ -1,0 +1,20 @@
+[package]
+name = "uplink-scuffle-probe"
+version = "0.1.0"
+edition = "2024"
+publish = false
+rust-version = "1.97"
+
+# Das Experiment gehört ausdrücklich nicht zum Produktionsworkspace.
+[workspace]
+
+[dependencies]
+bytes = "=1.11.1"
+scuffle-flv = "=0.2.2"
+sha2 = "0.10"
+
+[dev-dependencies]
+serde_json = "1"
+
+[lints.rust]
+unsafe_code = "forbid"
