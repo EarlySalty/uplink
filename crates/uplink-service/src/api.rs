@@ -582,7 +582,9 @@ fn output_status(
     if blocked {
         return (
             "failed",
-            Some("Gespeicherte Zieladresse ist gesperrt. Verbindung im Dashboard erneuern."),
+            Some(
+                "Konfiguration des Ziels ist gesperrt. Der Betreiber muss Plattformfreigabe, Serveradresse und Transport prüfen.",
+            ),
         );
     }
     let Some(session) = session else {
