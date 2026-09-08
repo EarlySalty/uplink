@@ -84,6 +84,7 @@ pub(crate) async fn fixture() -> (Database, Arc<ServiceState>) {
         "CREATE TABLE relay.destinations(streamer_id bigint REFERENCES relay.users(streamer_id),platform text NOT NULL,rtmp_url text NOT NULL,stream_key_enc bytea NOT NULL,enabled boolean NOT NULL,width integer,height integer,fps integer,bitrate_kbps integer,UNIQUE(streamer_id,platform))",
         "CREATE TABLE relay.waitlist(streamer_id bigint PRIMARY KEY)",
         include_str!("../../../../db/migrations/20260908_destination_fences.sql"),
+        include_str!("../../../../db/migrations/20260908_twitch_audio_mode.sql"),
     ] {
         store.query(sql, &[]).await.unwrap();
     }

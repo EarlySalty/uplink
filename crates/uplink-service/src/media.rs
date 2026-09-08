@@ -100,6 +100,25 @@ impl Coordinator {
                 .filter(|value| *value > 0)
                 .ok_or("Gewünschtes Ausgabeprofil ist noch unvollständig.")
         };
+        let audio_mode: Option<String> = row.try_get(7).map_err(|_| "Audiowahl fehlt.")?;
+        let use_vod_audio = match (platform.as_str(), audio_mode.as_deref()) {
+            ("twitch", Some("live")) => false,
+            ("twitch", Some("separate_vod")) => true,
+            (_, None) => policy.use_vod_audio,
+            _ => return Err("Gespeicherte Audiowahl ist ungültig."),
+        };
+        let vod_audio_track = if use_vod_audio {
+            Some(
+                self.state
+                    .config
+                    .media
+                    .vod_audio_track
+                    .filter(|track| *track != self.state.config.media.live_audio_track)
+                    .ok_or("Für separaten VOD-Ton fehlt die eigene Audiozuordnung.")?,
+            )
+        } else {
+            None
+        };
         Ok(DesiredOutput {
             target: PublishTarget {
                 id: platform,
@@ -121,11 +140,7 @@ impl Coordinator {
                 codec: policy.video_codec,
             },
             live_audio_track: self.state.config.media.live_audio_track,
-            vod_audio_track: if policy.use_vod_audio {
-                self.state.config.media.vod_audio_track
-            } else {
-                None
-            },
+            vod_audio_track,
             layout: None,
         })
     }
@@ -165,7 +180,7 @@ impl SessionProcessor for Coordinator {
             .ok_or("Sessionreservierung fehlt.")?;
         let tenant = i64::try_from(first.identity.session.tenant_id())
             .map_err(|_| "Nutzeridentität ist ungültig.")?;
-        let rows=self.state.store.query("SELECT platform,rtmp_url,stream_key_enc,width,height,fps,bitrate_kbps FROM relay.destinations WHERE streamer_id=$1 AND enabled=true ORDER BY platform",&[&tenant]).await?;
+        let rows=self.state.store.query("SELECT platform,rtmp_url,stream_key_enc,width,height,fps,bitrate_kbps,twitch_audio_mode FROM relay.destinations WHERE streamer_id=$1 AND enabled=true ORDER BY platform",&[&tenant]).await?;
         if rows.is_empty() {
             return Err("Kein Ausgabeziel ist aktiviert.");
         }

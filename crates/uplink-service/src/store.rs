@@ -53,6 +53,38 @@ impl Store {
     pub async fn ready(&self) -> bool {
         self.query("SELECT 1", &[]).await.is_ok()
     }
+    /// Ausschließlich im Binary versionierte Release-Migrationen. Derselbe
+    /// begrenzte Transaktions-/Abbruchpfad wie für normale Datenbankarbeit.
+    pub(crate) async fn migrate(
+        &self,
+        name: &'static str,
+        sql: &'static str,
+    ) -> Result<(), &'static str> {
+        if !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        {
+            return Err("Migrationsname ist ungültig.");
+        }
+        let checksum = hex::encode(Sha256::digest(sql.as_bytes()));
+        // name/sql stammen ausschließlich aus migrations.rs und include_str!;
+        // kein CLI-, HTTP-, Config- oder Datenbanktext wird als SQL eingesetzt.
+        let guarded = format!("DO $uplink_migration$ BEGIN
+            IF EXISTS(SELECT 1 FROM relay.uplink_schema_migrations WHERE name='{name}' AND checksum<>'{checksum}') THEN
+                RAISE EXCEPTION 'Uplink-Migrationsprüfsumme stimmt nicht';
+            END IF;
+            IF NOT EXISTS(SELECT 1 FROM relay.uplink_schema_migrations WHERE name='{name}') THEN
+                {sql}
+                INSERT INTO relay.uplink_schema_migrations(name,checksum) VALUES('{name}','{checksum}');
+            END IF;
+        END $uplink_migration$");
+        self.query_statements(&[
+            CheckedStatement { sql:"SELECT pg_advisory_xact_lock(849205731)", expected_rows:None },
+            CheckedStatement { sql:"CREATE TABLE IF NOT EXISTS relay.uplink_schema_migrations(name text PRIMARY KEY,checksum text NOT NULL,applied_at timestamptz NOT NULL DEFAULT clock_timestamp())", expected_rows:None },
+            CheckedStatement { sql:&guarded, expected_rows:None },
+        ], &[], None).await?;
+        Ok(())
+    }
     pub async fn query(
         &self,
         sql: &str,

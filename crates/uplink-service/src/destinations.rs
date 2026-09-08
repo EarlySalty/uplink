@@ -15,6 +15,8 @@ pub struct DestinationUpdate {
     pub height: Option<i32>,
     pub fps: Option<i32>,
     pub bitrate_kbps: Option<i32>,
+    /// Auslassen erhält die bisherige Wahl, auch bei konkurrierenden Updates.
+    pub twitch_audio_mode: Option<String>,
 }
 impl Drop for DestinationUpdate {
     fn drop(&mut self) {
@@ -39,6 +41,9 @@ impl DestinationUpdate {
                 .is_some_and(|v| v <= 0 || v > 8192 || v % 2 != 0)
             || self.fps.is_some_and(|v| v <= 0 || v > 240)
             || self.bitrate_kbps.is_some_and(|v| v <= 0 || v > 100_000)
+            || self.twitch_audio_mode.as_deref().is_some_and(|mode| {
+                self.platform != "twitch" || !matches!(mode, "live" | "separate_vod")
+            })
             || self.stream_key.as_ref().is_some_and(|key| {
                 key.len() > 4096 || key.bytes().any(|b| b == 0 || b == b'\r' || b == b'\n')
             })

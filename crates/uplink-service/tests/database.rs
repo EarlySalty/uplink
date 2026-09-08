@@ -35,6 +35,148 @@ impl uplink_service::runtime::SessionProcessor for Collector {
 #[path = "support/database.rs"]
 mod database;
 use database::{Database, fixture};
+
+#[tokio::test]
+#[ignore = "Benötigt isolierte PostgreSQL-16-Testinstanz."]
+async fn explicit_twitch_audio_choice_survives_omitted_updates() {
+    let (database, state) = fixture().await;
+    let response = router(state.clone()).oneshot(request("PUT", "/v1/me/destinations", r#"{"streamer_id":11,"destinations":[{"platform":"twitch","connection_generation":1,"rtmp_url":"rtmps://live.twitch.tv/app","stream_key":"synthetic","twitch_audio_mode":"live"}]}"#)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    for body in [
+        r#"{"streamer_id":11,"destinations":[{"platform":"twitch","connection_generation":1,"width":1280}]}"#,
+        r#"{"streamer_id":11,"destinations":[{"platform":"twitch","connection_generation":2,"stream_key":"replacement"}]}"#,
+    ] {
+        assert_eq!(
+            router(state.clone())
+                .oneshot(request("PUT", "/v1/me/destinations", body))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+    }
+    let response = router(state.clone())
+        .oneshot(request("GET", "/v1/me/destinations?streamer_id=11", ""))
+        .await
+        .unwrap();
+    let value: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
+    assert_eq!(value["destinations"][0]["twitch_audio_mode"], "live");
+    assert_eq!(value["destinations"][0]["effective_audio_mode"], "live");
+    assert!(value["destinations"][0]["active_audio_mode"].is_null());
+    for (platform, mode) in [("kick", "live"), ("twitch", "fallback")] {
+        let body = serde_json::json!({"streamer_id":11,"destinations":[{"platform":platform,"connection_generation":2,"twitch_audio_mode":mode}]}).to_string();
+        assert_eq!(
+            router(state.clone())
+                .oneshot(request("PUT", "/v1/me/destinations", body))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+    database.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "Benötigt isolierte PostgreSQL-16-Testinstanz."]
+async fn omitted_audio_mode_preserves_concurrently_committed_choice() {
+    let (database, state) = fixture().await;
+    state.store.query("INSERT INTO relay.destinations VALUES(11,'twitch','rtmps://live.twitch.tv/app',$1,true,1920,1080,60,6000,'live')", &[&vec![0u8]]).await.unwrap();
+    let (mut writer, driver) = database.raw().await;
+    let transaction = writer.transaction().await.unwrap();
+    transaction.execute("UPDATE relay.destinations SET twitch_audio_mode='separate_vod' WHERE streamer_id=11 AND platform='twitch'", &[]).await.unwrap();
+    let app = router(state.clone());
+    let omitted = tokio::spawn(async move {
+        app.oneshot(request("PUT", "/v1/me/destinations", r#"{"streamer_id":11,"destinations":[{"platform":"twitch","connection_generation":1,"width":1280}]}"#)).await.unwrap()
+    });
+    tokio::time::timeout(Duration::from_millis(800), async {
+        loop {
+            transaction.batch_execute("SELECT pg_stat_clear_snapshot()").await.unwrap();
+            if transaction.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE wait_event_type='Lock' AND query LIKE '%INSERT INTO relay.destinations%')", &[]).await.unwrap().get::<_,bool>(0) { break; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+    transaction.commit().await.unwrap();
+    assert_eq!(omitted.await.unwrap().status(), StatusCode::OK);
+    let row = state.store.query("SELECT twitch_audio_mode,width FROM relay.destinations WHERE streamer_id=11 AND platform='twitch'", &[]).await.unwrap();
+    assert_eq!(row[0].get::<_, String>(0), "separate_vod");
+    assert_eq!(row[0].get::<_, i32>(1), 1280);
+    drop(writer);
+    driver.await.unwrap();
+    database.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "Benötigt isolierte PostgreSQL-16-Testinstanz."]
+async fn release_migrations_are_repeatable_and_keep_existing_audio_choice() {
+    let (database, state) = fixture().await;
+    state
+        .store
+        .query(
+            "ALTER TABLE relay.destinations DROP COLUMN twitch_audio_mode",
+            &[],
+        )
+        .await
+        .unwrap();
+    state
+        .store
+        .query("DROP TABLE relay.destination_fences", &[])
+        .await
+        .unwrap();
+    state.store.query("INSERT INTO relay.destinations VALUES(11,'twitch','rtmps://live.twitch.tv/app',$1,true,1920,1080,60,6000)", &[&vec![0u8]]).await.unwrap();
+    uplink_service::migrations::apply(&state.store)
+        .await
+        .unwrap();
+    let row = state
+        .store
+        .query("SELECT twitch_audio_mode FROM relay.destinations", &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        row[0].get::<_, Option<String>>(0),
+        None,
+        "Keine stille Altbestandswahl"
+    );
+    state
+        .store
+        .query(
+            "UPDATE relay.destinations SET twitch_audio_mode='live'",
+            &[],
+        )
+        .await
+        .unwrap();
+    uplink_service::migrations::apply(&state.store)
+        .await
+        .unwrap();
+    assert_eq!(
+        state
+            .store
+            .query("SELECT twitch_audio_mode FROM relay.destinations", &[])
+            .await
+            .unwrap()[0]
+            .get::<_, String>(0),
+        "live"
+    );
+    assert!(
+        state
+            .store
+            .query(
+                "UPDATE relay.destinations SET twitch_audio_mode='fallback'",
+                &[]
+            )
+            .await
+            .is_err()
+    );
+    state.store.query("UPDATE relay.uplink_schema_migrations SET checksum='changed' WHERE name='20260908_twitch_audio_mode'", &[]).await.unwrap();
+    assert!(
+        uplink_service::migrations::apply(&state.store)
+            .await
+            .is_err(),
+        "Geänderte Migration bleibt fatal"
+    );
+    database.stop().await;
+}
 impl database::Database {
     pub(crate) async fn raw(&self) -> (tokio_postgres::Client, tokio::task::JoinHandle<()>) {
         let mut config = tokio_postgres::Config::new();
@@ -1158,6 +1300,28 @@ async fn executable_smoke(database: &Database) {
         .parent()
         .unwrap()
         .join("uplink-service");
+    for _ in 0..2 {
+        let mut migration = Command::new(&binary)
+            .arg("--config")
+            .arg(&config_path)
+            .arg("--migrate")
+            .env_clear()
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(15), migration.wait()).await;
+        if result.is_err() {
+            let _ = migration.kill().await;
+            let _ = migration.wait().await;
+        }
+        assert!(
+            matches!(result,Ok(Ok(status)) if status.success()),
+            "Normaler Migrationsmodus muss über den vererbten RAM-FD enden"
+        );
+        identity.as_file().seek(SeekFrom::Start(0)).unwrap();
+    }
     let mut daemon = Command::new(binary)
         .arg("--config")
         .arg(config_path)
@@ -1214,6 +1378,7 @@ async fn controlplane_preserves_credentials_and_rejects_unauthorized_changes() {
         "CREATE TABLE relay.destinations(streamer_id bigint REFERENCES relay.users(streamer_id),platform text NOT NULL,rtmp_url text NOT NULL,stream_key_enc bytea NOT NULL,enabled boolean NOT NULL,width integer,height integer,fps integer,bitrate_kbps integer,UNIQUE(streamer_id,platform))",
         "CREATE TABLE relay.waitlist(streamer_id bigint PRIMARY KEY)",
         include_str!("../../../db/migrations/20260908_destination_fences.sql"),
+        include_str!("../../../db/migrations/20260908_twitch_audio_mode.sql"),
     ] {
         store.query(statement, &[]).await.unwrap();
     }

@@ -64,6 +64,39 @@ pub fn active_profile(session: Option<&SessionStatus>, platform: &str, state: &s
     json!({"width":width,"height":height,"fps":numerator as f64 / denominator as f64,"codec":profile["codec"],"bitrate_kbps":bitrate,"profile_origin":"running_graph"})
 }
 
+/// Lokales Audio-Routing, keine Bestätigung eines Plattform-VODs.
+pub fn active_audio_mode(session: Option<&SessionStatus>, platform: &str, state: &str) -> Value {
+    let Some(session) =
+        session.filter(|session| session.active && state == "sending" && platform == "twitch")
+    else {
+        return Value::Null;
+    };
+    let Some(audio) = session
+        .outputs
+        .as_ref()
+        .and_then(|status| status["graph"].as_array())
+        .and_then(|graphs| {
+            graphs
+                .iter()
+                .find(|graph| graph["id"] == platform && graph["profile_origin"] == "running_graph")
+        })
+        .and_then(|graph| graph["audio"].as_array())
+    else {
+        return Value::Null;
+    };
+    match audio.as_slice() {
+        [live] if live["destination_wire_track"] == 0 => json!("live"),
+        [live, vod]
+            if live["destination_wire_track"] == 0
+                && vod["destination_wire_track"] == 1
+                && live["source_wire_track"] != vod["source_wire_track"] =>
+        {
+            json!("separate_vod")
+        }
+        _ => Value::Null,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
