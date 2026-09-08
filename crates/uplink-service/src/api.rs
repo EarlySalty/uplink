@@ -313,7 +313,7 @@ async fn rotate_dock(
         ));
     }
     if let Some(hub) = &state.chat {
-        hub.invalidate(query.streamer_id as u64);
+        hub.rotate_docks(query.streamer_id as u64);
     }
     Ok(Json(
         json!({"ok":true,"dock_urls":dock_urls(&state.config.dock_base_url,&token)}),
@@ -360,7 +360,7 @@ async fn me(
     Query(query): Query<TenantQuery>,
 ) -> ApiResult {
     authorize(&state, &headers, query.streamer_id)?;
-    let rows = state.store.query("SELECT u.enabled,u.ingest_key_enc,u.dock_token_enc,u.reconnect_wait_s,EXISTS(SELECT 1 FROM relay.waitlist WHERE streamer_id=$1) AS waitlisted FROM (SELECT $1::bigint AS streamer_id) requested LEFT JOIN relay.users u USING(streamer_id)", &[&query.streamer_id]).await.map_err(|e| failure(StatusCode::SERVICE_UNAVAILABLE,e))?;
+    let rows = state.store.query("SELECT u.enabled,u.ingest_key_enc,u.dock_token_enc,u.reconnect_wait_s,EXISTS(SELECT 1 FROM relay.waitlist WHERE streamer_id=$1) AS waitlisted,u.ingest_key_hash FROM (SELECT $1::bigint AS streamer_id) requested LEFT JOIN relay.users u USING(streamer_id)", &[&query.streamer_id]).await.map_err(|e| failure(StatusCode::SERVICE_UNAVAILABLE,e))?;
     let row = rows.first().ok_or_else(|| {
         failure(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -401,6 +401,13 @@ async fn me(
         })
         .transpose()
         .map_err(|e| failure(StatusCode::SERVICE_UNAVAILABLE, e))?;
+    if enabled {
+        let expected: Option<String> = row.try_get(5).map_err(|_| invalid_credentials())?;
+        let actual = credential_hash(key.as_ref().ok_or_else(invalid_credentials)?.expose())?;
+        if expected.as_ref() != Some(&actual) {
+            return Err(invalid_credentials());
+        }
+    }
     let key = std::str::from_utf8(key.as_ref().map_or(&[][..], |value| value.expose())).map_err(
         |_| {
             failure(
@@ -675,6 +682,24 @@ async fn reject_waitlist(
 struct Admission {
     streamer_id: i64,
 }
+fn invalid_credentials() -> (StatusCode, Json<Value>) {
+    failure(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Bestehender Streamzugang ist ungültig.",
+    )
+}
+fn credential_hash(key: &[u8]) -> Result<String, (StatusCode, Json<Value>)> {
+    if key.len() != 36
+        || !key.starts_with(b"rsr_")
+        || !key[4..]
+            .iter()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
+        return Err(invalid_credentials());
+    }
+    use sha2::Digest;
+    Ok(hex::encode(sha2::Sha256::digest(key)))
+}
 async fn admit_user(
     State(state): State<Arc<ServiceState>>,
     headers: HeaderMap,
@@ -685,42 +710,66 @@ async fn admit_user(
         body.map_err(|_| failure(StatusCode::BAD_REQUEST, "Plattformidentität ist ungültig."))?;
     let id = body.streamer_id;
     admin_id(id)?;
-    let mut random = [0u8; 16];
-    getrandom::fill(&mut random).map_err(|_| {
-        failure(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Zufallsquelle ist nicht verfügbar.",
+    let existing = state
+        .store
+        .query(
+            "SELECT ingest_key_hash,ingest_key_enc,enabled FROM relay.users WHERE streamer_id=$1",
+            &[&id],
         )
-    })?;
-    let key = zeroize::Zeroizing::new(format!("rsr_{}", hex::encode(random)));
-    use sha2::Digest;
-    let hash = hex::encode(sha2::Sha256::digest(key.as_bytes()));
-    let encrypted = state
-        .secrets
-        .encryption
-        .seal(key.as_bytes(), &format!("ingest_key:{id}"))
+        .await
         .map_err(|e| failure(StatusCode::SERVICE_UNAVAILABLE, e))?;
-    let rows=state.store.query("WITH admitted AS (INSERT INTO relay.users(streamer_id,enabled,ingest_key_hash,ingest_key_enc) VALUES($1,true,$2,$3) ON CONFLICT(streamer_id) DO UPDATE SET enabled=true RETURNING streamer_id,ingest_key_enc), removed AS (DELETE FROM relay.waitlist w USING admitted a WHERE w.streamer_id=a.streamer_id) SELECT streamer_id,ingest_key_enc FROM admitted",&[&id,&hash,&encrypted]).await.map_err(|e|failure(StatusCode::SERVICE_UNAVAILABLE,e))?;
-    let encrypted: Vec<u8> = rows
-        .first()
-        .ok_or_else(|| {
+    let present = !existing.is_empty();
+    let (previous_hash, previous_enc, previous_enabled): (Option<String>, Option<Vec<u8>>, bool) =
+        match existing.first() {
+            Some(row) => (
+                row.try_get(0).map_err(|_| invalid_credentials())?,
+                row.try_get(1).map_err(|_| invalid_credentials())?,
+                row.try_get(2).map_err(|_| invalid_credentials())?,
+            ),
+            None => (None, None, false),
+        };
+    let (stored, encrypted) = if let Some(encrypted) = &previous_enc {
+        let stored = state
+            .secrets
+            .encryption
+            .open(encrypted, &format!("ingest_key:{id}"))
+            .map_err(|_| invalid_credentials())?;
+        let actual = credential_hash(stored.expose())?;
+        if previous_hash.as_ref().is_some_and(|hash| hash != &actual) {
+            return Err(invalid_credentials());
+        }
+        (stored, encrypted.clone())
+    } else {
+        // Ein vorhandener Hash ohne entschlüsselbaren Schlüssel wird nicht als
+        // Freigabe-Nebenwirkung rotiert. Nur vollständig fehlende Daten anlegen.
+        if previous_hash.is_some() {
+            return Err(invalid_credentials());
+        }
+        let mut random = [0u8; 16];
+        getrandom::fill(&mut random).map_err(|_| {
             failure(
                 StatusCode::SERVICE_UNAVAILABLE,
-                "Freigabe konnte nicht bestätigt werden.",
-            )
-        })?
-        .try_get(1)
-        .map_err(|_| {
-            failure(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Bestehender Streamzugang ist ungültig.",
+                "Zufallsquelle ist nicht verfügbar.",
             )
         })?;
-    let stored = state
-        .secrets
-        .encryption
-        .open(&encrypted, &format!("ingest_key:{id}"))
-        .map_err(|e| failure(StatusCode::SERVICE_UNAVAILABLE, e))?;
+        let key = crate::crypto::Secret::new(format!("rsr_{}", hex::encode(random)).into_bytes());
+        let encrypted = state
+            .secrets
+            .encryption
+            .seal(key.expose(), &format!("ingest_key:{id}"))
+            .map_err(|_| invalid_credentials())?;
+        (key, encrypted)
+    };
+    let hash = credential_hash(stored.expose())?;
+    // Die Prüfung geschieht vor jeder Schreibwirkung. Nach paralleler Rotation
+    // oder Sperre passt der gelesene Stand nicht mehr: nichts überschreiben.
+    let rows = state.store.query("WITH admitted AS (INSERT INTO relay.users AS u(streamer_id,enabled,ingest_key_hash,ingest_key_enc) VALUES($1,true,$2,$3) ON CONFLICT(streamer_id) DO UPDATE SET enabled=true,ingest_key_hash=EXCLUDED.ingest_key_hash,ingest_key_enc=EXCLUDED.ingest_key_enc WHERE $6::bool AND u.ingest_key_hash IS NOT DISTINCT FROM $4::text AND u.ingest_key_enc IS NOT DISTINCT FROM $5::bytea AND u.enabled=$7 RETURNING streamer_id), removed AS (DELETE FROM relay.waitlist w USING admitted a WHERE w.streamer_id=a.streamer_id) SELECT streamer_id FROM admitted", &[&id,&hash,&encrypted,&previous_hash,&previous_enc,&present,&previous_enabled]).await.map_err(|e|failure(StatusCode::SERVICE_UNAVAILABLE,e))?;
+    if rows.is_empty() {
+        return Err(failure(
+            StatusCode::CONFLICT,
+            "Streamzugang wurde gleichzeitig geändert. Gespeicherten Stand neu laden.",
+        ));
+    }
     let key = std::str::from_utf8(stored.expose()).map_err(|_| {
         failure(
             StatusCode::SERVICE_UNAVAILABLE,

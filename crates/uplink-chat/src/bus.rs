@@ -136,6 +136,28 @@ mod tests {
         assert_eq!(b.subscribe(Some(1)).1.len(), 1);
     }
     #[test]
+    fn stream_info_returns_to_an_earlier_state_without_losing_the_update() {
+        let b = Bus::new();
+        let info = |title| {
+            Ereignis::Info(
+                serde_json::from_value(serde_json::json!({
+                    "platform":"twitch", "channel_id":"7", "title":title
+                }))
+                .unwrap(),
+            )
+        };
+        let (mut subscriber, _, _) = b.subscribe(None);
+        assert_eq!(b.publish(info("A")), Ok(Some(1)));
+        assert_eq!(b.publish(info("A")), Ok(None));
+        assert_eq!(b.publish(info("B")), Ok(Some(2)));
+        assert!(!b.is_duplicate(&info("A")));
+        assert_eq!(b.publish(info("A")), Ok(Some(3)));
+        for id in 1..=3 {
+            assert_eq!(subscriber.try_recv().unwrap().id, id);
+        }
+        assert!(subscriber.try_recv().is_err());
+    }
+    #[test]
     fn lag_is_explicit_and_replay_bounded() {
         let b = Bus::new();
         for n in 0..1200 {

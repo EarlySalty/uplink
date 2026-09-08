@@ -1509,3 +1509,237 @@ async fn controlplane_preserves_credentials_and_rejects_unauthorized_changes() {
     executable_smoke(&database).await;
     database.stop().await;
 }
+
+#[tokio::test]
+#[ignore = "Benötigt isolierte PostgreSQL-16-Testinstanz."]
+async fn admission_repairs_absent_credentials_without_replacing_valid_keys() {
+    let (database, mut state) = fixture().await;
+    Arc::get_mut(&mut Arc::get_mut(&mut state).unwrap().secrets)
+        .unwrap()
+        .admin = Secret::new(b"synthetic-admin".to_vec());
+    state
+        .store
+        .query(
+            "INSERT INTO relay.users(streamer_id,enabled) VALUES(12,false)",
+            &[],
+        )
+        .await
+        .unwrap();
+    state
+        .store
+        .query("INSERT INTO relay.waitlist VALUES(12)", &[])
+        .await
+        .unwrap();
+    state
+        .store
+        .query(
+            "UPDATE relay.users SET ingest_key_hash=NULL WHERE streamer_id=11",
+            &[],
+        )
+        .await
+        .unwrap();
+    let app = router(state.clone());
+    for id in [12_i64, 11] {
+        let mut req = request(
+            "POST",
+            "/v1/admin/users",
+            format!("{{\"streamer_id\":{id}}}"),
+        );
+        req.headers_mut()
+            .insert("X-Relay-Auth", "synthetic-admin".parse().unwrap());
+        assert_eq!(
+            app.clone().oneshot(req).await.unwrap().status(),
+            StatusCode::OK
+        );
+        let rows = state.store.query("SELECT enabled,ingest_key_hash,ingest_key_enc FROM relay.users WHERE streamer_id=$1", &[&id]).await.unwrap();
+        let key = state
+            .secrets
+            .encryption
+            .open(&rows[0].get::<_, Vec<u8>>(2), &format!("ingest_key:{id}"))
+            .unwrap();
+        use sha2::Digest;
+        assert!(rows[0].get::<_, bool>(0));
+        assert_eq!(
+            rows[0].get::<_, String>(1),
+            hex::encode(sha2::Sha256::digest(key.expose()))
+        );
+        if id == 11 {
+            assert_eq!(key.expose(), b"rsr_00000000000000000000000000000000");
+        }
+    }
+    assert_eq!(
+        state
+            .store
+            .query("SELECT count(*) FROM relay.waitlist", &[])
+            .await
+            .unwrap()[0]
+            .get::<_, i64>(0),
+        0
+    );
+    database.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "Benötigt isolierte PostgreSQL-16-Testinstanz."]
+async fn admission_rejects_corrupt_credentials_before_enabling_or_removing_waitlist() {
+    let (database, mut state) = fixture().await;
+    Arc::get_mut(&mut Arc::get_mut(&mut state).unwrap().secrets)
+        .unwrap()
+        .admin = Secret::new(b"synthetic-admin".to_vec());
+    state
+        .store
+        .query(
+            "UPDATE relay.users SET enabled=false,ingest_key_enc=$1 WHERE streamer_id=11",
+            &[&vec![2_u8, 0]],
+        )
+        .await
+        .unwrap();
+    state
+        .store
+        .query("INSERT INTO relay.waitlist VALUES(11)", &[])
+        .await
+        .unwrap();
+    let mut req = request("POST", "/v1/admin/users", "{\"streamer_id\":11}");
+    req.headers_mut()
+        .insert("X-Relay-Auth", "synthetic-admin".parse().unwrap());
+    assert_eq!(
+        router(state.clone()).oneshot(req).await.unwrap().status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert!(
+        !state
+            .store
+            .query("SELECT enabled FROM relay.users WHERE streamer_id=11", &[])
+            .await
+            .unwrap()[0]
+            .get::<_, bool>(0)
+    );
+    assert_eq!(
+        state
+            .store
+            .query("SELECT count(*) FROM relay.waitlist", &[])
+            .await
+            .unwrap()[0]
+            .get::<_, i64>(0),
+        1
+    );
+    database.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "Benötigt isolierte PostgreSQL-16-Testinstanz."]
+async fn me_never_reports_a_healthy_enabled_user_without_matching_credentials() {
+    let (database, state) = fixture().await;
+    let app = router(state.clone());
+    let current = state
+        .store
+        .query(
+            "SELECT ingest_key_enc,ingest_key_hash FROM relay.users WHERE streamer_id=11",
+            &[],
+        )
+        .await
+        .unwrap();
+    let encrypted: Vec<u8> = current[0].get(0);
+    let hash: String = current[0].get(1);
+    let invalid_shape = state
+        .secrets
+        .encryption
+        .seal(b"not-a-stream-key", "ingest_key:11")
+        .unwrap();
+    use sha2::Digest;
+    for (encrypted, hash) in [
+        (Some(encrypted.clone()), None),
+        (None, Some(hash.clone())),
+        (Some(vec![2_u8, 0]), Some(hash)),
+        (Some(encrypted), Some("0".repeat(64))),
+        (
+            Some(invalid_shape),
+            Some(hex::encode(sha2::Sha256::digest(b"not-a-stream-key"))),
+        ),
+    ] {
+        state
+            .store
+            .query(
+                "UPDATE relay.users SET ingest_key_enc=$1,ingest_key_hash=$2 WHERE streamer_id=11",
+                &[&encrypted, &hash],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            app.clone()
+                .oneshot(request("GET", "/v1/me?streamer_id=11", ""))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+    database.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "Benötigt isolierte PostgreSQL-16-Testinstanz mit konkurrierenden Verbindungen."]
+async fn admission_does_not_overwrite_a_key_rotated_after_validation() {
+    let (database, mut state) = fixture().await;
+    Arc::get_mut(&mut Arc::get_mut(&mut state).unwrap().secrets)
+        .unwrap()
+        .admin = Secret::new(b"synthetic-admin".to_vec());
+    state
+        .store
+        .query("INSERT INTO relay.waitlist VALUES(11)", &[])
+        .await
+        .unwrap();
+    let (mut locker, driver) = database.raw().await;
+    let transaction = locker.transaction().await.unwrap();
+    let rotated = b"rsr_11111111111111111111111111111111";
+    let encrypted = state
+        .secrets
+        .encryption
+        .seal(rotated, "ingest_key:11")
+        .unwrap();
+    use sha2::Digest;
+    let hash = hex::encode(sha2::Sha256::digest(rotated));
+    transaction
+        .execute(
+            "UPDATE relay.users SET ingest_key_hash=$1,ingest_key_enc=$2 WHERE streamer_id=11",
+            &[&hash, &encrypted],
+        )
+        .await
+        .unwrap();
+    let mut req = request("POST", "/v1/admin/users", "{\"streamer_id\":11}");
+    req.headers_mut()
+        .insert("X-Relay-Auth", "synthetic-admin".parse().unwrap());
+    let app = router(state.clone());
+    let admission = tokio::spawn(async move { app.oneshot(req).await.unwrap() });
+    tokio::time::timeout(Duration::from_millis(800), async {
+        loop {
+            transaction.batch_execute("SELECT pg_stat_clear_snapshot()").await.unwrap();
+            if transaction.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE wait_event_type='Lock' AND pid<>pg_backend_pid())",&[]).await.unwrap().get::<_,bool>(0) { break; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+    transaction.commit().await.unwrap();
+    assert_eq!(admission.await.unwrap().status(), StatusCode::CONFLICT);
+    let rows = state
+        .store
+        .query(
+            "SELECT ingest_key_hash,ingest_key_enc FROM relay.users WHERE streamer_id=11",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows[0].get::<_, String>(0), hash);
+    assert_eq!(rows[0].get::<_, Vec<u8>>(1), encrypted);
+    assert_eq!(
+        state
+            .store
+            .query("SELECT count(*) FROM relay.waitlist", &[])
+            .await
+            .unwrap()[0]
+            .get::<_, i64>(0),
+        1
+    );
+    drop(locker);
+    driver.await.unwrap();
+    database.stop().await;
+}

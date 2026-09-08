@@ -178,7 +178,7 @@ async fn ws(
         .on_upgrade(move |socket| socket_loop(h, user, hash, since, filter, socket, permit))
         .into_response())
 }
-struct SocketPermit(Arc<User>);
+struct SocketPermit(Arc<User>, tokio_util::sync::CancellationToken);
 impl SocketPermit {
     fn acquire(u: Arc<User>, max: usize) -> Result<Self, Error> {
         u.sockets
@@ -191,7 +191,8 @@ impl SocketPermit {
                     "Zu viele OBS-Fenster geöffnet.",
                 )
             })?;
-        Ok(Self(u))
+        let cancel = u.socket_cancel.lock().expect("Dockverbindungen").clone();
+        Ok(Self(u, cancel))
     }
 }
 impl Drop for SocketPermit {
@@ -217,28 +218,34 @@ async fn socket_loop(
     since: Option<u64>,
     filter: ArtFilter,
     mut socket: WebSocket,
-    _permit: SocketPermit,
+    permit: SocketPermit,
 ) {
-    let (mut rx, replay, gap) = u.bus.subscribe(since);
-    if ws_send(&mut socket,&json!({"typ":"status","generation":h.generation,"plattformen":h.status(&u),"nachlauf_unvollstaendig":gap})).await.is_err(){return}
-    for frame in replay {
-        if filter.passt(&frame.ereignis) && ws_send(&mut socket, &frame).await.is_err() {
-            return;
+    let cancel = permit.1.clone();
+    let session = async {
+        let (mut rx, replay, gap) = u.bus.subscribe(since);
+        if ws_send(&mut socket,&json!({"typ":"status","generation":h.generation,"plattformen":h.status(&u),"nachlauf_unvollstaendig":gap})).await.is_err(){return}
+        for frame in replay {
+            if filter.passt(&frame.ereignis) && ws_send(&mut socket, &frame).await.is_err() {
+                return;
+            }
         }
-    }
-    let mut tick = tokio::time::interval(Duration::from_secs(10));
-    loop {
-        tokio::select! {biased;_=u.cancel.cancelled()=>break,
-        _=tick.tick()=>{
-         let valid=tokio::time::timeout(Duration::from_secs(5),h.identity.resolve(hash)).await;
-         if !matches!(valid,Ok(Ok(Some(identity)))if identity.enabled&&identity.streamer_id==u.id){
-           let (code,reason)=if matches!(valid,Ok(Ok(_))){(1008,"OBS-Adresse ist nicht mehr gültig")}else{(1013,"Zugang konnte gerade nicht geprüft werden")};
-           let _=tokio::time::timeout(Duration::from_secs(2),socket.send(Message::Close(Some(axum::extract::ws::CloseFrame{code,reason:reason.into()})))).await;break
-         }
-         if ws_send(&mut socket,&json!({"typ":"status","generation":h.generation,"plattformen":h.status(&u)})).await.is_err(){break}
-         let metrics=u.metrics.lock().expect("Kennzahlen").clone();if let Some(metrics)=metrics&& ws_send(&mut socket,&metrics).await.is_err(){break}
-        },frame=rx.recv()=>{match frame{Ok(frame)=>if filter.passt(&frame.ereignis)&&ws_send(&mut socket,&frame).await.is_err(){break},Err(_)=>break}},incoming=socket.next()=>{match incoming{Some(Ok(Message::Close(_)))|Some(Err(_))|None=>break,Some(Ok(Message::Ping(v)))=>{if tokio::time::timeout(Duration::from_secs(5),socket.send(Message::Pong(v))).await.is_err(){break}},_=>{}}}}
-    }
+        let mut tick = tokio::time::interval(Duration::from_secs(10));
+        loop {
+            tokio::select! {biased;_=tick.tick()=>{
+             let valid=tokio::time::timeout(Duration::from_secs(5),h.identity.resolve(hash)).await;
+             if !matches!(valid,Ok(Ok(Some(identity)))if identity.enabled&&identity.streamer_id==u.id){
+               let (code,reason)=if matches!(valid,Ok(Ok(_))){(1008,"OBS-Adresse ist nicht mehr gültig")}else{(1013,"Zugang konnte gerade nicht geprüft werden")};
+               let _=tokio::time::timeout(Duration::from_secs(2),socket.send(Message::Close(Some(axum::extract::ws::CloseFrame{code,reason:reason.into()})))).await;break
+             }
+             if ws_send(&mut socket,&json!({"typ":"status","generation":h.generation,"plattformen":h.status(&u)})).await.is_err(){break}
+             let metrics=u.metrics.lock().expect("Kennzahlen").clone();if let Some(metrics)=metrics&& ws_send(&mut socket,&metrics).await.is_err(){break}
+            },frame=rx.recv()=>{match frame{Ok(frame)=>if filter.passt(&frame.ereignis)&&ws_send(&mut socket,&frame).await.is_err(){break},Err(_)=>break}},incoming=socket.next()=>{match incoming{Some(Ok(Message::Close(_)))|Some(Err(_))|None=>break,Some(Ok(Message::Ping(v)))=>{if tokio::time::timeout(Duration::from_secs(5),socket.send(Message::Pong(v))).await.is_err(){break}},_=>{}}}}
+        }
+    };
+    // Rotation und Sperre unterbrechen auch ausstehende Sends, Identitäts-
+    // abfragen und Replay. Das Socketpermit bleibt bis dahin im Besitzer.
+    tokio::select! { biased; _ = cancel.cancelled() => {}, _ = session => {} }
+    drop(permit);
 }
 #[derive(Deserialize)]
 struct SendBody {

@@ -65,6 +65,7 @@ pub(crate) struct User {
     pub adapters: Mutex<HashMap<Platform, Arc<dyn ChatAdapter>>>,
     pub errors: Mutex<HashMap<Platform, ChatFehler>>,
     pub cancel: CancellationToken,
+    pub socket_cancel: Mutex<CancellationToken>,
     pub sockets: AtomicUsize,
     pub active: AtomicBool,
     session_epoch: AtomicU64,
@@ -96,6 +97,15 @@ pub struct Status {
     pub zustand: &'static str,
 }
 impl ChatHub {
+    /// Nur bestehende Dockverbindungen schließen. Kanaladapter, aktive Session
+    /// und Kennzahlen gehören zur Plattformidentität und bleiben erhalten.
+    pub fn rotate_docks(&self, id: u64) {
+        if let Some(user) = self.users.lock().expect("Nutzer").get(&id) {
+            let mut sockets = user.socket_cancel.lock().expect("Dockverbindungen");
+            sockets.cancel();
+            *sockets = user.cancel.child_token();
+        }
+    }
     /// Identität wurde vom Dienst bereits dauerhaft und mandantenbezogen geprüft.
     pub fn status_for(self: &Arc<Self>, id: u64) -> Result<Vec<Status>, &'static str> {
         let user = self.ensure(id)?;
@@ -104,7 +114,7 @@ impl ChatHub {
     pub fn user_ids(&self) -> Vec<u64> {
         self.users.lock().expect("Nutzer").keys().copied().collect()
     }
-    /// Nach persistenter Dockrotation oder Nutzersperre bestehende Adapter und
+    /// Nach Nutzersperre bestehende Adapter und
     /// Websockets abbrechen; neue Zugriffe müssen die neue Identität prüfen.
     pub fn invalidate(&self, id: u64) {
         if let Some(user) = self.users.lock().expect("Nutzer").remove(&id) {
@@ -171,12 +181,14 @@ impl ChatHub {
         if users.len() >= self.config.max_users {
             return Err("Chat ist ausgelastet");
         }
+        let cancel = self.cancel.child_token();
         let u = Arc::new(User {
             id,
             bus: Bus::new(),
             adapters: Mutex::new(HashMap::new()),
             errors: Mutex::new(HashMap::new()),
-            cancel: self.cancel.child_token(),
+            socket_cancel: Mutex::new(cancel.child_token()),
+            cancel,
             sockets: AtomicUsize::new(0),
             active: AtomicBool::new(false),
             session_epoch: AtomicU64::new(0),
@@ -391,5 +403,66 @@ fn sync_session(
             counts.starten(user.id as i64);
             highlighter.starten(user.id as i64);
         }
+    }
+}
+
+#[cfg(test)]
+mod rotation_tests {
+    use super::*;
+    struct Offline;
+    impl DockIdentity for Offline {
+        fn resolve(&self, _: [u8; 32]) -> BoxFuture<'_, Result<Option<DockUser>, BrokerError>> {
+            Box::pin(async { Ok(None) })
+        }
+    }
+    impl PlatformBroker for Offline {
+        fn grant(
+            &self,
+            _: u64,
+            _: Platform,
+            _: bool,
+        ) -> BoxFuture<'_, Result<crate::Grant, BrokerError>> {
+            Box::pin(async { Err(BrokerError::Disconnected) })
+        }
+    }
+    #[tokio::test]
+    async fn dock_rotation_keeps_active_session_and_cached_metrics() {
+        let hub =
+            ChatHub::new(ChatConfig::default(), Arc::new(Offline), Arc::new(Offline)).unwrap();
+        hub.set_active(7, true).unwrap();
+        let user = hub.ensure(7).unwrap();
+        let epoch = user.session_epoch.load(Ordering::Acquire);
+        let socket = user.socket_cancel.lock().unwrap().clone();
+        let frame = crate::kennzahlen::rahmen_bauen(
+            chrono::Utc::now(),
+            true,
+            vec![],
+            &HashMap::new(),
+            None,
+            None,
+        );
+        *user.metrics.lock().unwrap() = Some(frame.clone());
+        let info = crate::nachricht::Ereignis::Info(
+            serde_json::from_value(
+                serde_json::json!({"platform":"twitch","channel_id":"7","title":"Aktiv"}),
+            )
+            .unwrap(),
+        );
+        user.bus.publish(info).unwrap();
+        hub.rotate_docks(7);
+        assert!(socket.is_cancelled());
+        let current = hub.ensure(7).unwrap();
+        assert!(Arc::ptr_eq(&user, &current));
+        assert!(!current.cancel.is_cancelled());
+        assert!(!current.socket_cancel.lock().unwrap().is_cancelled());
+        assert!(current.active.load(Ordering::Acquire));
+        assert_eq!(current.session_epoch.load(Ordering::Acquire), epoch);
+        assert_eq!(*current.metrics.lock().unwrap(), Some(frame));
+        assert_eq!(current.bus.subscribe(None).1.len(), 1);
+        hub.invalidate(7);
+        assert!(current.cancel.is_cancelled());
+        assert!(current.socket_cancel.lock().unwrap().is_cancelled());
+        assert!(hub.user_ids().is_empty());
+        hub.shutdown().await;
     }
 }

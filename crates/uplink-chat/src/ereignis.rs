@@ -8,9 +8,6 @@
 //! Neu gegenueber dem Bot ist nur [`PunkteEreignis`] (Tag `points`), das der
 //! Bot nicht kennt.
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
-
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -247,38 +244,11 @@ pub struct StreamInfo {
 }
 
 impl StreamInfo {
-    /// Dedupe-Schluessel eines Zustands: Hash der Felder. Zwei gleiche
-    /// Momentaufnahmen hintereinander sind eine.
+    /// Eine Kanalzustandsquelle hat eine feste Identität. Der Bus vergleicht
+    /// ihren jeweils letzten Inhalt; auch A → B → A ist eine neue Änderung.
+    /// Optionale Felder bleiben im Inhalt erhalten und werden nicht erfunden.
     pub fn dedupe_key(&self) -> String {
-        let mut hasher = DefaultHasher::new();
-        self.title.hash(&mut hasher);
-        self.category_id.hash(&mut hasher);
-        self.category_name.hash(&mut hasher);
-        // Nur, was diese Quelle wirklich geliefert hat. Ein Feld, das sie
-        // gar nicht kennt, darf den Schluessel nicht mitbestimmen; sonst
-        // haenge der Schluessel an einem `false`, das niemand geprueft hat.
-        //
-        // Ueber Quellgrenzen hinweg entdoppelt das nicht, und das ist
-        // Absicht: `channel.update` ohne Tags und der Kanal-Endpunkt mit
-        // Tags beschreiben nicht dasselbe, sie wissen verschieden viel.
-        //
-        // Der Preis dafuer, ausdruecklich: derselbe Titel- und
-        // Kategorie-Stand aus beiden Quellen ergibt zwei Rahmen statt einem.
-        // Im Dock faellt das nicht auf, `standUebernehmen` ist idempotent
-        // und ein Live-Rahmen ueberschreibt die Tags nicht. Wer einen
-        // zweiten Verbraucher baut, rechnet damit.
-        if let Some(tags) = &self.tags {
-            tags.hash(&mut hasher);
-        }
-        if let Some(is_live) = self.is_live {
-            is_live.hash(&mut hasher);
-        }
-        dedupe_key(
-            self.platform,
-            &self.channel_id,
-            "info",
-            &format!("{:016x}", hasher.finish()),
-        )
+        dedupe_key(self.platform, &self.channel_id, "info", "current")
     }
 }
 
@@ -458,10 +428,10 @@ mod tests {
         assert_eq!(info.title, "Deadlock Ranked");
         assert_eq!(info.tags.as_deref().map(<[String]>::len), Some(2));
         assert_eq!(serde_json::to_value(&ereignis).unwrap(), nutzlast);
-        // Zustand: gleiche Felder, gleicher Schluessel; anderer Titel, anderer.
+        // Gleicher Kanal, gleiche Zustandsidentität; Inhalt prüft der Bus.
         let mut anders = info.clone();
         anders.title = "Neu".into();
-        assert_ne!(info.dedupe_key(), anders.dedupe_key());
+        assert_eq!(info.dedupe_key(), anders.dedupe_key());
         assert!(info.dedupe_key().starts_with("twitch:12345:info:"));
         // Patch schickt nur gesetzte Felder.
         let patch = StreamInfoPatch {
