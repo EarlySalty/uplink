@@ -5,6 +5,8 @@ use std::net::SocketAddr;
 #[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
+    pub chat: Option<ChatSettings>,
+    #[serde(default)]
     pub test_ingest: Option<TestIngestConfig>,
     #[serde(default = "tls_reload_default")]
     pub tls_reload_seconds: u64,
@@ -15,6 +17,8 @@ pub struct Config {
     pub public_ingest_url: String,
     pub dock_base_url: String,
     pub max_sessions: usize,
+    #[serde(default = "pending_connections_default")]
+    pub max_pending_connections: usize,
     pub max_sessions_per_tenant: usize,
     pub database_max_queries: u32,
     pub request_timeout_seconds: u64,
@@ -23,8 +27,20 @@ pub struct Config {
     pub media: MediaConfig,
     pub platforms: Vec<PlatformConfig>,
 }
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChatSettings {
+    pub bot_base_url: String,
+    pub allowed_origins: Vec<String>,
+    pub max_users: usize,
+    pub max_sockets_per_user: usize,
+    pub idle_timeout_seconds: u64,
+}
 fn tls_reload_default() -> u64 {
     60
+}
+fn pending_connections_default() -> usize {
+    8
 }
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -57,10 +73,17 @@ pub struct PlatformConfig {
 #[serde(deny_unknown_fields)]
 pub struct InfisicalConfig {
     pub base_url: String,
+    #[serde(default = "infisical_socket_default")]
+    pub socket_path: std::path::PathBuf,
+    #[serde(default)]
+    pub socket_owner_uid: u32,
     pub project_id: String,
     pub environment: String,
     pub secret_path: String,
     pub credential_fd: u32,
+}
+fn infisical_socket_default() -> std::path::PathBuf {
+    uplink_infisical_transport::DEFAULT_SOCKET.into()
 }
 #[derive(Clone, Deserialize)]
 #[serde(tag = "source", rename_all = "snake_case", deny_unknown_fields)]
@@ -87,6 +110,30 @@ impl Config {
             return Err("Konfigurationsdatei ist zu groß.");
         }
         let config: Self = toml::from_str(input).map_err(|_| "Konfiguration ist ungültig.")?;
+        if let Some(chat) = &config.chat {
+            let base =
+                reqwest::Url::parse(&chat.bot_base_url).map_err(|_| "Botadresse ist ungültig.")?;
+            if !matches!(base.scheme(), "http" | "https")
+                || !matches!(base.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"))
+                || base.path() != "/"
+                || base.query().is_some()
+                || base.fragment().is_some()
+                || !base.username().is_empty()
+                || base.password().is_some()
+                || !(1..=1024).contains(&chat.max_users)
+                || !(1..=32).contains(&chat.max_sockets_per_user)
+                || !(30..=3600).contains(&chat.idle_timeout_seconds)
+                || chat.allowed_origins.is_empty()
+                || chat.allowed_origins.len() > 8
+                || chat.allowed_origins.iter().any(|origin| {
+                    reqwest::Url::parse(origin).map_or(true, |url| {
+                        url.scheme() != "https" || url.origin().ascii_serialization() != *origin
+                    })
+                })
+            {
+                return Err("Chatkonfiguration verletzt Zugriffs- oder Ressourcengrenzen.");
+            }
+        }
         let public_ingest = reqwest::Url::parse(&config.public_ingest_url)
             .map_err(|_| "Öffentliche Eingangsadresse ist ungültig.")?;
         if public_ingest.scheme() != "rtmps"
@@ -98,6 +145,19 @@ impl Config {
             || !matches!(public_ingest.path(), "/live" | "/live/")
         {
             return Err("Öffentliche Eingangsadresse darf keinen Zugang enthalten.");
+        }
+        let dock = reqwest::Url::parse(&config.dock_base_url)
+            .map_err(|_| "Öffentliche Dockadresse ist ungültig.")?;
+        if dock.scheme() != "https"
+            || dock.host_str().is_none()
+            || !dock.username().is_empty()
+            || dock.password().is_some()
+            || dock.query().is_some()
+            || dock.fragment().is_some()
+        {
+            return Err(
+                "Öffentliche Dockadresse muss eine gültige HTTPS-Adresse ohne Zugang sein.",
+            );
         }
         if config
             .loopback_test_ca
@@ -115,30 +175,20 @@ impl Config {
         }) {
             return Err("Testeingang benötigt genau eine ausdrückliche Nutzerfreigabe.");
         }
-        let infisical = reqwest::Url::parse(&config.infisical.base_url)
-            .map_err(|_| "Infisical-Adresse ist ungültig.")?;
-        let allowed_infisical = infisical.scheme() == "https"
-            || (infisical.scheme() == "http"
-                && matches!(
-                    infisical.host_str(),
-                    Some("127.0.0.1" | "localhost" | "[::1]")
-                ));
         if !config.api_bind.ip().is_loopback()
             || !(30..=86400).contains(&config.tls_reload_seconds)
             || config.max_sessions == 0
             || config.max_sessions > 1024
+            || !(1..=128).contains(&config.max_pending_connections)
             || config.max_sessions_per_tenant == 0
             || config.max_sessions_per_tenant > config.max_sessions
             || config.database_max_queries == 0
             || config.database_max_queries > 64
             || config.request_timeout_seconds == 0
             || config.request_timeout_seconds > 60
-            || !allowed_infisical
-            || !infisical.username().is_empty()
-            || infisical.password().is_some()
+            || config.infisical.base_url != uplink_infisical_transport::BASE_URL
+            || !config.infisical.socket_path.is_absolute()
             || config.infisical.credential_fd < 3
-            || !config.public_ingest_url.starts_with("rtmps://")
-            || !config.dock_base_url.starts_with("https://")
         {
             return Err("Konfiguration verletzt Zugriffs- oder Ressourcengrenzen.");
         }
@@ -173,14 +223,6 @@ impl Config {
         if !config.media.ffmpeg.is_absolute()
             || !config.media.ffprobe.is_absolute()
             || !config.media.work_directory.is_absolute()
-            || config.media.max_event_bytes == 0
-            || config.media.max_event_bytes > 16 * 1024 * 1024
-            || config.media.max_queued_bytes < config.media.max_event_bytes
-            || config
-                .media
-                .max_queued_bytes
-                .saturating_mul(config.max_sessions)
-                > 1024 * 1024 * 1024
             || config.media.max_queued_events == 0
             || config.media.max_queued_events > 4096
             || config.media.max_tracks == 0
@@ -189,6 +231,7 @@ impl Config {
         {
             return Err("Mediengrenzen oder Audiozuordnung sind ungültig.");
         }
+        config.ingest_limits()?;
         let mut platforms = std::collections::HashSet::new();
         for platform in &config.platforms {
             if !matches!(

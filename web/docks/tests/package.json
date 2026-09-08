@@ -1,0 +1,8 @@
+{
+  "name": "uplink-dock-tests",
+  "private": true,
+  "type": "module",
+  "scripts": { "test": "node --test docks.test.mjs" },
+  "engines": { "node": ">=22.22.2" },
+  "devDependencies": { "jsdom": "30.0.1" }
+}

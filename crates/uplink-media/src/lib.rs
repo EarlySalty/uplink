@@ -116,6 +116,7 @@ impl fmt::Debug for PublishTarget {
 
 #[derive(Debug, Clone)]
 pub struct MediaLimits {
+    /// Maximaler Tag vor der Spurumschrift; deren E-RTMP-Header braucht bis zu 5 Byte.
     pub max_tag_bytes: usize,
     pub queue_bytes: usize,
     pub queue_events: usize,
@@ -125,6 +126,37 @@ pub struct MediaLimits {
     pub max_outputs: usize,
     pub max_encode_groups: usize,
     pub worker_threads: usize,
+}
+impl MediaLimits {
+    /// Eingang und neu codiertes Video behalten ihre Grenze. Die Drahtumschrift
+    /// erhält Platz für OneTrack; kopiertes AAC behält ihn auch hinter FFmpeg.
+    /// Die Queue zählt weiterhin reale Bytes.
+    pub(crate) fn routing_limits(&self) -> Self {
+        let mut routed = self.clone();
+        routed.max_tag_bytes = self.max_tag_bytes.saturating_add(5).min(0xff_ffff);
+        routed.queue_bytes = self
+            .queue_bytes
+            .saturating_add(5)
+            .min(u32::MAX as usize)
+            .min(tokio::sync::Semaphore::MAX_PERMITS);
+        routed
+    }
+
+    /// Gemeinsamer Paketvertrag für Konfiguration und Engine. Die 24-Bit-Länge
+    /// bezeichnet den Taginhalt; die Queue hält zusätzlich 11 Headerbytes und
+    /// vier Bytes PreviousTagSize. Ein gültiges größtes Paket muss hineinpassen.
+    pub fn validate_packet_limits(&self) -> Result<()> {
+        if self.max_tag_bytes == 0
+            || self.max_tag_bytes > 0xff_ffff
+            || self
+                .max_tag_bytes
+                .checked_add(15)
+                .is_none_or(|framed| self.queue_bytes < framed)
+        {
+            return Err(MediaError::InvalidConfiguration);
+        }
+        Ok(())
+    }
 }
 impl Default for MediaLimits {
     fn default() -> Self {
@@ -304,6 +336,42 @@ pub struct MediaStatus {
     pub encode_groups: usize,
     pub video_decoders: usize,
     pub outputs: Vec<OutputStatus>,
+    /// Tatsächlich angelegter Mediengraph. Keine gemessene Bitrate und keine
+    /// Plattformbestätigung; aktive Verwendung ergibt sich aus OutputStatus.
+    pub graph: Vec<OutputGraph>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OutputGraph {
+    pub id: String,
+    pub profile_origin: &'static str,
+    pub video: Vec<VideoProcessing>,
+    pub audio: Vec<AudioProcessing>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct VideoProcessing {
+    pub wire_track: u8,
+    pub mode: &'static str,
+    pub encode_group: Option<usize>,
+    pub profile: Option<ProcessingProfile>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProcessingProfile {
+    pub width: u32,
+    pub height: u32,
+    pub fps_numerator: u32,
+    pub fps_denominator: u32,
+    pub codec: &'static str,
+    pub target_bitrate_kbps: u32,
+    pub keyframe_interval_frames: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AudioProcessing {
+    pub source_wire_track: u8,
+    pub destination_wire_track: u8,
 }
 
 #[derive(Debug, Serialize)]

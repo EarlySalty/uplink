@@ -5,7 +5,7 @@ use crate::{
 };
 use serde::Deserialize;
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, HashSet, VecDeque},
     process::Stdio,
 };
 use tokio::{
@@ -85,7 +85,14 @@ impl MediaEngine {
         if spec.outputs.is_empty() || spec.outputs.len() > self.config.limits.max_outputs {
             return Err(MediaError::InvalidConfiguration);
         }
-        let prepared = self.prepare_source(spec.first, &mut input).await?;
+        let audio = spec
+            .outputs
+            .iter()
+            .flat_map(|output| {
+                std::iter::once(output.live_audio_track).chain(output.vod_audio_track)
+            })
+            .collect();
+        let prepared = self.prepare_source(spec.first, &mut input, &audio).await?;
         let graph = Graph::observed(&prepared.observation, &spec.outputs)?;
         let routes = spec
             .outputs
@@ -113,7 +120,12 @@ impl MediaEngine {
         if spec.outputs.is_empty() || spec.outputs.len() > self.config.limits.max_outputs {
             return Err(MediaError::InvalidConfiguration);
         }
-        let prepared = self.prepare_source(spec.first, &mut input).await?;
+        let audio = spec
+            .outputs
+            .iter()
+            .flat_map(|output| output.audio.iter().map(|audio| audio.source_wire_track))
+            .collect();
+        let prepared = self.prepare_source(spec.first, &mut input, &audio).await?;
         let graph = Graph::program(&prepared.observation, &spec.outputs)?;
         let routes = spec
             .outputs
@@ -137,11 +149,13 @@ impl MediaEngine {
         &self,
         first: MediaEvent,
         input: &mut mpsc::Receiver<MediaEvent>,
+        selected_audio: &HashSet<u8>,
     ) -> Result<PreparedSource> {
         let identity = first.identity;
         let mut prefix = VecDeque::new();
         let mut next = Some(first);
         let mut bytes = 0usize;
+        let mut events = 0usize;
         let mut first_video_dts = None;
         let mut duration = 0u32;
         let deadline = Instant::now() + self.config.limits.startup_timeout;
@@ -155,33 +169,43 @@ impl MediaEngine {
             {
                 return Err(MediaError::WrongSession);
             }
-            if event.configuration_revision > 1
-                || (event.configuration_revision == 0 && event.event_kind != EventKind::Metadata)
-            {
-                return Err(MediaError::UnsupportedProfile);
+            if event.wire_body().len() > self.config.limits.max_tag_bytes {
+                return Err(MediaError::InvalidMedia);
             }
             bytes = bytes
                 .checked_add(event.wire_body().len() + 15)
                 .ok_or(MediaError::ResourceLimit)?;
-            if bytes > self.config.limits.queue_bytes
-                || prefix.len() >= self.config.limits.queue_events
-            {
+            if bytes > self.config.limits.queue_bytes || events >= self.config.limits.queue_events {
                 return Err(MediaError::Backpressure);
             }
-            if event.event_kind == EventKind::SequenceHeader
-                && tracks.insert(event.identity.track, event.codec).is_some()
+            events += 1;
+            // Auch verworfene Zusatzspuren verbrauchen das Vorlaufbudget und
+            // gehören zur selben Session. Erst danach gilt die Audioauswahl.
+            if event.identity.track.kind != MediaKind::Audio
+                || selected_audio.contains(&event.identity.track.wire_id)
             {
-                return Err(MediaError::UnsupportedProfile);
+                if event.configuration_revision > 1
+                    || (event.configuration_revision == 0
+                        && event.event_kind != EventKind::Metadata)
+                {
+                    return Err(MediaError::UnsupportedProfile);
+                }
+                if event.event_kind == EventKind::SequenceHeader
+                    && tracks.insert(event.identity.track, event.codec).is_some()
+                {
+                    return Err(MediaError::UnsupportedProfile);
+                }
+                if event.identity.track.kind == MediaKind::Video
+                    && event.event_kind == EventKind::Frame
+                {
+                    let start = first_video_dts.get_or_insert(event.dts_ms);
+                    duration = event
+                        .dts_ms
+                        .checked_sub(*start)
+                        .ok_or(MediaError::InvalidMedia)?;
+                }
+                prefix.push_back(event);
             }
-            if event.identity.track.kind == MediaKind::Video && event.event_kind == EventKind::Frame
-            {
-                let start = first_video_dts.get_or_insert(event.dts_ms);
-                duration = event
-                    .dts_ms
-                    .checked_sub(*start)
-                    .ok_or(MediaError::InvalidMedia)?;
-            }
-            prefix.push_back(event);
             if duration >= 1000 {
                 break;
             }
@@ -230,7 +254,10 @@ impl MediaEngine {
                     .iter()
                     .position(|track| *track == event.identity.track)
                     .ok_or(MediaError::MissingTrack)?;
-                tag = tag.with_audio_track(canonical as u8, self.config.limits.max_tag_bytes)?;
+                tag = tag.with_audio_track(
+                    canonical as u8,
+                    self.config.limits.routing_limits().max_tag_bytes,
+                )?;
             }
             tag.write_to(&mut flv).await?;
             if flv.len() > self.config.limits.queue_bytes + HEADER.len() + prefix.len() * 5 {
@@ -238,14 +265,7 @@ impl MediaEngine {
             }
         }
         let measured = probe(&self.config, flv).await?;
-        let observation = observation(
-            measured,
-            &audio,
-            video[0].wire_id,
-            prefix.len(),
-            bytes,
-            duration,
-        )?;
+        let observation = observation(measured, &audio, video[0].wire_id, events, bytes, duration)?;
         let identity = TrackIdentity {
             track: video[0],
             ..identity
@@ -262,6 +282,10 @@ struct PreparedSource {
     prefix: VecDeque<MediaEvent>,
     observation: SourceObservation,
 }
+
+#[cfg(test)]
+#[path = "prepare/review_tests.rs"]
+mod review_tests;
 
 async fn probe(config: &EngineConfig, bytes: Vec<u8>) -> Result<ProbeDocument> {
     let child=Command::new(&config.ffprobe)

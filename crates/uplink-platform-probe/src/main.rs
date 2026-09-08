@@ -7,7 +7,7 @@ use uplink_media::{
     EngineConfig, MediaLimits, PublishSecret,
     platform::{
         hardware,
-        twitch::{Canvas, GoLiveClient, GoLiveProbe, Preferences, Rational},
+        twitch::{Canvas, GoLiveClient, GoLiveError, GoLiveProbe, Preferences, Rational},
     },
 };
 use uplink_service::{
@@ -128,8 +128,8 @@ fn metadata(input: &str) -> Result<Metadata> {
     let project_id = take("INFISICAL_PROJECT_ID")?;
     let environment = take("INFISICAL_ENV")?;
     let secret_path = take("INFISICAL_SECRET_PATH")?;
-    // The delegated probe is authorized for this existing local broker only.
-    // No proxy, redirect, shell interpolation or arbitrary Infisical endpoint.
+    // Die bisherige normale Metadatendatei bezeichnet weiterhin diese Instanz.
+    // Der Transport verwendet ausschließlich deren geschützten Unixsocket.
     if base_url != "http://127.0.0.1:8080"
         || project_id.len() != 36
         || project_id.bytes().enumerate().any(|(index, byte)| {
@@ -153,7 +153,7 @@ fn metadata(input: &str) -> Result<Metadata> {
         return Err(ERROR);
     }
     Ok(Metadata {
-        base_url,
+        base_url: "http://infisical.local".into(),
         project_id,
         environment,
         secret_path,
@@ -253,6 +253,7 @@ fn fetch_config(args: &Arguments, meta: Metadata) -> Result<Config> {
     // Adapt the existing fetch contract. No server is started, and its TLS,
     // ingest and dashboard fields are never consumed by this executable.
     Ok(Config {
+        chat: None,
         test_ingest: None,
         tls_reload_seconds: 60,
         loopback_test_ca: None,
@@ -261,11 +262,14 @@ fn fetch_config(args: &Arguments, meta: Metadata) -> Result<Config> {
         public_ingest_url: "rtmps://localhost/live".into(),
         dock_base_url: "https://localhost".into(),
         max_sessions: 1,
+        max_pending_connections: 1,
         max_sessions_per_tenant: 1,
         database_max_queries: 1,
         request_timeout_seconds: 5,
         infisical: InfisicalConfig {
             base_url: meta.base_url,
+            socket_path: "/run/uplink-infisical/api.sock".into(),
+            socket_owner_uid: 0,
             project_id: meta.project_id,
             environment: meta.environment,
             secret_path: meta.secret_path,
@@ -425,10 +429,10 @@ async fn run(args: Arguments) -> Result<()> {
         .map_err(|_| "Lokale Hardware- oder Encodermessung ist fehlgeschlagen.")?;
     let requested = preferences();
     let configuration = GoLiveClient::new()
-        .map_err(|_| "Twitch-Konfigurationsclient ist nicht verfügbar.")?
+        .map_err(GoLiveError::message)?
         .probe(&authentication, &hardware, &requested)
         .await
-        .map_err(|_| "Twitch-Konfiguration konnte nicht sicher geprüft werden.")?;
+        .map_err(GoLiveError::message)?;
     emit(&Summary {
         broker_identity_matches: identity_matches,
         chat_identity_broker_status: if identity_matches.is_some() {
@@ -525,7 +529,7 @@ mod tests {
     #[test]
     fn metadata_reads_only_known_literal_fields_without_shell_evaluation() {
         let value = metadata(META).unwrap();
-        assert_eq!(value.base_url, "http://127.0.0.1:8080");
+        assert_eq!(value.base_url, "http://infisical.local");
         assert_eq!(value.environment, "prod");
         assert_eq!(value.secret_path, "/");
         assert_eq!(value.project_id, "00000000-0000-0000-0000-000000000001");

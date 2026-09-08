@@ -257,12 +257,16 @@ mod tests {
 
     #[test]
     fn multivideo_av1_preserves_payload_without_inventing_cts() {
-        let body = enhanced_video(b"av01", 1, Some(12), &[0xff, 0xff, 0xff, 0x22]);
-        let parsed = inspect(MediaKind::Video, &body, 100, 64).unwrap();
-        assert_eq!(parsed.codec, WireCodec::Av1);
-        assert_eq!(parsed.pts_ms, 100);
-        assert_eq!(parsed.track.wire_id, 12);
-        assert_eq!(&body[parsed.payload], &[0xff, 0xff, 0xff, 0x22]);
+        // E-RTMP V2, ExVideoTagBody: AV1 CodedFrames consists directly of OBUs;
+        // the SI24 offset belongs to the separate AVC/HEVC/VVC branches.
+        for track in [None, Some(12)] {
+            let body = enhanced_video(b"av01", 1, track, &[0xff, 0xff, 0xff, 0x22]);
+            let parsed = inspect(MediaKind::Video, &body, 100, 64).unwrap();
+            assert_eq!(parsed.codec, WireCodec::Av1);
+            assert_eq!(parsed.pts_ms, 100);
+            assert_eq!(parsed.track.wire_id, track.unwrap_or(0));
+            assert_eq!(&body[parsed.payload], &[0xff, 0xff, 0xff, 0x22]);
+        }
     }
 
     #[test]

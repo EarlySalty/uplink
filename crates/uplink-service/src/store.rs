@@ -9,6 +9,11 @@ tokio::task_local! { pub static REQUEST_DEADLINE: Instant; }
 pub const CLEANUP_GRACE: Duration = Duration::from_secs(2);
 const QUERY_LIMIT: Duration = Duration::from_secs(10);
 
+pub(crate) struct CheckedStatement<'a> {
+    pub sql: &'a str,
+    pub expected_rows: Option<usize>,
+}
+
 pub struct Store {
     connection: tokio_postgres::Config,
     slots: Arc<Semaphore>,
@@ -48,10 +53,77 @@ impl Store {
     pub async fn ready(&self) -> bool {
         self.query("SELECT 1", &[]).await.is_ok()
     }
+    /// Ausschließlich im Binary versionierte Release-Migrationen. Derselbe
+    /// begrenzte Transaktions-/Abbruchpfad wie für normale Datenbankarbeit.
+    pub(crate) async fn migrate(
+        &self,
+        name: &'static str,
+        sql: &'static str,
+    ) -> Result<(), &'static str> {
+        if !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        {
+            return Err("Migrationsname ist ungültig.");
+        }
+        let checksum = hex::encode(Sha256::digest(sql.as_bytes()));
+        // name/sql stammen ausschließlich aus migrations.rs und include_str!;
+        // kein CLI-, HTTP-, Config- oder Datenbanktext wird als SQL eingesetzt.
+        let guarded = format!("DO $uplink_migration$ BEGIN
+            IF EXISTS(SELECT 1 FROM relay.uplink_schema_migrations WHERE name='{name}' AND checksum<>'{checksum}') THEN
+                RAISE EXCEPTION 'Uplink-Migrationsprüfsumme stimmt nicht' USING ERRCODE = 'UL001';
+            END IF;
+            IF NOT EXISTS(SELECT 1 FROM relay.uplink_schema_migrations WHERE name='{name}') THEN
+                {sql}
+                INSERT INTO relay.uplink_schema_migrations(name,checksum) VALUES('{name}','{checksum}');
+            END IF;
+        END $uplink_migration$");
+        self.query_statements(&[
+            CheckedStatement { sql:"SELECT pg_advisory_xact_lock(849205731)", expected_rows:None },
+            CheckedStatement { sql:"CREATE TABLE IF NOT EXISTS relay.uplink_schema_migrations(name text PRIMARY KEY,checksum text NOT NULL,applied_at timestamptz NOT NULL DEFAULT clock_timestamp())", expected_rows:None },
+            CheckedStatement { sql:&guarded, expected_rows:None },
+        ], &[], None).await?;
+        Ok(())
+    }
     pub async fn query(
         &self,
         sql: &str,
         params: &[&(dyn ToSql + Sync)],
+    ) -> Result<Vec<Row>, &'static str> {
+        self.query_with_retention(sql, params, None).await
+    }
+    pub(crate) async fn query_with_retention(
+        &self,
+        sql: &str,
+        params: &[&(dyn ToSql + Sync)],
+        retention: Option<Arc<dyn std::any::Any + Send + Sync>>,
+    ) -> Result<Vec<Row>, &'static str> {
+        self.query_statements(
+            &[CheckedStatement {
+                sql,
+                expected_rows: None,
+            }],
+            params,
+            retention,
+        )
+        .await
+    }
+    /// Each statement obtains a new READ COMMITTED snapshot, while all fence
+    /// row locks remain held until the shared commit. A single modifying CTE
+    /// cannot see a first INSERT that committed while it waited for its fence.
+    pub(crate) async fn query_fenced(
+        &self,
+        statements: [CheckedStatement<'_>; 2],
+        params: &[&(dyn ToSql + Sync)],
+        retention: Option<Arc<dyn std::any::Any + Send + Sync>>,
+    ) -> Result<Vec<Row>, &'static str> {
+        self.query_statements(&statements, params, retention).await
+    }
+    async fn query_statements(
+        &self,
+        statements: &[CheckedStatement<'_>],
+        params: &[&(dyn ToSql + Sync)],
+        retention: Option<Arc<dyn std::any::Any + Send + Sync>>,
     ) -> Result<Vec<Row>, &'static str> {
         let slot = self
             .slots
@@ -81,19 +153,27 @@ impl Store {
         // Nach der begrenzten Nachlaufzeit schließt Drop die Verbindung hart.
         let driver = tokio::spawn(async move {
             let _slot = slot;
+            let _retention = retention;
             let _ = timeout_at(deadline + CLEANUP_GRACE, driver).await;
         });
         let result = async {
             let cancel = client.cancel_token();
-            let transaction = timeout_at(deadline, client.transaction()).await
+            let transaction = timeout_at(deadline, client.build_transaction().isolation_level(tokio_postgres::IsolationLevel::ReadCommitted).start()).await
                 .map_err(|_| "Datenbankanfrage hat die Frist überschritten.")?
                 .map_err(|_| "Datenbanktransaktion konnte nicht starten.")?;
-            let rows = {
-                let query = transaction.query(sql, params);
+            let mut rows=Vec::new();
+            for statement in statements {
+            rows = {
+                let query = transaction.query(statement.sql, params);
                 tokio::pin!(query);
                 match timeout_at(deadline, &mut query).await {
                     Ok(Ok(rows)) => rows,
-                    Ok(Err(_)) => {
+                    Ok(Err(error)) => {
+                        // Eigener SQLSTATE des versionierten Migrationsguards;
+                        // niemals Servertexte oder SQL-Details weiterreichen.
+                        if error.code().is_some_and(|code| code.code() == "UL001") {
+                            return Err("Uplink-Migrationsprüfsumme stimmt nicht. Release und Migrationsledger prüfen; Start abgebrochen.");
+                        }
                         return Err("Datenbankanfrage fehlgeschlagen oder Frist überschritten.");
                     }
                     Err(_) => {
@@ -106,6 +186,10 @@ impl Store {
                     }
                 }
             };
+            if statement.expected_rows.is_some_and(|expected| rows.len()!=expected) {
+                return Err("Zielgeneration ist veraltet; Verbindung wurde zwischenzeitlich geändert.");
+            }
+            }
             if Instant::now() >= deadline {
                 return Err("Datenbankanfrage hat die Frist überschritten.");
             }

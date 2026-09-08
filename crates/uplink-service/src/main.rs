@@ -11,7 +11,9 @@ async fn main() {
 async fn run() -> Result<(), &'static str> {
     let mut args = std::env::args_os().skip(1);
     if args.next().as_deref() != Some(std::ffi::OsStr::new("--config")) {
-        return Err("Aufruf: uplink-service --config <Datei> [--check-config | --ingest-test]");
+        return Err(
+            "Aufruf: uplink-service --config <Datei> [--check-config | --migrate | --ingest-test]",
+        );
     }
     let path = PathBuf::from(args.next().ok_or("Konfigurationsdatei fehlt.")?);
     let mode = args.next();
@@ -19,9 +21,12 @@ async fn run() -> Result<(), &'static str> {
         || mode.as_deref().is_some_and(|value| {
             value != std::ffi::OsStr::new("--check-config")
                 && value != std::ffi::OsStr::new("--ingest-test")
+                && value != std::ffi::OsStr::new("--migrate")
         })
     {
-        return Err("Aufruf: uplink-service --config <Datei> [--check-config | --ingest-test]");
+        return Err(
+            "Aufruf: uplink-service --config <Datei> [--check-config | --migrate | --ingest-test]",
+        );
     }
     use tokio::io::AsyncReadExt;
     let file = tokio::fs::File::open(path)
@@ -44,9 +49,20 @@ async fn run() -> Result<(), &'static str> {
         );
         return Ok(());
     }
+    if config.test_ingest.is_some()
+        && mode.as_deref() != Some(std::ffi::OsStr::new("--ingest-test"))
+    {
+        return Err("Ein reiner Testeingang darf nicht als regulärer Uplink-Dienst starten.");
+    }
     uplink_service::secrets::protect_configured_fds(&config)?;
     let reader = uplink_service::secrets::SecretReader::new(&config).await?;
     let secrets = Arc::new(reader.fetch().await?);
+    if mode.as_deref() == Some(std::ffi::OsStr::new("--migrate")) {
+        let store = Store::connect(&secrets.database, config.database_max_queries).await?;
+        uplink_service::migrations::apply(&store).await?;
+        println!("Uplink-Zielgeneration und Audiowahl sind migriert. Kein Listener gestartet.");
+        return Ok(());
+    }
     let resolver = if matches!(
         config.tls,
         uplink_service::config::TlsConfig::Infisical { .. }
@@ -91,7 +107,29 @@ async fn run() -> Result<(), &'static str> {
     let reload_seconds = config.tls_reload_seconds;
     let store = Arc::new(Store::connect(&secrets.database, config.database_max_queries).await?);
     let registry = Registry::new(config.max_sessions, config.max_sessions_per_tenant)?;
+    let chat = config
+        .chat
+        .as_ref()
+        .map(|chat| {
+            let identities = Arc::new(uplink_service::chat::StoredDockIdentity(store.clone()));
+            let broker = Arc::new(uplink_service::chat::BotBroker::new(
+                &chat.bot_base_url,
+                uplink_service::crypto::Secret::new(secrets.bot_internal.expose().to_vec()),
+            )?);
+            uplink_chat::ChatHub::new(
+                uplink_chat::ChatConfig {
+                    allowed_origins: chat.allowed_origins.clone(),
+                    max_users: chat.max_users,
+                    max_sockets_per_user: chat.max_sockets_per_user,
+                    idle_timeout: std::time::Duration::from_secs(chat.idle_timeout_seconds),
+                },
+                identities,
+                broker,
+            )
+        })
+        .transpose()?;
     let state = Arc::new(ServiceState {
+        chat,
         config,
         store,
         secrets,
@@ -135,9 +173,15 @@ async fn run() -> Result<(), &'static str> {
             };
             resolver.mark_refresh_failure(result.is_err());
             match (result.is_err(), failed) {
-                (true, false) => eprintln!(
-                    "TLS-Aktualisierung fehlgeschlagen; neue Verbindungen benötigen einen weiterhin gültigen Stand."
-                ),
+                (true, false) => {
+                    // Fetch/Resolver liefern ausschließlich geprüfte statische
+                    // Fehlertexte, niemals den Infisical-Antwortkörper.
+                    if let Err(reason) = result {
+                        eprintln!(
+                            "TLS-Aktualisierung fehlgeschlagen: {reason} Neue Verbindungen benötigen einen weiterhin gültigen Stand."
+                        );
+                    }
+                }
                 (false, true) => eprintln!("TLS-Aktualisierung wieder verfügbar."),
                 _ => {}
             }

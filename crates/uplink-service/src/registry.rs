@@ -6,6 +6,7 @@ use std::{
 #[derive(Clone)]
 pub struct Registry(Arc<Mutex<State>>);
 struct State {
+    changes: std::collections::HashSet<u64>,
     next: u64,
     active: HashMap<u64, (u64, SessionStatus)>,
     total: usize,
@@ -15,6 +16,8 @@ struct State {
 #[derive(Clone, serde::Serialize)]
 pub struct SessionStatus {
     pub id: u64,
+    pub active: bool,
+    pub generation: Option<String>,
     pub state: &'static str,
     pub received_events: u64,
     pub received_bytes: u64,
@@ -29,12 +32,28 @@ pub struct Reservation {
     tenant: u64,
     registry: Weak<Mutex<State>>,
 }
+pub struct TenantChange {
+    tenant: u64,
+    registry: Weak<Mutex<State>>,
+}
+impl Drop for TenantChange {
+    fn drop(&mut self) {
+        if let Some(registry) = self.registry.upgrade() {
+            registry
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .changes
+                .remove(&self.tenant);
+        }
+    }
+}
 impl Registry {
     pub fn new(total: usize, per_tenant: usize) -> Result<Self, &'static str> {
         if total == 0 || per_tenant == 0 || per_tenant > total {
             return Err("Sessiongrenzen sind ungültig.");
         }
         Ok(Self(Arc::new(Mutex::new(State {
+            changes: Default::default(),
             next: 1,
             active: HashMap::new(),
             total,
@@ -48,6 +67,7 @@ impl Registry {
             .lock()
             .map_err(|_| "Sessionverwaltung ist nicht verfügbar.")?;
         if tenant == 0
+            || state.changes.contains(&tenant)
             || state.active.len() >= state.total
             || state.active.values().filter(|(t, _)| *t == tenant).count() >= state.per_tenant
         {
@@ -64,6 +84,8 @@ impl Registry {
                 tenant,
                 SessionStatus {
                     id,
+                    active: true,
+                    generation: None,
                     state: "Eingang wird geprüft",
                     received_events: 0,
                     received_bytes: 0,
@@ -80,6 +102,25 @@ impl Registry {
             tenant,
             registry: Arc::downgrade(&self.0),
         })
+    }
+    pub fn begin_change(&self, tenant: u64) -> Result<Arc<TenantChange>, &'static str> {
+        let mut state = self
+            .0
+            .lock()
+            .map_err(|_| "Sessionverwaltung ist nicht verfügbar.")?;
+        if tenant == 0
+            || state.changes.contains(&tenant)
+            || state.active.values().any(|(id, _)| *id == tenant)
+        {
+            return Err(
+                "Ein Stream oder eine Zieländerung läuft. Stream zuerst beenden und erneut versuchen.",
+            );
+        }
+        state.changes.insert(tenant);
+        Ok(Arc::new(TenantChange {
+            tenant,
+            registry: Arc::downgrade(&self.0),
+        }))
     }
     pub fn active_count(&self) -> usize {
         self.0
@@ -110,6 +151,10 @@ impl Registry {
     }
 }
 impl Reservation {
+    pub fn generation(&self, generation: uplink_ingest::ConnectionGeneration) {
+        // Nur servergenerierte Zufallsinstanz und Zähler, keine Zugangsdaten.
+        self.update(|state| state.generation = Some(format!("{generation:?}")));
+    }
     pub fn ingest_ended(&self, reason: &uplink_ingest::EndReason) {
         self.update(|state| {
             // EndReason/MediaError enthalten ausschließlich geprüfte Enumwerte,
@@ -174,6 +219,7 @@ impl Drop for Reservation {
         if let Some(registry) = self.registry.upgrade() {
             let mut state = registry.lock().unwrap_or_else(|e| e.into_inner());
             if let Some((tenant, mut status)) = state.active.remove(&self.id) {
+                status.active = false;
                 if status.error.is_none() {
                     status.state = "Beendet";
                 }

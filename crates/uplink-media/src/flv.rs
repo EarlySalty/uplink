@@ -170,6 +170,7 @@ impl FlvTag {
 pub struct FlvReader<R> {
     reader: R,
     max_tag_bytes: usize,
+    max_copied_audio_bytes: usize,
     started: bool,
 }
 impl<R: AsyncRead + Unpin> FlvReader<R> {
@@ -177,7 +178,16 @@ impl<R: AsyncRead + Unpin> FlvReader<R> {
         Self {
             reader,
             max_tag_bytes,
+            max_copied_audio_bytes: max_tag_bytes,
             started: false,
+        }
+    }
+    /// FFmpeg kopiert intern umgeschriebenes AAC einschließlich OneTrack-Header.
+    /// Nur dafür gilt die Reserve; neue Video- und Metadatentags behalten ihr Limit.
+    pub(crate) fn worker_output(reader: R, limits: &crate::MediaLimits) -> Self {
+        Self {
+            max_copied_audio_bytes: limits.routing_limits().max_tag_bytes,
+            ..Self::new(reader, limits.max_tag_bytes)
         }
     }
     pub async fn next(&mut self) -> Result<Option<FlvTag>> {
@@ -220,8 +230,13 @@ impl<R: AsyncRead + Unpin> FlvReader<R> {
             .await
             .map_err(|_| MediaError::InvalidMedia)?;
         let length = u32::from_be_bytes([0, header[1], header[2], header[3]]) as usize;
+        let max_bytes = if header[0] == 8 {
+            self.max_copied_audio_bytes
+        } else {
+            self.max_tag_bytes
+        };
         if length == 0
-            || length > self.max_tag_bytes
+            || length > max_bytes
             || header[8..11] != [0, 0, 0]
             || !matches!(header[0], 8 | 9 | 18)
         {
@@ -233,6 +248,11 @@ impl<R: AsyncRead + Unpin> FlvReader<R> {
             .read_exact(&mut body)
             .await
             .map_err(|_| MediaError::InvalidMedia)?;
+        if length > self.max_tag_bytes
+            && (body.len() < 7 || body[0] != 0x95 || body[1] > 1 || &body[2..6] != b"mp4a")
+        {
+            return Err(MediaError::InvalidMedia);
+        }
         let mut previous = [0_u8; 4];
         self.reader
             .read_exact(&mut previous)
@@ -245,7 +265,7 @@ impl<R: AsyncRead + Unpin> FlvReader<R> {
             header[0],
             timestamp,
             body.into(),
-            self.max_tag_bytes,
+            max_bytes,
         )?))
     }
 }
@@ -253,6 +273,46 @@ impl<R: AsyncRead + Unpin> FlvReader<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn worker_reserve_only_accepts_bounded_copied_aac() {
+        let limits = crate::MediaLimits {
+            max_tag_bytes: 64,
+            ..crate::MediaLimits::default()
+        };
+        for (kind, prefix, length, accepted) in [
+            (8, b"\x95\x01mp4a\x01".as_slice(), 69, true),
+            (8, b"\x95\x00mp4a\x01".as_slice(), 69, true),
+            (8, b"\x95\x01mp4a\x01".as_slice(), 70, false),
+            (8, b"\x95\x01Opus\x01".as_slice(), 69, false),
+            (8, b"\x95\x04mp4a\x01".as_slice(), 69, false),
+            (8, b"\xaf\x01".as_slice(), 65, false),
+            (9, b"\x17\x01\x00\x00\x00".as_slice(), 65, false),
+            (18, b"metadata".as_slice(), 65, false),
+        ] {
+            let mut body = prefix.to_vec();
+            body.resize(length, 0x12);
+            let mut wire = HEADER.to_vec();
+            FlvTag::new(kind, 0, body.into(), 70)
+                .unwrap()
+                .write_to(&mut wire)
+                .await
+                .unwrap();
+            let result = FlvReader::worker_output(wire.as_slice(), &limits)
+                .next()
+                .await;
+            assert_eq!(
+                result.is_ok(),
+                accepted,
+                "Tagtyp {kind}, Länge {length}, Kopf {prefix:?}"
+            );
+            assert!(
+                FlvReader::new(wire.as_slice(), limits.max_tag_bytes)
+                    .next()
+                    .await
+                    .is_err()
+            );
+        }
+    }
     #[tokio::test]
     async fn bounded_roundtrip_preserves_extended_timestamp_and_payload() {
         let tag = FlvTag::new(

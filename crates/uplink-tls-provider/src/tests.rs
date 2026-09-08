@@ -1,11 +1,12 @@
 use super::*;
+use std::os::unix::fs::PermissionsExt;
 use std::{collections::HashMap, sync::Mutex};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     task::JoinHandle,
 };
 
-fn config(port: u16) -> Config {
+fn config(_port: u16) -> Config {
     Config {
         hostname: "test.example".into(),
         certificate_file: "/certificate.pem".into(),
@@ -16,7 +17,7 @@ fn config(port: u16) -> Config {
         project_id: "00000000-0000-0000-0000-000000000001".into(),
         environment: "prod".into(),
         secret_path: "/".into(),
-        infisical_port: port,
+        infisical_socket: uplink_infisical_transport::DEFAULT_SOCKET.into(),
     }
 }
 fn material() -> (Material, Arc<rustls::RootCertStore>) {
@@ -42,16 +43,28 @@ struct Server {
     state: Arc<Mutex<State>>,
     task: JoinHandle<()>,
     port: u16,
+    directory: PathBuf,
 }
 impl Drop for Server {
     fn drop(&mut self) {
         self.task.abort();
+        let _ = std::fs::remove_dir_all(&self.directory);
     }
 }
 impl Server {
     async fn start() -> Self {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let directory = PathBuf::from(format!(
+            "/tmp/uplink-provider-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.join("api.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let port = 8080;
         let state = Arc::new(Mutex::new(State::default()));
         let shared = state.clone();
         let task = tokio::spawn(async move {
@@ -128,12 +141,26 @@ impl Server {
                 socket.write_all(&body).await.unwrap();
             }
         });
-        Self { state, task, port }
+        Self {
+            state,
+            task,
+            port,
+            directory,
+        }
     }
     fn vault(&self) -> Vault {
-        Vault::new(
+        use std::os::unix::fs::MetadataExt;
+        let uid = std::fs::metadata(&self.directory).unwrap().uid();
+        let client =
+            uplink_infisical_transport::client_builder(&self.directory.join("api.sock"), uid)
+                .unwrap()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap();
+        Vault::with_client(
             &config(self.port),
             &Secret::new(b"synthetic-test-identity".to_vec()),
+            client,
         )
         .unwrap()
     }
@@ -225,12 +252,32 @@ async fn access_rejection_never_becomes_creation_or_reflected_output() {
             Some(("PATCH".into(), CERTIFICATE_SECRET.into(), status));
         let result = sync_material(&server.vault(), &new, "test.example", roots).await;
         assert_eq!(result, Err(Error::Rejected(status)));
+        assert!(
+            Error::Rejected(status)
+                .to_string()
+                .contains(&format!("HTTP {status}"))
+        );
+        assert!(
+            !Error::Rejected(status)
+                .to_string()
+                .contains("sensitive-reflected-error")
+        );
         assert_eq!(
             server.writes(),
             vec![("PATCH".into(), CERTIFICATE_SECRET.into())]
         );
         assert!(!format!("{result:?}").contains("sensitive-reflected-error"));
     }
+}
+
+#[test]
+fn provider_never_accepts_an_unprivileged_socket_as_root_peer() {
+    let mut settings = config(8080);
+    settings.infisical_socket = "/run/missing-infisical-provider-peer.sock".into();
+    assert!(matches!(
+        Vault::new(&settings, &Secret::new(b"synthetic-identity".to_vec())),
+        Err(Error::Peer)
+    ));
 }
 
 #[tokio::test]

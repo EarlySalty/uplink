@@ -527,14 +527,14 @@ footer {
   var TEXT_MAX = 500;
 
   var letzteId = 0;
-  var generation = 0;
+  var generation = null;
   /* Verbindungen, die ohne einen einzigen Statusrahmen wieder zu waren.
      Der Server lehnt eine falsche Adresse vor dem Upgrade ab, der Browser
      meldet dafuer nur 1006; nach ein paar Versuchen zeigen wir das an. */
   var ohneStatus = 0;
   var OHNE_STATUS_MAX = 3;
   var statusGesehen = false;
-  var gesehen = {};
+  var gesehen = Object.create(null);
   var gesehenReihe = [];
   var MAX_ZEILEN = 300;
   var sock = null;
@@ -546,9 +546,11 @@ footer {
      stehen, aber keine davon leuchtet mehr gruen. */
   var letzterStand = [];
   var hatLive = false;
+  var sendeLaeuft = false;
+  var entwurfRevision = 0;
   /* Bits je Zuschauer, solange dieses Fenster offen ist. Mehr behauptet die
      Leiste auch nicht; der Hinweis dazu steht als Titel daran. */
-  var bitsJeWer = {};
+  var bitsJeWer = Object.create(null);
   // Karussell in der Leiste: je Kennzahl eine Karte fuer den laufenden Stream
   // und eine ueber alle Streams (GRILLME C4-A1). Die Bits-Bestenliste ist
   // eine Karte davon und keine eigene Leiste mehr.
@@ -1048,7 +1050,7 @@ footer {
 
   function bitsZaehlen(e) {
     if (e.art !== "cheer") return;
-    var key = e.dedupe_key || "";
+    var key = e.dedupe_key ? JSON.stringify(["activity", e.platform, e.channel_id, e.dedupe_key]) : "";
     if (key) {
       if (gesehen[key]) return;
       gesehen[key] = true;
@@ -1062,7 +1064,7 @@ footer {
   }
 
   function dedupeKey(n) {
-    return (n.platform || "") + ":" + (n.channel_id || "") + ":" + (n.message_id || "");
+    return JSON.stringify(["chat", n.platform || "", n.channel_id || "", n.message_id || ""]);
   }
 
   function anhaengen(rahmen) {
@@ -1076,19 +1078,46 @@ footer {
     var n = rahmen.ereignis;
     if (typeof rahmen.id === "number" && rahmen.id > letzteId) letzteId = rahmen.id;
     var key = dedupeKey(n);
-    if (gesehen[key]) return;
-    gesehen[key] = true;
-    gesehenReihe.push(key);
-    if (gesehenReihe.length > 2000) delete gesehen[gesehenReihe.shift()];
+    var vorher = gesehen[key];
+    var inhalt = JSON.stringify(n);
+    if (vorher && vorher.inhalt === inhalt) return;
+    // Plattformen können dieselbe Nachricht später ergänzen. Sie bleibt an
+    // ihrem Platz; ein erneut gelieferter identischer Stand erzeugt keine Zeile.
+    var zeile = zeileBauen(n);
+    gesehen[key] = { inhalt: inhalt, zeile: zeile };
+    if (!vorher) {
+      gesehenReihe.push(key);
+      if (gesehenReihe.length > 2000) delete gesehen[gesehenReihe.shift()];
+    }
     if (n.channel_login) kanalMerken(n.channel_login);
+    if (vorher) {
+      if (vorher.zeile && vorher.zeile.parentNode === liste) {
+        liste.replaceChild(zeile, vorher.zeile);
+        if (amEnde) liste.scrollTop = liste.scrollHeight;
+      }
+      return;
+    }
     if (leer) { leer.remove(); leer = null; }
-    liste.appendChild(zeileBauen(n));
+    liste.appendChild(zeile);
     while (liste.children.length > MAX_ZEILEN) liste.removeChild(liste.firstChild);
     if (amEnde) {
       liste.scrollTop = liste.scrollHeight;
     } else {
       untenKnopf.classList.add("da");
     }
+  }
+
+  function plattformHinweis(p) {
+    if (p.hinweis) return p.hinweis;
+    var texte = {
+      disconnected: "Nicht verbunden",
+      needs_reauth: "Bitte im Dashboard neu verbinden",
+      unavailable: "Verbindung ist nicht erreichbar",
+      connecting: "Verbindung wird aufgebaut",
+      connected: "Chat verbunden",
+      unsupported: "Chat ist noch nicht verfügbar"
+    };
+    return texte[p.zustand] || (p.verbunden ? "Chat verbunden" : "Chat nicht verbunden");
   }
 
   function pilleBauen(p) {
@@ -1099,7 +1128,8 @@ footer {
     var punkt = document.createElement("span");
     punkt.className = "punkt";
     span.appendChild(punkt);
-    span.title = p.verbunden ? "Stream läuft" : (p.hinweis || "Stream läuft gerade nicht");
+    span.title = plattformHinweis(p);
+    if (!p.verbunden) span.appendChild(document.createTextNode(" · " + span.title));
     return span;
   }
 
@@ -1107,7 +1137,10 @@ footer {
     /* Nur Plattformen, die der Streamer verbunden hat. `verbunden` faengt
        einen Server ab, der `eingerichtet` noch nicht schickt. */
     if (stand) letzterStand = stand;
-    var sichtbar = letzterStand.filter(function (p) { return p.eingerichtet || p.verbunden; });
+    var sichtbar = letzterStand.filter(function (p) {
+      if (p.zustand === "disconnected" && p.eingerichtet === false) return false;
+      return p.eingerichtet || p.verbunden || p.hinweis || (p.zustand && p.zustand !== "disconnected");
+    });
     if (!stand) {
       /* Kein frischer Stand: alles bleibt stehen, nichts ist mehr live. */
       sichtbar = sichtbar.map(function (p) {
@@ -1126,7 +1159,7 @@ footer {
     var live = sichtbar.filter(function (p) { return p.verbunden; });
     hatLive = live.length > 0;
     document.body.classList.toggle("mehrere", live.length > 1);
-    sendenKnopf.disabled = !hatLive;
+    sendenKnopf.disabled = sendeLaeuft || !hatLive;
     // Das Feld bleibt bedienbar. Ein `disabled` nimmt dem Streamer beim
     // naechsten Abriss den Fokus mitten im Satz, und ein Abriss kommt genau
     // dann, wenn der Chat voll laeuft.
@@ -1163,9 +1196,9 @@ footer {
         statusGesehen = true;
         ohneStatus = 0;
         lage("verbunden", "verbunden");
-        if (typeof daten.generation === "number" && daten.generation !== generation) {
-          /* Neuer Serverprozess, die Nummern zaehlen wieder ab 1. */
-          if (generation !== 0) letzteId = 0;
+        if (typeof daten.generation === "string" && /^[0-9a-f]{32}$/.test(daten.generation) && daten.generation !== generation) {
+          /* Neuer Ereignispuffer: Alte Nummern gelten nicht mehr. */
+          if (generation !== null) letzteId = 0;
           generation = daten.generation;
         }
         statusAnzeigen(daten.plattformen);
@@ -1224,8 +1257,11 @@ footer {
   }
 
   function senden() {
+    if (sendeLaeuft || !hatLive) return;
     var text = eingabe.value.trim();
     if (!text) return;
+    var gesendeteRevision = entwurfRevision;
+    sendeLaeuft = true;
     sendenKnopf.disabled = true;
     fetch(sendeUrl(), {
       method: "POST",
@@ -1235,10 +1271,14 @@ footer {
       return r.json().then(function (j) { return { status: r.status, json: j }; }, function () { return { status: r.status, json: {} }; });
     }).then(function (antwort) {
       if (antwort.status === 200) {
-        eingabe.value = "";
-        zaehlerZeigen();
-        setzeMeldung("");
-        (antwort.json.ergebnisse || []).forEach(function (e) {
+        var ergebnisse = antwort.json.ergebnisse || [];
+        var angenommen = ergebnisse.some(function (e) { return e.ok; });
+        if (angenommen && entwurfRevision === gesendeteRevision) {
+          eingabe.value = "";
+          zaehlerZeigen();
+        }
+        setzeMeldung(ergebnisse.length ? "" : "Keine Plattform hat die Nachricht bestätigt.");
+        ergebnisse.forEach(function (e) {
           if (e.ok) melden("Auf " + anzeige(e.platform) + " gesendet", "ok");
           else melden(e.hinweis || (anzeige(e.platform) + " hat nicht angenommen"), "schief");
         });
@@ -1251,6 +1291,7 @@ footer {
       setzeMeldung("Senden hat nicht geklappt, keine Verbindung");
     }).then(function () {
       /* Nur freigeben, wenn ueberhaupt noch eine Plattform live ist. */
+      sendeLaeuft = false;
       sendenKnopf.disabled = !hatLive;
       eingabe.focus();
     });
@@ -1262,7 +1303,7 @@ footer {
     zaehler.className = n >= TEXT_MAX ? "voll" : (n >= TEXT_MAX - 60 ? "nah" : "");
   }
 
-  eingabe.addEventListener("input", zaehlerZeigen);
+  eingabe.addEventListener("input", function () { entwurfRevision += 1; zaehlerZeigen(); });
   eingabe.addEventListener("keydown", function (ev) {
     if (ev.key !== "Enter" || ev.shiftKey) return;
     ev.preventDefault();

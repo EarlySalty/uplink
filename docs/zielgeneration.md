@@ -1,0 +1,17 @@
+# Zielgenerationen beim Verbinden und Trennen
+
+Der Bot reserviert jede neue Verbindung und jede Trennung mit einer dauerhaft monotonen Generation je Nutzer und Plattform. Twitch-, Kick- und YouTube-Callbacks schreiben Grant und Generation unter derselben UID-Sperre. Ein nach einer Trennung fortgesetzter alter OAuth-State bleibt ungültig, auch nach einer späteren neuen Verbindung. Token und Generation werden gemeinsam gelesen. Manuell eingegebene neue Schlüssel erhalten ebenfalls eine neue Generation; reine Profiländerungen verwenden die bestehende.
+
+PUT /v1/me/destinations enthält connection_generation je Ziel. Nur eine höhere Generation oder dieselbe noch offene Generation darf schreiben. DELETE /v1/me/destinations/{platform}?streamer_id=…&connection_generation=… benötigt eine positive Generation. Sein Tombstone bleibt nach dem Löschen bestehen. Alte DELETEs können neue Ziele ebenso wenig löschen wie alte PUTs sie wieder anlegen. Generationssperre und anschließende Zielmutation laufen als getrennte Statements derselben READ-COMMITTED-Transaktion. Dadurch sieht die Zielmutation auch einen Erst-INSERT, der während des Wartens auf den Fence committed wurde. Ein einziges datenänderndes CTE hätte hierfür einen veralteten Snapshot. Gemischte Batches mit einem überholten Eintrag werden vollständig zurückgerollt. Bestätigungen enthalten die tatsächlich akzeptierte Generation.
+
+Vor dem Fern-DELETE speichert der Bot disabled und disconnect_pending. Fehlende oder unvollständige Antworten bleiben im normalen Dashboard als trennung_offen sichtbar; derselbe Trennen-Knopf wiederholt dieselbe Generation. Der lokale Abschluss prüft die Generation erneut atomar unter der UID-Sperre. Eine inzwischen neue Verbindung wird weder deaktiviert noch ihr Grant gelöscht. Gemeinsame Twitch-Grants für Raid und Bot werden nicht widerrufen. Kick-/YouTube-Trennung entfernt nur die passende lokale Grant-Zeile; keine verzögerten Widerrufe oder pauschalen Kick-Abonnementlöschungen gegen eine neue Verbindung.
+
+## Datenbanken und Fristen
+
+Uplink: db/migrations/20260908_destination_fences.sql, relay.destination_fences. Bot: rust/migrations/20260908220000_uplink_target_generations.sql, bestehende Datenbank twitch_analytics. Kein verteilter Datenbank-Commit. Im Bot ist die Sperrreihenfolge Pool → UID → Zielgeneration → Grant; der Fern-DELETE läuft erst nach Commit, ohne gehaltene DB-Sperre. Reservierung und lokaler Abschluss haben jeweils 15 Sekunden Gesamtfrist. Der bestehende lokale HTTP-Client begrenzt Requests; Uplink behält seine serverseitigen Anfrage-, SQL- und Aufräumfristen. Unterbrochene SQL-Operationen werden zurückgerollt. Ein ungeklärter Fernabschluss wird nicht als Erfolg ausgegeben.
+
+## Upgrade und Rückfall
+
+Die Migrationen vor dem gekoppelten Dienst-/Bot-Release anwenden. Vorhandene Ziele und Grants ohne Generation gelten als Generation 0; Zugangsdaten werden dabei nicht umgeschrieben. Nach der ersten positiven Generation werden generationlose Alt-PUTs geschlossen abgewiesen. Unversionierte DELETEs werden immer abgewiesen. Die Tombstones wirken auch nach Neustart weiter.
+
+Generationstabellen, Sequenz und Tombstones bei einem Rückfall erhalten, niemals zurücksetzen oder löschen. Ein alter Relay-Binärstand ohne Generationsprüfung ist nur bei gesperrten Ziel-Schreibrouten ein sicherer Rückfall; eine vollständige Rückrollzusage bei aktivem Schreibzugang gibt es nicht. Ein zurückgerollter Bot kann bereits versionierte Ziele nicht mehr unversioniert ändern. Kein zweiter Tokenstore und keine neuen Secrets.

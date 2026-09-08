@@ -419,10 +419,14 @@ footer {
   var titelGeaendert = false;
   var kategorieGeaendert = false;
   var tagsGeaendert = false;
+  var revisionen = { titel: 0, kategorie: 0, tags: 0 };
+  var kategorieBearbeitung = false;
+  var speichernLaeuft = false;
+  var speicherBestaetigungen = [];
   var sucheTimer = null;
   var sucheLauf = 0;
   var letzteId = 0;
-  var generation = 0;
+  var generation = null;
   var sock = null;
   var wartezeit = 1000;
   var ohneStatus = 0;
@@ -455,6 +459,7 @@ footer {
   }
   function unsauberZeigen() {
     nichtGespeichert.classList.toggle("da", !!geaendert());
+    bestaetigungenAktualisieren();
   }
 
   function karteZeichnen() {
@@ -510,6 +515,8 @@ footer {
       kategorieZuschauer = null;
       kategorieId = null;
       kategorieGeaendert = false;
+      kategorieBearbeitung = true;
+      revisionen.kategorie += 1;
       karteZeichnen();
       unsauberZeigen();
       kategorie.value = "";
@@ -534,6 +541,7 @@ footer {
       weg.addEventListener("click", function () {
         tags.splice(i, 1);
         tagsGeaendert = true;
+        revisionen.tags += 1;
         tagsZeichnen();
         unsauberZeigen();
       });
@@ -562,6 +570,7 @@ footer {
     if (tags.some(function (x) { return x.toLowerCase() === t.toLowerCase(); })) { tagEingabe.value = ""; return; }
     tags.push(t);
     tagsGeaendert = true;
+    revisionen.tags += 1;
     tagEingabe.value = "";
     tagsZeichnen();
     unsauberZeigen();
@@ -573,14 +582,15 @@ footer {
     titelZaehler.className = "zaehler" + (n >= TITEL_MAX ? " voll" : (n >= TITEL_MAX - 20 ? " nah" : ""));
   }
 
-  function standUebernehmen(info, quelle) {
+  function standUebernehmen(info, quelle, angefragt) {
     if (!info) return;
-    if (quelle !== "live" || !titelGeaendert) {
+    function aktuell(feld) { return !angefragt || angefragt[feld] === revisionen[feld]; }
+    if (!titelGeaendert && aktuell("titel")) {
       titel.value = info.title || "";
       titelZaehlerZeigen();
       if (quelle === "live") titelGeaendert = false;
     }
-    if (quelle !== "live" || !kategorieGeaendert) {
+    if (!kategorieGeaendert && !kategorieBearbeitung && aktuell("kategorie")) {
       var vorherId = kategorieId;
       kategorieId = info.category_id || null;
       kategorieName = info.category_name || "";
@@ -600,7 +610,7 @@ footer {
       kategorie.value = "";
       karteZeichnen();
     }
-    if (quelle !== "live" && (!tagsGeaendert || quelle === "gespeichert")) {
+    if (quelle !== "live" && !tagsGeaendert && aktuell("tags")) {
       tags = (info.tags || []).slice(0, TAGS_MAX);
       tagsGeaendert = false;
       tagsZeichnen();
@@ -608,8 +618,20 @@ footer {
     unsauberZeigen();
   }
 
-  function ergebnisZeichnen(liste, wasOk) {
+  function bestaetigungenAktualisieren() {
+    speicherBestaetigungen.forEach(function (b) {
+      var vorherigerStand = Object.keys(b.revisionen).some(function (feld) {
+        return b.revisionen[feld] !== revisionen[feld];
+      });
+      b.text.textContent = vorherigerStand
+        ? "Vorheriger Stand auf " + anzeige(b.platform) + " gespeichert" + (b.hinweis ? " · " + b.hinweis : "")
+        : (b.hinweis || ("Auf " + anzeige(b.platform) + " gespeichert"));
+    });
+  }
+
+  function ergebnisZeichnen(liste, wasOk, gesendet) {
     ergebnis.textContent = "";
+    speicherBestaetigungen = [];
     if (!liste || !liste.length) return;
     liste.forEach(function (e, i) {
       var zeile = document.createElement("div");
@@ -630,12 +652,17 @@ footer {
       text.textContent = e.ok
         ? (e.hinweis || ("Auf " + anzeige(e.platform) + " " + wasOk))
         : (e.hinweis || ("Auf " + anzeige(e.platform) + " hat es nicht geklappt"));
+      if (e.ok && wasOk === "gespeichert" && gesendet) {
+        speicherBestaetigungen.push({ text: text, platform: e.platform, hinweis: e.hinweis, revisionen: gesendet });
+      }
       zeile.appendChild(text);
       ergebnis.appendChild(zeile);
     });
+    bestaetigungenAktualisieren();
   }
 
   function laden() {
+    var angefragt = Object.assign({}, revisionen);
     fetch(api("/v1/stream-info"), { headers: kopf() }).then(function (r) {
       if (r.status === 401) {
         setzeMeldung("Diese Adresse gilt nicht mehr. Im Dashboard unter Uplink eine neue erzeugen.", true);
@@ -647,7 +674,7 @@ footer {
       if (!j) return;
       var liste = j.ergebnisse || [];
       var erste = liste.filter(function (e) { return e.ok && e.info; })[0];
-      standUebernehmen(erste ? erste.info : null, "geladen");
+      standUebernehmen(erste ? erste.info : null, "geladen", angefragt);
       /* Beim Lesen nur zeigen, was schiefging. Ein Erfolg steht schon in den
          Feldern. */
       var schief = liste.filter(function (e) { return !e.ok; });
@@ -658,8 +685,7 @@ footer {
     });
   }
 
-  function suchen(q) {
-    var lauf = ++sucheLauf;
+  function suchen(q, lauf) {
     fetch(api("/v1/stream-info/kategorien?q=" + encodeURIComponent(q)), { headers: kopf() })
       .then(function (r) {
         /* Eine leere Liste heisst "gibt es nicht". Wer zu schnell getippt hat,
@@ -707,6 +733,9 @@ footer {
               kategorieBild = k.bild || null;
               kategorieZuschauer = typeof k.zuschauer === "number" ? k.zuschauer : null;
               kategorieGeaendert = true;
+              kategorieBearbeitung = false;
+              revisionen.kategorie += 1;
+              sucheLauf += 1;
               kategorie.value = "";
               vorschlaege.style.display = "none";
               karteZeichnen();
@@ -721,6 +750,7 @@ footer {
   }
 
   function speichernLage(laedt) {
+    speichernLaeuft = laedt;
     speichern.textContent = "";
     if (laedt) {
       var kringel = document.createElement("span");
@@ -734,11 +764,13 @@ footer {
   }
 
   function speichernKlick() {
+    if (speichernLaeuft || speichern.disabled) return;
     var patch = {};
     if (titelGeaendert) patch.title = titel.value.replace(/[\r\n]+/g, " ").trim();
     if (kategorieGeaendert && kategorieId) patch.category_id = kategorieId;
     if (tagsGeaendert) patch.tags = tags.slice();
     if (!Object.keys(patch).length) { setzeMeldung("Nichts geändert"); return; }
+    var gesendet = Object.assign({}, revisionen);
     speichernLage(true);
     setzeMeldung("");
     fetch(api("/v1/stream-info"), { method: "PUT", headers: kopf(), body: JSON.stringify(patch) })
@@ -746,18 +778,20 @@ footer {
       .then(function (a) {
         if (a.status === 200) {
           var liste = a.json.ergebnisse || [];
-          ergebnisZeichnen(liste, "gespeichert");
-          /* Gespeichert ist gespeichert, auch wenn der Stand danach nicht
-             lesbar war. Ohne diese Trennung stand gleichzeitig "Gespeichert"
-             und die Marke "nicht gespeichert" auf dem Schirm. */
+          ergebnisZeichnen(liste, "gespeichert", gesendet);
+          // Nur bestätigte, seit dem Klick unveränderte Felder sind sauber.
+          // Bei Teilerfolg bleiben die Wünsche für einen erneuten Versuch stehen.
           var etwasOk = liste.some(function (e) { return e.ok; });
-          if (etwasOk) {
-            titelGeaendert = false; kategorieGeaendert = false; tagsGeaendert = false;
+          var allesOk = liste.length > 0 && liste.every(function (e) { return e.ok; });
+          if (allesOk) {
+            if ("title" in patch && gesendet.titel === revisionen.titel) titelGeaendert = false;
+            if ("category_id" in patch && gesendet.kategorie === revisionen.kategorie) kategorieGeaendert = false;
+            if ("tags" in patch && gesendet.tags === revisionen.tags) tagsGeaendert = false;
           }
           var erste = liste.filter(function (e) { return e.ok && e.info; })[0];
           if (erste) {
-            standUebernehmen(erste.info, "gespeichert");
-          } else if (etwasOk) {
+            standUebernehmen(erste.info, "gespeichert", gesendet);
+          } else if (etwasOk && !kategorieGeaendert && gesendet.kategorie === revisionen.kategorie) {
             /* Gespeichert, aber der Stand danach war nicht lesbar. Die Zahl aus
                der Kategoriesuche gilt trotzdem nicht mehr, sonst bliebe sie ohne
                das Neuzeichnen auf der Karte stehen. */
@@ -781,6 +815,19 @@ footer {
     return proto + "//" + location.host + basis() + "/v1/chat/ws?t=" + encodeURIComponent(token) + "&arten=info&seit=" + letzteId + (generation ? "&gen=" + generation : "");
   }
 
+  function plattformHinweis(p) {
+    if (p.hinweis) return p.hinweis;
+    var texte = {
+      disconnected: "Nicht verbunden",
+      needs_reauth: "Bitte im Dashboard neu verbinden",
+      unavailable: "Verbindung ist nicht erreichbar",
+      connecting: "Verbindung wird aufgebaut",
+      connected: "Chat verbunden",
+      unsupported: "Chat ist noch nicht verfügbar"
+    };
+    return texte[p.zustand] || (p.verbunden ? "Chat verbunden" : "Chat nicht verbunden");
+  }
+
   function pilleBauen(p) {
     var span = document.createElement("span");
     span.className = "pille" + (p.verbunden ? " live" : "");
@@ -789,18 +836,21 @@ footer {
     var punkt = document.createElement("span");
     punkt.className = "punkt";
     span.appendChild(punkt);
-    /* Speichern geht auch ohne laufenden Stream. Der Punkt sagt nur, ob
-       gerade gesendet wird, nicht ob das Fenster arbeitet. */
-    span.title = p.verbunden ? "Stream läuft" : "Verbunden, Stream läuft gerade nicht";
+    // Der Adapterstatus bestätigt keine laufende öffentliche Liveausgabe.
+    span.title = plattformHinweis(p);
+    if (!p.verbunden) span.appendChild(document.createTextNode(" · " + span.title));
     return span;
   }
 
   function statusAnzeigen(stand) {
     if (stand) letzterStand = stand;
-    var sichtbar = letzterStand.filter(function (p) { return p.eingerichtet || p.verbunden; });
+    var sichtbar = letzterStand.filter(function (p) {
+      if (p.zustand === "disconnected" && p.eingerichtet === false) return false;
+      return p.eingerichtet || p.verbunden || p.hinweis || (p.zustand && p.zustand !== "disconnected");
+    });
     if (!stand) {
       sichtbar = sichtbar.map(function (p) {
-        return { platform: p.platform, eingerichtet: true, verbunden: false };
+        return { platform: p.platform, eingerichtet: true, verbunden: false, hinweis: "Verbindung zu Uplink kommt gerade zurück" };
       });
     }
     plattformen.textContent = "";
@@ -825,8 +875,8 @@ footer {
         statusGesehen = true;
         ohneStatus = 0;
         lage("verbunden", "verbunden");
-        if (typeof daten.generation === "number" && daten.generation !== generation) {
-          if (generation !== 0) letzteId = 0;
+        if (typeof daten.generation === "string" && /^[0-9a-f]{32}$/.test(daten.generation) && daten.generation !== generation) {
+          if (generation !== null) letzteId = 0;
           generation = daten.generation;
         }
         statusAnzeigen(daten.plattformen);
@@ -873,15 +923,19 @@ footer {
     wartezeit = Math.min(wartezeit * 2, 30000);
   }
 
-  titel.addEventListener("input", function () { titelGeaendert = true; titelZaehlerZeigen(); unsauberZeigen(); });
+  titel.addEventListener("input", function () { titelGeaendert = true; revisionen.titel += 1; titelZaehlerZeigen(); unsauberZeigen(); });
   /* Enter im Titel speichert nicht: sonst geht ein Titel raus, den der
      Streamer nur zu Ende tippen wollte. */
   titel.addEventListener("keydown", function (ev) { if (ev.key === "Enter") ev.preventDefault(); });
   kategorie.addEventListener("input", function () {
     clearTimeout(sucheTimer);
+    var lauf = ++sucheLauf;
+    kategorieBearbeitung = true;
+    vorschlaege.textContent = "";
+    vorschlaege.style.display = "none";
     var q = kategorie.value.trim();
-    if (q.length < 2) { vorschlaege.style.display = "none"; return; }
-    sucheTimer = setTimeout(function () { suchen(q); }, 300);
+    if (q.length < 2) return;
+    sucheTimer = setTimeout(function () { suchen(q, lauf); }, 300);
   });
   kategorie.addEventListener("blur", function () { setTimeout(function () { vorschlaege.style.display = "none"; }, 150); });
   tagEingabe.addEventListener("keydown", function (ev) {

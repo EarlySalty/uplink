@@ -124,16 +124,20 @@ async fn fetch_with_token(config: &Config, token: &Secret) -> Result<ServiceSecr
     let token = std::str::from_utf8(token.expose())
         .map_err(|_| "Infisical-Zugang ist ungültig.")?
         .trim();
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(config.request_timeout_seconds))
-        .no_proxy()
-        .build()
-        .map_err(|_| "HTTP-Client ist nicht verfügbar.")?;
+    if config.infisical.base_url != uplink_infisical_transport::BASE_URL {
+        return Err("Infisical benötigt die geschützte Unix-Gegenstelle.");
+    }
+    let client = uplink_infisical_transport::client_builder(
+        &config.infisical.socket_path,
+        config.infisical.socket_owner_uid,
+    )?
+    .timeout(Duration::from_secs(config.request_timeout_seconds))
+    .build()
+    .map_err(|_| "HTTP-Client ist nicht verfügbar.")?;
     let mut response = client
         .get(format!(
             "{}/api/v4/secrets/",
-            config.infisical.base_url.trim_end_matches('/')
+            uplink_infisical_transport::BASE_URL
         ))
         .query(&[
             ("projectId", config.infisical.project_id.as_str()),
@@ -148,7 +152,7 @@ async fn fetch_with_token(config: &Config, token: &Secret) -> Result<ServiceSecr
         .await
         .map_err(|_| "Infisical ist nicht erreichbar.")?;
     if !response.status().is_success() {
-        return Err("Infisical hat den Zugriff abgewiesen.");
+        return Err(response_failure(response.status().as_u16()));
     }
     let mut body = Zeroizing::new(Vec::new());
     while let Some(chunk) = response
@@ -207,14 +211,28 @@ async fn fetch_with_token(config: &Config, token: &Secret) -> Result<ServiceSecr
     } else {
         None
     };
+    let api = take("RS_RELAY_API_SECRET")?;
+    let admin = take("RS_RELAY_ADMIN_SECRET")?;
+    if api.matches(admin.expose()) {
+        return Err("API- und Adminzugang müssen verschieden sein. Start abgebrochen.");
+    }
     Ok(ServiceSecrets {
-        api: take("RS_RELAY_API_SECRET")?,
-        admin: take("RS_RELAY_ADMIN_SECRET")?,
+        api,
+        admin,
         encryption,
         database: take("RS_RELAY_DATABASE_URL")?,
         bot_internal: take("RS_RELAY_BOT_INTERNAL_TOKEN")?,
         tls_material,
     })
+}
+
+fn response_failure(status: u16) -> &'static str {
+    match status {
+        401 | 403 => "Infisical hat den Zugriff abgewiesen.",
+        429 => "Infisical begrenzt derzeit die Anfragen.",
+        408 | 500..=599 => "Infisical ist vorübergehend gestört.",
+        _ => "Infisical-Anfrage oder Endpunkt ist ungültig.",
+    }
 }
 
 fn decode_encryption_key(encoded: Secret) -> Result<Secret, &'static str> {
@@ -288,6 +306,30 @@ pub async fn tls(
 mod tests {
     use super::*;
     use base64::{Engine, engine::general_purpose::STANDARD};
+
+    #[test]
+    fn infisical_failures_distinguish_access_service_and_rate_limit() {
+        assert_eq!(
+            response_failure(401),
+            "Infisical hat den Zugriff abgewiesen."
+        );
+        assert_eq!(
+            response_failure(403),
+            "Infisical hat den Zugriff abgewiesen."
+        );
+        assert_eq!(
+            response_failure(503),
+            "Infisical ist vorübergehend gestört."
+        );
+        assert_eq!(
+            response_failure(429),
+            "Infisical begrenzt derzeit die Anfragen."
+        );
+        assert_eq!(
+            response_failure(404),
+            "Infisical-Anfrage oder Endpunkt ist ungültig."
+        );
+    }
 
     #[test]
     fn existing_base64_key_preserves_exact_bytes_and_optional_padding() {

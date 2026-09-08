@@ -125,7 +125,7 @@ impl ChunkReader {
     pub fn update_max_chunk_size(&mut self, chunk_size: usize) -> bool {
         // We need to make sure that the chunk size is within the allowed range.
         // Returning false here should close the connection.
-        if !(INIT_CHUNK_SIZE..=self.limits.max_chunk_size).contains(&chunk_size) {
+        if !(1..=self.limits.max_chunk_size).contains(&chunk_size) {
             false
         } else {
             self.max_chunk_size = chunk_size;
@@ -753,6 +753,27 @@ mod tests {
     fn test_reader_chunk_size_out_of_bounds() {
         let mut reader = ChunkReader::default();
         assert!(!reader.update_max_chunk_size(MAX_CHUNK_SIZE + 1));
+    }
+
+    #[test]
+    fn negotiated_small_chunks_reassemble_a_message() {
+        for size in [1, 7, 64, 127] {
+            let mut reader = ChunkReader::default();
+            assert!(reader.update_max_chunk_size(size));
+            let body = vec![0x5a; 257];
+            let mut wire = BytesMut::from(&[3, 0, 0, 0, 0, 1, 1, 9, 1, 0, 0, 0][..]);
+            for (index, part) in body.chunks(size).enumerate() {
+                if index > 0 {
+                    wire.extend_from_slice(&[0xc3]);
+                }
+                wire.extend_from_slice(part);
+            }
+            let chunk = reader.read_chunk(&mut wire).unwrap().unwrap();
+            assert_eq!(chunk.payload.as_ref(), body);
+            assert!(wire.is_empty());
+            assert!(!reader.update_max_chunk_size(0));
+            assert!(!reader.update_max_chunk_size(MAX_CHUNK_SIZE + 1));
+        }
     }
 
     #[test]

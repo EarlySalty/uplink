@@ -43,6 +43,14 @@ Eine vollständige Session mit wartendem Peer scheiterte zuvor in Debug/Release
 und besteht nach dem Fix; Fenstervergrößerung, Null-Abweisung, mehrfacher Wechsel
 und Wire-Zähler-Wrap sind ebenfalls geprüft.
 
+GitHub-Nachreview vom 8. September 2026: `chunk/reader.rs` akzeptiert
+ausgehandelte Chunkgrößen von 1 bis zur konfigurierten Obergrenze; 128 bleibt
+der Startwert, entsprechend RTMP 5.4.1. `command_messages/netconnection/mod.rs`
+ordnet das E-RTMP-Drahtfeld `capsEx` explizit dem typisierten Feld zu.
+Die Regressionen lesen echte fragmentierte Chunks beziehungsweise eine
+AMF-kodierte Connect-Nachricht. Damit enthält auch
+`command_messages/netconnection/reader.rs` einen ergänzten semantischen Test.
+
 Die Bibliothek allein ist weder eine öffentlich freigegebene Ingest-Schnittstelle
 noch eine Codec-, OBS-, Twitch- oder Plattformfreigabe. Die aufrufende Anwendung
 verantwortet TLS, Autorisierung, Sessionanzahl, Medienkopien und Eventbudgets.

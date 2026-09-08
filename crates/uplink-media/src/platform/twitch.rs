@@ -24,9 +24,10 @@ pub enum GoLiveError {
     UnsupportedEncoder,
     UnsupportedAudioMapping,
 }
-impl fmt::Display for GoLiveError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
+impl GoLiveError {
+    /// Feste Diagnose ohne Anbietertext, Zugang oder Antwortkörper.
+    pub fn message(self) -> &'static str {
+        match self {
             Self::InvalidRequest => "Twitch-Anfrage passt nicht zu den gemessenen Fähigkeiten",
             Self::Transport => "Twitch-Konfiguration ist vorübergehend nicht erreichbar",
             Self::HttpRejected => "Twitch hat die Konfigurationsanfrage abgelehnt",
@@ -43,7 +44,12 @@ impl fmt::Display for GoLiveError {
             Self::UnsupportedAudioMapping => {
                 "Die von Twitch geforderte Audiozuordnung ist nicht nachgewiesen"
             }
-        })
+        }
+    }
+}
+impl fmt::Display for GoLiveError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.message())
     }
 }
 impl std::error::Error for GoLiveError {}
@@ -229,12 +235,7 @@ impl GoLiveClient {
         allowed_ingest_hosts: &[String],
     ) -> Result<TwitchConfiguration> {
         let capabilities = RequestCapabilities::from_measurement(hardware)?;
-        let codecs: Vec<_> = hardware
-            .encoders
-            .iter()
-            .filter(|probe| probe.initialized)
-            .map(|probe| probe.codec)
-            .collect();
+        let codecs = configurable_codecs(&hardware.encoders);
         let body = request_body(authentication, &capabilities, preferences, &codecs)?;
         let response = self
             .http
@@ -446,6 +447,19 @@ struct ClientDescription {
     version: &'static str,
     supported_codecs: Vec<&'static str>,
 }
+fn configurable_codecs(probes: &[super::hardware::EncoderProbe]) -> Vec<Codec> {
+    // configure must request only the concrete obs_x264 -> libx264 mapping.
+    // The read-only probe deliberately keeps measuring all available codecs.
+    if probes
+        .iter()
+        .any(|probe| probe.initialized && probe.codec == Codec::H264 && probe.encoder == "libx264")
+    {
+        vec![Codec::H264]
+    } else {
+        Vec::new()
+    }
+}
+
 fn request_body(
     authentication: &PublishSecret,
     capabilities: &RequestCapabilities,
@@ -772,13 +786,22 @@ fn parse_configuration(
         .authentication
         .filter(|s| !s.is_empty())
         .unwrap_or(original);
-    let (key, _) = active.split_once('?').unwrap_or((active, ""));
+    let (key, active_query) = active.split_once('?').unwrap_or((active, ""));
     let mut query_builder = url::form_urlencoded::Serializer::new(String::new());
-    for (key, value) in url::form_urlencoded::parse(query.as_bytes()).chain(
-        url::form_urlencoded::parse(original.split_once('?').map_or("", |(_, q)| q).as_bytes()),
-    ) {
+    let original_query = original.split_once('?').map_or("", |(_, q)| q);
+    let mut seen = std::collections::BTreeMap::new();
+    for (key, value) in url::form_urlencoded::parse(query.as_bytes())
+        .chain(url::form_urlencoded::parse(original_query.as_bytes()))
+        .chain(url::form_urlencoded::parse(active_query.as_bytes()))
+    {
         if key == "clientConfigId" {
             return Err(GoLiveError::InvalidResponse);
+        }
+        if let Some(previous) = seen.insert(key.clone(), value.clone()) {
+            if previous != value {
+                return Err(GoLiveError::InvalidResponse);
+            }
+            continue;
         }
         query_builder.append_pair(&key, &value);
     }
@@ -866,6 +889,94 @@ mod tests {
         ] {
             assert!(!debug.contains(secret));
         }
+    }
+
+    #[test]
+    fn temporary_authentication_keeps_its_own_query() {
+        let bytes = String::from_utf8(response())
+            .unwrap()
+            .replace(
+                "synthetic-temporary\"",
+                "synthetic-temporary?temporary=one%2Btwo&flag=active\"",
+            )
+            .replace("/{stream_key}\"", "/{stream_key}?endpoint=yes\"");
+        let configuration = parse_configuration(
+            bytes.as_bytes(),
+            &preferences(),
+            &PublishSecret::new(b"synthetic-original?old=discarded&bandwidthtest=true".to_vec())
+                .unwrap(),
+            &["test.example".into()],
+            &[Codec::H264],
+        )
+        .unwrap();
+        let path = std::str::from_utf8(configuration.target.playpath.expose_for_pipe()).unwrap();
+        assert!(path.contains("temporary=one%2Btwo"));
+        assert!(path.contains("flag=active"));
+        assert!(path.contains("endpoint=yes"));
+        assert!(path.contains("bandwidthtest=true"));
+        assert!(path.contains("old=discarded"));
+        assert!(path.ends_with("clientConfigId=synthetic-config"));
+    }
+
+    #[test]
+    fn conflicting_or_reserved_temporary_auth_queries_are_rejected() {
+        for suffix in ["?bandwidthtest=false", "?clientConfigId=foreign"] {
+            let bytes = String::from_utf8(response()).unwrap().replace(
+                "synthetic-temporary\"",
+                &format!("synthetic-temporary{suffix}\""),
+            );
+            assert_eq!(
+                parse_configuration(
+                    bytes.as_bytes(),
+                    &preferences(),
+                    &PublishSecret::new(b"synthetic-original?bandwidthtest=true".to_vec()).unwrap(),
+                    &["test.example".into()],
+                    &[Codec::H264],
+                )
+                .unwrap_err(),
+                GoLiveError::InvalidResponse
+            );
+        }
+    }
+
+    #[test]
+    fn probe_error_messages_keep_distinct_static_causes() {
+        let errors = [
+            GoLiveError::InvalidRequest,
+            GoLiveError::Transport,
+            GoLiveError::ResponseTooLarge,
+            GoLiveError::InvalidResponse,
+        ];
+        let messages: std::collections::HashSet<_> =
+            errors.iter().map(|error| error.message()).collect();
+        assert_eq!(messages.len(), errors.len());
+        for error in errors {
+            assert_eq!(error.to_string(), error.message());
+        }
+    }
+
+    #[test]
+    fn configure_advertises_only_the_proven_encoder_translation() {
+        use super::super::hardware::EncoderProbe;
+        let probes = vec![
+            EncoderProbe {
+                codec: Codec::H264,
+                encoder: "libx264".into(),
+                initialized: true,
+            },
+            EncoderProbe {
+                codec: Codec::Hevc,
+                encoder: "libx265".into(),
+                initialized: true,
+            },
+            EncoderProbe {
+                codec: Codec::Av1,
+                encoder: "libsvtav1".into(),
+                initialized: true,
+            },
+        ];
+        assert_eq!(configurable_codecs(&probes), vec![Codec::H264]);
+        assert!(configurable_codecs(&probes[1..]).is_empty());
     }
     #[test]
     fn malformed_unsupported_or_foreign_config_is_not_publishable() {

@@ -1,6 +1,7 @@
 [Unit]
 Description=Uplink-Zertifikat aus Caddy nach Infisical übernehmen
-After=network.target caddy.service
+After=network.target caddy.service infisical-bridge.service
+Requires=infisical-bridge.service
 
 [Service]
 Type=oneshot

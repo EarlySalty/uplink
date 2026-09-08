@@ -1,0 +1,43 @@
+# Normaler Streamingbetrieb
+
+Der vorbereitete normale Anschluss verwendet dieselbe User-Unit `rs-relay.service`, API `127.0.0.1:8891` und ausschließlich `rtmps://deutsche-deadlock-community.de:1935/live`. OBS erhält Server und vorhandenen privaten Schlüssel getrennt aus dem bestehenden Dashboard. Keine zusätzliche Testunit oder Nutzer-Testadresse. Es wurde noch nicht umgeschaltet.
+
+Unmittelbar vor dem Wechsel werden die aktiven Sessions des bisherigen Dienstes erneut nur als Zähler/Status geprüft. Laufende Nutzersessions werden nicht ungeprüft durch einen Neustart unterbrochen. Bei bestätigtem Offlinezustand wechseln Dashboardkonfiguration, normale RTMPS-Adresse, Firewallregel und derselbe Dienst gemeinsam. Es werden keine Zugangsdaten zur Bestandsprüfung ausgegeben.
+
+`deployment/uplink.toml` enthält die bestehende Infisical-Projektidentität und FD 5, TLS-Namen, private Laufzeitablage und unabhängige FFmpeg-/FFprobe-Pfade unter `/opt/uplink/media/ffmpeg8-c733b4b2/`. Die vier HTML-Docks sind mittels `include_str!` im Dienstbinary eingebunden; es gibt keine Laufzeit-Assetabhängigkeit zum alten Repository. Der Dashboardprozess verwendet seine eigene Credential aus `/run/credentials/deadlock-twitch-dashboard-rust.service/infisical-token`, FD 9 und `/etc/deadlock-twitch/uplink.json`; die gewöhnliche Vorlage liegt im Bot-Repo unter `rust/deployment/uplink.json.example`.
+
+Die Ausgangshosts wurden am 8. September ausschließlich als `scheme/host/port` aus dem autorisierten Bestand gelesen. Sie werden exakt freigegeben. Nur der alte Twitch-Default `rtmp://live.twitch.tv/app` wird auf den [offiziellen sicheren Default](https://ingest.twitch.tv/ingests) `rtmps://ingest.global-contribute.live-video.net:443/app` abgebildet. Der gespeicherte Wert und der vollständige Schlüssel bleiben unverändert. Fremde/regionale/manuelle URLs werden nicht umgeschrieben. Ein TLS-Handshake mit vertrauenswürdigem Zertifikat ist kein Publikationsnachweis.
+
+`prepare-release.sh /absolutes/uplink-service /neues/paket` prüft die normale Konfiguration, die beiden bekannten Medienbinary-SHA256-Werte und die erforderliche Fence-Migration. Es kopiert Binary, Launcher, gewöhnliche Konfiguration, Unitoverride und additive Migrationen in ein neues Paket mit Prüfsummen. Es aktiviert nichts. Das Paket verlangt den integrierten Fencing-Stand; ein Branch ohne dessen Migration scheitert ausdrücklich. Vor Umschalten: Relay-Fence-Migration `20260908_destination_fences.sql` und Bot-Migrationen für Uplink-Intent sowie `20260908220000_uplink_target_generations.sql` anwenden. Beim Rückfall bleiben Sequenz und Tombstones erhalten; ein alter Relay ohne Fence-Prüfung darf nur mit gesperrten Ziel-Schreibrouten laufen.
+
+Die normale API liefert den tatsächlich beobachteten Eingang getrennt vom laufenden Encoderprofil. `active_profile.profile_origin=running_graph` bedeutet: Maße, Bildrate, Codec und **Zielbitrate** aus dem verwendeten Encodergraph. Es ist keine unabhängig gemessene Ausgangsbitrate. Vor Medienversand, bei Fehler und nach Ende bleibt `active_profile=null`; mehrspurige Programme bleiben im vollständigen `session.outputs.graph` sichtbar. `publication_confirmed` bleibt ohne Plattformnachweis false.
+
+Lokaler gekoppelter Nachweis:
+
+```sh
+cargo test -j2 -p uplink-service --test normalbetrieb normal_coordinator -- --ignored --nocapture
+```
+
+Er benötigt PostgreSQL 16 und genau die unabhängig installierten FFmpeg-8-Binaries. Er startet denselben Coordinator und dieselben HTTP-/RTMPS-Routen auf isoliertem Loopback mit eigener öffentlicher Test-CA, privaten Testschlüsseln nur im RAM und synthetischer PostgreSQL-Datenbank. Ein fehlkonfiguriertes Ziel steht neben einem gesunden Ausgang: H.264 320×180/25 → H.264 256×144/25, 50 Videoframes, je 95 AAC-Pakete für Live und VOD. Beide Audio-Payloads und Zeitstempel werden exakt gegen das versionierte Referenzmanifest geprüft. API: erkannte Quelle, laufender Graph, separate Zielfehler, keine behauptete Veröffentlichung, ausdrückliches Streamende und anschließend kein aktives Profil. Der frühere sofortige Coordinator-Abbruch wurde damit rot reproduziert; nach der Zielisolation grün. Der vorhandene CI-Workflow beschafft den fest gepinnten FFmpeg-8-Build über HTTPS, prüft Archiv- und Binary-SHA256 und führt alle vier Normalbetriebsproben ausdrücklich aus. Download, Extraktion und Hashabgleich wurden zusätzlich lokal gegen die veröffentlichte Quelle geprüft; fehlende Werkzeuge oder Abweichungen scheitern sichtbar.
+
+GoLive-/1440p-Freigabe, persistente logische Wiederverbindung, Wartebild, Delay und gespeicherte Layoutsteuerung bleiben offen. Der aktuelle normale Coordinator verwendet die vorhandene echte Einvideo-Verarbeitung mit expliziter AAC-Zuordnung. Diese erste normale Strecke ist kein Vierplattform-Live- oder Kapazitätsnachweis.
+
+Die ausdrücklich gespeicherte Twitch-Audiowahl ist `twitch_audio_mode=live|separate_vod`. NULL behält die vorhandene Instanzregel. Ausgelassene PUT-Felder erhalten die aktuelle Wahl auch bei konkurrierenden Änderungen. Live braucht nur den Live-Feed; separat verlangt einen anderen Feed. Fehlt dieser, hält ausschließlich der betroffene Ausgang an. Vier echte lokale Normalbetriebsfälle prüfen Ein-AAC-Live, getrennte Zwei-AAC-Ausgabe, fehlenden VOD-Feed neben gesundem Ziel und die vorherige gekoppelte Strecke. `active_audio_mode` beschreibt ausschließlich den lokalen sendenden Graph, keine Plattformverarbeitung.
+
+Die Migration wird vor dem gemeinsamen Wechsel mit dem **neuen** Releasebinary ausgeführt. Beide Programme lesen ausschließlich den vorhandenen FD und beenden sich ohne Listener:
+
+```sh
+# Als Besitzer der bestehenden User-Unit-Credential; nur FD öffnen.
+exec 5< /run/user/1000/credentials/rs-relay.service/infisical-token
+/opt/uplink/RELEASE/bin/uplink-service --config /home/nathanael/.config/uplink/uplink.toml --migrate
+```
+
+```sh
+# Als Besitzer der bestehenden Dashboard-Systemunit-Credential.
+exec 9< /run/credentials/deadlock-twitch-dashboard-rust.service/infisical-token
+/opt/deadlock/twitch/RELEASE/rust/target/release/tb-dashboard --uplink-config /etc/deadlock-twitch/uplink.json --uplink-migrate
+```
+
+`RELEASE` wird durch den geprüften neuen Paketpfad ersetzt, nicht durch den noch alten current-Link. Relay führt nur die eingebetteten Fence-/Audio-Migrationen mit Transaktionssperre und SHA256-Ledger aus; Bot verwendet für Intent/Generation die bestehenden SQLx-Versionen, Prüfsummen und Sperren. Wiederholung ist zulässig, Prüfsummenabweichung fatal. Der reguläre vollständige Bot-Migrator bleibt unverändert. Der Bot-Migrationszugang heißt im bestehenden Infisical-Vertrag `TWITCH_ANALYTICS_DSN`. Weder DSN noch Zugangsinhalte stehen in Argumenten oder erzeugten Dateien.
+
+Der gekoppelte Bot-Build muss **tb-bot und tb-dashboard** aus demselben endgültig integrierten Stand enthalten (`cargo build --release --locked -j2 -p tb-bot -p tb-dashboard`). Als Overlay für ein vollständiges normales Release paketiert `rust/scripts/prepare_uplink_release.sh /absolutes/cargo-release /neues/paket` beide Binaries, beide vorhandenen Launcher und das neu gebaute Dashboard in deren vorhandene Pfade. Das Overlay ersetzt nicht die übrigen Dateien eines vollständigen Bot-Releases. Der neue AuthWriter betrifft beide System-Units: `deadlock-twitch-bot-rust` und `deadlock-twitch-dashboard-rust`. Beide werden zusammen mit der bestehenden Relay-User-Unit auf den kompatiblen Stand gebracht; bestehende andere Änderungen dürfen dabei nicht zurückgenommen werden. Paketierung allein behauptet keine Freigabe oder Umschaltung.

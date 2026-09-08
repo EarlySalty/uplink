@@ -1,6 +1,121 @@
 use uplink_service::{config::Config, crypto::Secret, registry::Registry};
 
 #[test]
+fn advertised_dock_addresses_require_an_usable_public_origin() {
+    let example = include_str!("../../../config/uplink-beispiel.toml");
+    for address in [
+        "https://",
+        "https://user:password@example.invalid/uplink",
+        "https://example.invalid/uplink?token=unused",
+        "https://example.invalid/uplink#fragment",
+    ] {
+        let mut config: toml::Value = toml::from_str(example).unwrap();
+        config["dock_base_url"] = toml::Value::String(address.into());
+        assert!(
+            Config::parse(&toml::to_string(&config).unwrap()).is_err(),
+            "Ungültige Dockadresse darf keinen erfolgreichen Konfigurationscheck erhalten"
+        );
+    }
+}
+
+#[test]
+fn parser_allocations_are_part_of_the_global_ingest_budget() {
+    let mut config: toml::Value =
+        toml::from_str(include_str!("../../../config/uplink-beispiel.toml")).unwrap();
+    config["max_sessions"] = 64.into();
+    config["media"]["max_event_bytes"] = 0xff_ffff.into();
+    config["media"]["max_queued_bytes"] = (0xff_ffff + 15).into();
+    assert_eq!(
+        Config::parse(&toml::to_string(&config).unwrap()).err(),
+        Some("Parser und Medienpuffer überschreiten das gemeinsame Eingangsbudget."),
+        "Gültige Einzelpaketgrenzen dürfen das globale Parserbudget nicht umgehen"
+    );
+}
+
+#[test]
+fn root_only_destinations_have_no_publishable_app() {
+    for address in [
+        "rtmps://live.twitch.tv/",
+        "rtmps://live.twitch.tv",
+        "rtmp://example.invalid/",
+    ] {
+        assert!(uplink_service::destinations::public_endpoint(address).is_err());
+    }
+}
+
+#[test]
+fn media_engine_and_ingest_use_the_same_explicit_byte_and_event_limits() {
+    let mut config = Config::parse(include_str!("../../../config/uplink-beispiel.toml")).unwrap();
+    config.media.max_event_bytes = 4 * 1024 * 1024;
+    config.media.max_queued_bytes = 12 * 1024 * 1024;
+    config.media.max_queued_events = 1024;
+    let media = config.media_limits();
+    let ingest = config.ingest_limits().unwrap();
+    assert_eq!(media.max_tag_bytes, ingest.max_event_bytes);
+    assert_eq!(media.queue_bytes, ingest.max_queued_bytes);
+    assert_eq!(media.queue_events, ingest.max_queued_events);
+    assert_eq!(ingest.max_connections, config.max_sessions);
+    assert_eq!(
+        ingest.max_pending_connections,
+        config.max_pending_connections
+    );
+}
+
+fn assert_packet_limit_contract(tag_bytes: usize, queue_bytes: usize, accepted: bool) {
+    let mut input: toml::Value =
+        toml::from_str(include_str!("../../../config/uplink-beispiel.toml")).unwrap();
+    input["max_sessions"] = 1.into();
+    input["max_pending_connections"] = 1.into();
+    input["media"]["max_event_bytes"] = (tag_bytes as i64).into();
+    input["media"]["max_queued_bytes"] = (queue_bytes as i64).into();
+    let parsed = Config::parse(&toml::to_string(&input).unwrap());
+    assert_eq!(
+        parsed.is_ok(),
+        accepted,
+        "Paketgrenze {tag_bytes}, Queuegrenze {queue_bytes}"
+    );
+    if let Ok(config) = parsed {
+        let limits = config.media_limits();
+        assert_eq!(limits.max_tag_bytes, tag_bytes);
+        assert_eq!(
+            limits.queue_bytes, queue_bytes,
+            "Keine stille Budgeterhöhung"
+        );
+        let ingest = config.ingest_limits().unwrap();
+        assert_eq!(ingest.max_event_bytes, tag_bytes);
+        assert_eq!(ingest.max_queued_bytes, queue_bytes);
+        ingest.rtmp.validate().unwrap();
+        // Der Konstruktor startet keine Prozesse. Ein vorhandenes Testbinary
+        // genügt für seine Dateiprüfung; kein lokaler FFmpeg-Pfad ist nötig.
+        let executable = std::env::current_exe().unwrap();
+        assert!(
+            uplink_media::MediaEngine::new(uplink_media::EngineConfig {
+                ffmpeg: executable.clone(),
+                ffprobe: executable,
+                work_directory: "/unused-uplink-limit-test".into(),
+                limits,
+            })
+            .is_ok()
+        );
+    }
+}
+
+#[test]
+fn packet_limits_require_room_for_the_complete_flv_frame() {
+    let payload = 2 * 1024 * 1024;
+    for overhead in [0, 14, 15, 16] {
+        assert_packet_limit_contract(payload, payload + overhead, overhead >= 15);
+    }
+}
+
+#[test]
+fn packet_limits_keep_the_exact_24_bit_wire_boundary() {
+    for tag in [0xff_fffe, 0xff_ffff, 0x100_0000] {
+        assert_packet_limit_contract(tag, tag + 15, tag <= 0xff_ffff);
+    }
+}
+
+#[test]
 fn isolated_ingest_scope_requires_one_positive_explicit_identity() {
     let example = include_str!("../../../config/uplink-beispiel.toml");
     let valid = format!("{example}\n[test_ingest]\nallowed_streamer_ids = [11]\n");
@@ -11,20 +126,54 @@ fn isolated_ingest_scope_requires_one_positive_explicit_identity() {
 }
 
 #[test]
+fn normal_binary_refuses_input_only_configuration_before_secret_access() {
+    let example = include_str!("../../../config/uplink-beispiel.toml");
+    let mut bytes = [0; 8];
+    getrandom::fill(&mut bytes).unwrap();
+    let path =
+        std::env::temp_dir().join(format!("uplink-normal-start-{}.toml", hex::encode(bytes)));
+    std::fs::write(
+        &path,
+        format!("{example}\n[test_ingest]\nallowed_streamer_ids=[11]\n"),
+    )
+    .unwrap();
+    let binary = std::env::current_exe()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("uplink-service");
+    let output = std::process::Command::new(binary)
+        .arg("--config")
+        .arg(&path)
+        .output();
+    std::fs::remove_file(path).unwrap();
+    let output = output.unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap().trim(),
+        "Ein reiner Testeingang darf nicht als regulärer Uplink-Dienst starten."
+    );
+    assert!(output.stdout.is_empty());
+}
+
+#[test]
 fn public_ingest_never_accepts_private_test_roots_or_embedded_credentials() {
     let example = include_str!("../../../config/uplink-beispiel.toml");
     let local = format!("loopback_test_ca = \"/tmp/public-ca.pem\"\n{example}");
     assert!(Config::parse(&local).is_ok());
-    assert!(Config::parse(&local.replace("127.0.0.1:8893", "0.0.0.0:8893")).is_err());
+    let mut public: toml::Value = toml::from_str(&local).unwrap();
+    public["ingest_bind"] = toml::Value::String("0.0.0.0:1935".into());
+    assert!(Config::parse(&toml::to_string(&public).unwrap()).is_err());
     for bad in [
         "rtmps://synthetic:key@example.org/live",
         "rtmps://example.org/live?key=synthetic",
         "rtmps://example.org/live/synthetic",
     ] {
-        assert!(
-            Config::parse(&example.replace("rtmps://deutsche-deadlock-community.de:443/live", bad))
-                .is_err()
-        );
+        let mut config: toml::Value = toml::from_str(example).unwrap();
+        config["public_ingest_url"] = toml::Value::String(bad.into());
+        assert!(Config::parse(&toml::to_string(&config).unwrap()).is_err());
     }
 }
 
@@ -49,6 +198,22 @@ fn per_tenant_reservation_releases_on_drop_and_bounds_global_work() {
     drop(second);
     drop(replacement);
     assert_eq!(registry.active_count(), 0);
+}
+
+#[test]
+fn destination_change_excludes_admission_until_every_database_owner_releases_it() {
+    let registry = Registry::new(2, 1).unwrap();
+    let change = registry.begin_change(11).unwrap();
+    let database_owner = change.clone();
+    assert!(registry.reserve(11).is_err());
+    assert!(registry.reserve(12).is_ok());
+    drop(change);
+    assert!(registry.reserve(11).is_err());
+    drop(database_owner);
+    let active = registry.reserve(11).unwrap();
+    assert!(registry.begin_change(11).is_err());
+    drop(active);
+    assert!(registry.begin_change(11).is_ok());
 }
 
 #[test]

@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/uplink-core", "crates/uplink-cli", "crates/uplink-ingest", "crates/uplink-service", "crates/uplink-media", "crates/uplink-platform-probe", "crates/uplink-tls-provider"]
+members = ["crates/uplink-core", "crates/uplink-cli", "crates/uplink-ingest", "crates/uplink-service", "crates/uplink-media", "crates/uplink-platform-probe", "crates/uplink-tls-provider", "crates/uplink-chat", "crates/uplink-infisical-transport"]
 exclude = ["third_party/scuffle-rtmp", "third_party/scuffle-amf"]
 resolver = "3"
 
