@@ -1,0 +1,82 @@
+# Rein lokales Planszenario. Keine geprüften Plattformfähigkeiten und keine
+# freigegebenen Produktobergrenzen. Kein Stream, keine Secrets, keine Verbindung.
+schema_version = 1
+
+[limits]
+max_width = 4096
+max_height = 4096
+max_pixels = 9000000
+max_fps = { numerator = 120, denominator = 1 }
+max_video_kbps = 20000
+max_audio_kbps = 512
+max_audio_tracks = 4
+max_outputs = 8
+max_unique_encodes = 4
+
+[video_profiles.av1_1080]
+width = 1920
+height = 1080
+fps = { numerator = 60000, denominator = 1000 }
+codec = "av1"
+codec_profile = "main"
+level = "4.1"
+bit_depth = 8
+chroma = "yuv420"
+color = { primaries = "bt709", transfer = "bt709", matrix = "bt709", range = "limited" }
+rate = { mode = "cbr", target_kbps = 4000, max_kbps = 4000, buffer_kbits = 8000 }
+gop = { keyframe_interval_frames = 120, closed = true }
+
+[video_profiles.h264_1080]
+width = 1920
+height = 1080
+fps = { numerator = 60, denominator = 1 }
+codec = "h264"
+codec_profile = "high"
+level = "4.2"
+bit_depth = 8
+chroma = "yuv420"
+color = { primaries = "bt709", transfer = "bt709", matrix = "bt709", range = "limited" }
+rate = { mode = "cbr", target_kbps = 6000, max_kbps = 6000, buffer_kbits = 12000 }
+gop = { keyframe_interval_frames = 120, closed = true }
+
+[audio_profiles.aac_stereo]
+codec = "aac"
+sample_rate = 48000
+channels = 2
+bitrate_kbps = 160
+
+[source]
+scope = { tenant_id = 1, session_id = 1, generation = 1 }
+video_track = 1
+video_profile = "av1_1080"
+audio = [
+  { track_id = 2, role = "live", profile = "aac_stereo" },
+  { track_id = 3, role = "vod", profile = "aac_stereo" },
+]
+
+[worker]
+decodable_video = ["av1_1080"]
+encodable_video = ["h264_1080"]
+decodable_audio = ["aac_stereo"]
+encodable_audio = ["aac_stereo"]
+compositable_layouts = []
+
+[[outputs]]
+id = "twitch_test"
+platform = "twitch"
+video_profile = "h264_1080"
+encoder_preset_revision = "lokaler-versuch-1"
+live_audio = { role = "live", profile = "aac_stereo" }
+vod_audio = { role = "vod", profile = "aac_stereo" }
+allowed_video_profiles = ["h264_1080"]
+allowed_audio_profiles = ["aac_stereo"]
+
+[[outputs]]
+id = "kick_test"
+platform = "kick"
+video_profile = "h264_1080"
+encoder_preset_revision = "lokaler-versuch-1"
+live_audio = { role = "vod", profile = "aac_stereo" }
+allowed_video_profiles = ["h264_1080"]
+allowed_audio_profiles = ["aac_stereo"]
+

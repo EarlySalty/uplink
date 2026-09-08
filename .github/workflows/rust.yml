@@ -1,0 +1,27 @@
+name: Rust
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain aus rust-toolchain.toml verwenden
+        run: rustup show
+      - name: Formatierung
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Tests
+        run: cargo test --workspace --locked
+      - name: Release-Build
+        run: cargo build --workspace --release --locked
+      - name: Lokales Planszenario
+        run: cargo run --release --locked -p uplink-cli -- plan --config config/plan-beispiel.toml
+
