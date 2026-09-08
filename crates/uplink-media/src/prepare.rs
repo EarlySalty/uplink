@@ -17,12 +17,12 @@ use tokio::{
 use uplink_ingest::{EventKind, MediaKind};
 
 /// Auch beim Abbruch des aufrufenden Futures behält eine Aufräumtask den Kindprozess.
-struct ProbeChild {
-    child: Option<Child>,
-    deadline: Duration,
+pub(crate) struct ProbeChild {
+    pub(crate) child: Option<Child>,
+    pub(crate) deadline: Duration,
 }
 impl ProbeChild {
-    async fn terminate(&mut self) -> Result<()> {
+    pub(crate) async fn terminate(&mut self) -> Result<()> {
         if let Some(child) = self.child.as_mut() {
             if !matches!(child.try_wait(), Ok(Some(_))) {
                 let _ = child.start_kill();
@@ -85,9 +85,62 @@ impl MediaEngine {
         if spec.outputs.is_empty() || spec.outputs.len() > self.config.limits.max_outputs {
             return Err(MediaError::InvalidConfiguration);
         }
-        let identity = spec.first.identity;
+        let prepared = self.prepare_source(spec.first, &mut input).await?;
+        let graph = Graph::observed(&prepared.observation, &spec.outputs)?;
+        let routes = spec
+            .outputs
+            .into_iter()
+            .map(|output| TargetRoute {
+                output_id: output.target.id.clone(),
+                target: output.target,
+            })
+            .collect();
+        self.start_graph(
+            prepared.identity,
+            routes,
+            graph,
+            input,
+            prepared.prefix,
+            Some(prepared.observation),
+        )
+    }
+
+    pub async fn prepare_program_and_start(
+        &self,
+        spec: ProgramSessionSpec,
+        mut input: mpsc::Receiver<MediaEvent>,
+    ) -> Result<RunningMedia> {
+        if spec.outputs.is_empty() || spec.outputs.len() > self.config.limits.max_outputs {
+            return Err(MediaError::InvalidConfiguration);
+        }
+        let prepared = self.prepare_source(spec.first, &mut input).await?;
+        let graph = Graph::program(&prepared.observation, &spec.outputs)?;
+        let routes = spec
+            .outputs
+            .into_iter()
+            .map(|output| TargetRoute {
+                output_id: output.target.id.clone(),
+                target: output.target,
+            })
+            .collect();
+        self.start_graph(
+            prepared.identity,
+            routes,
+            graph,
+            input,
+            prepared.prefix,
+            Some(prepared.observation),
+        )
+    }
+
+    async fn prepare_source(
+        &self,
+        first: MediaEvent,
+        input: &mut mpsc::Receiver<MediaEvent>,
+    ) -> Result<PreparedSource> {
+        let identity = first.identity;
         let mut prefix = VecDeque::new();
-        let mut next = Some(spec.first);
+        let mut next = Some(first);
         let mut bytes = 0usize;
         let mut first_video_dts = None;
         let mut duration = 0u32;
@@ -193,21 +246,21 @@ impl MediaEngine {
             bytes,
             duration,
         )?;
-        let graph = Graph::observed(&observation, &spec.outputs)?;
-        let routes = spec
-            .outputs
-            .into_iter()
-            .map(|output| TargetRoute {
-                output_id: output.target.id.clone(),
-                target: output.target,
-            })
-            .collect();
         let identity = TrackIdentity {
             track: video[0],
             ..identity
         };
-        self.start_graph(identity, routes, graph, input, prefix, Some(observation))
+        Ok(PreparedSource {
+            identity,
+            prefix,
+            observation,
+        })
     }
+}
+struct PreparedSource {
+    identity: TrackIdentity,
+    prefix: VecDeque<MediaEvent>,
+    observation: SourceObservation,
 }
 
 async fn probe(config: &EngineConfig, bytes: Vec<u8>) -> Result<ProbeDocument> {

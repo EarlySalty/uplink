@@ -3,6 +3,7 @@
 mod engine;
 pub mod flv;
 mod graph;
+pub mod platform;
 mod prepare;
 pub mod pusher;
 pub mod queue;
@@ -10,7 +11,7 @@ mod sockets;
 
 use serde::Serialize;
 use std::{fmt, path::PathBuf, sync::Arc, time::Duration};
-use uplink_core::{Codec, FrameRate, LayoutRevision, PlanInput};
+use uplink_core::{Codec, FrameRate, LayoutRevision, PlanInput, VideoProfile};
 use uplink_ingest::{MediaEvent, TrackIdentity, WireTrack};
 use zeroize::Zeroizing;
 
@@ -226,6 +227,29 @@ pub struct DesiredSessionSpec {
     pub outputs: Vec<DesiredOutput>,
 }
 
+/// Ein Plattformausgang kann mehrere Videoausgaben derselben Session enthalten.
+/// Die Wire-ID ist von Quellspur, Canvas und Encoder-Gruppe unabhängig.
+pub struct ProgramVideo {
+    pub wire_track: u8,
+    pub canvas_index: u8,
+    pub profile: VideoProfile,
+    pub layout: Option<LayoutSpec>,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProgramAudio {
+    pub source_wire_track: u8,
+    pub destination_wire_track: u8,
+}
+pub struct ProgramOutput {
+    pub target: PublishTarget,
+    pub video: Vec<ProgramVideo>,
+    pub audio: Vec<ProgramAudio>,
+}
+pub struct ProgramSessionSpec {
+    pub first: MediaEvent,
+    pub outputs: Vec<ProgramOutput>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct AudioObservation {
     pub wire_track: u8,
@@ -269,7 +293,9 @@ pub struct OutputStatus {
 pub enum OutputState {
     Starting,
     Publishing,
-    Ended,
+    /// Lokal vollständig geschrieben und Verbindung beendet. Entfernte
+    /// Medienannahme, Verarbeitung und Veröffentlichung bleiben unbestätigt.
+    LocalEndUnconfirmed,
     Failed(MediaError),
 }
 
