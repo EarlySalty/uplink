@@ -103,13 +103,6 @@ pub trait RunStore: Send + Sync {
         stream_id: Option<&'a str>,
         broadcast_id: Option<&'a str>,
     ) -> BoxFuture<'a, Result<(), &'static str>>;
-    fn referenzen_setzen<'a>(
-        &'a self,
-        run_id: i64,
-        generation: i64,
-        stream_id: Option<&'a str>,
-        broadcast_id: Option<&'a str>,
-    ) -> BoxFuture<'a, Result<(), &'static str>>;
     fn zustand_setzen<'a>(
         &'a self,
         run_id: i64,
@@ -371,25 +364,6 @@ impl RunStore for PostgresRunStore {
                 stream_id=COALESCE($3,stream_id), broadcast_id=COALESCE($4,broadcast_id), \
                 updated_at=clock_timestamp() WHERE run_id=$1 AND connection_generation=$2 \
                 AND ended_at IS NULL RETURNING run_id";
-            let zeilen = self
-                .sql
-                .query(sql, &[&run_id, &generation, &stream_id, &broadcast_id])
-                .await?;
-            if zeilen.is_empty() { Err(CAS) } else { Ok(()) }
-        })
-    }
-
-    fn referenzen_setzen<'a>(
-        &'a self,
-        run_id: i64,
-        generation: i64,
-        stream_id: Option<&'a str>,
-        broadcast_id: Option<&'a str>,
-    ) -> BoxFuture<'a, Result<(), &'static str>> {
-        Box::pin(async move {
-            let sql = "UPDATE relay.youtube_live_runs SET stream_id=COALESCE($3,stream_id), \
-                broadcast_id=COALESCE($4,broadcast_id), updated_at=clock_timestamp() \
-                WHERE run_id=$1 AND connection_generation=$2 AND ended_at IS NULL RETURNING run_id";
             let zeilen = self
                 .sql
                 .query(sql, &[&run_id, &generation, &stream_id, &broadcast_id])
@@ -693,30 +667,6 @@ impl RunStore for SpeicherRunStore {
                 Some(z) => {
                     z.run.schritt = None;
                     z.run.schritt_seit = None;
-                    if let Some(s) = stream_id {
-                        z.run.stream_id = Some(s.to_owned());
-                    }
-                    if let Some(b) = broadcast_id {
-                        z.run.broadcast_id = Some(b.to_owned());
-                    }
-                    Ok(())
-                }
-                None => Err(CAS),
-            }
-        })
-    }
-
-    fn referenzen_setzen<'a>(
-        &'a self,
-        run_id: i64,
-        generation: i64,
-        stream_id: Option<&'a str>,
-        broadcast_id: Option<&'a str>,
-    ) -> BoxFuture<'a, Result<(), &'static str>> {
-        Box::pin(async move {
-            let mut inner = self.inner.lock().expect("Speicher");
-            match Self::treffer(&mut inner.runs, run_id, generation) {
-                Some(z) => {
                     if let Some(s) = stream_id {
                         z.run.stream_id = Some(s.to_owned());
                     }

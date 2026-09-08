@@ -191,6 +191,13 @@ async fn postgres_store_deckt_lebenszyklus_ab() {
         uplink_youtube_live::model::RunZustand::Vorbereitung
     );
 
+    assert!(
+        store
+            .schritt_setzen(run.run_id, 999, Schritt::BroadcastInsert)
+            .await
+            .is_err(),
+        "schritt_setzen lehnt falsche Generation ab"
+    );
     store
         .schritt_setzen(run.run_id, 4, Schritt::BroadcastInsert)
         .await
@@ -198,6 +205,10 @@ async fn postgres_store_deckt_lebenszyklus_ab() {
     let mit_schritt = store.aktiven_run_laden(77).await.unwrap().unwrap();
     assert_eq!(mit_schritt.schritt, Some(Schritt::BroadcastInsert));
     assert!(mit_schritt.schritt_seit.is_some());
+    assert!(
+        store.schritt_loeschen(run.run_id, 999).await.is_err(),
+        "schritt_loeschen lehnt falsche Generation ab"
+    );
     store.schritt_loeschen(run.run_id, 4).await.unwrap();
     let ohne_schritt = store.aktiven_run_laden(77).await.unwrap().unwrap();
     assert_eq!(ohne_schritt.schritt, None);
@@ -219,18 +230,15 @@ async fn postgres_store_deckt_lebenszyklus_ab() {
         uplink_youtube_live::model::RunZustand::Vorbereitet
     );
 
-    store
-        .referenzen_setzen(run.run_id, 4, Some("S1"), Some("B1"))
-        .await
-        .unwrap();
     assert!(
         store
-            .referenzen_setzen(run.run_id, 999, Some("S2"), None)
+            .schritt_abschliessen(run.run_id, 999, Some("S9"), None)
             .await
-            .is_err()
+            .is_err(),
+        "schritt_abschliessen lehnt falsche Generation ab"
     );
     store
-        .schritt_abschliessen(run.run_id, 4, Some("S3"), None)
+        .schritt_abschliessen(run.run_id, 4, Some("S3"), Some("B1"))
         .await
         .unwrap();
     let nach_abschluss = store.aktiven_run_laden(77).await.unwrap().unwrap();
@@ -264,6 +272,13 @@ async fn postgres_store_deckt_lebenszyklus_ab() {
     let mit_start = store.aktiven_run_laden(77).await.unwrap().unwrap();
     assert!(mit_start.start_angefordert_at.is_some());
 
+    assert!(
+        store
+            .run_schliessen(run.run_id, 999, Some("nutzer_stop"), Some(true), None)
+            .await
+            .is_err(),
+        "run_schliessen lehnt falsche Generation ab"
+    );
     store
         .run_schliessen(run.run_id, 4, Some("nutzer_stop"), Some(true), None)
         .await

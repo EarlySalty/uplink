@@ -16,6 +16,9 @@ use zeroize::Zeroizing;
 const SCOPE_FORCE: &str = "https://www.googleapis.com/auth/youtube.force-ssl";
 const SCOPE_VOLL: &str = "https://www.googleapis.com/auth/youtube";
 const AKTIV: &[&str] = &["vorbereitung", "vorbereitet", "sendet", "live"];
+const TEXT_REVOKED: &str = "Broadcast wurde von YouTube zurückgezogen";
+const TEXT_FREMD: &str = "Broadcast ist an einen fremden Stream gebunden";
+const TEXT_BINDUNG: &str = "Bindung nicht bestätigt";
 
 enum RufFehler {
     Blockiert(Blockgrund),
@@ -375,6 +378,23 @@ impl YouTubeLive {
         Ok(Zustand::Live { refs, seit })
     }
 
+    async fn live_oder_fehler(&self, run: &Run, bound: Option<&str>) -> Result<Zustand, Abbruch> {
+        let refs = refs_opt(run).ok_or(Abbruch::Fehler(LiveFehler::Store("Referenzen fehlen.")))?;
+        match bound {
+            Some(b) if b == refs.stream_id.as_str() => self.abschluss_live(run).await,
+            Some(_) => Ok(Zustand::Fehler {
+                refs: Some(refs),
+                fehler: ApiFehler::Ungueltig(TEXT_FREMD.into()),
+                wiederaufnehmbar: false,
+            }),
+            None => Ok(Zustand::Fehler {
+                refs: Some(refs),
+                fehler: ApiFehler::Ungueltig(TEXT_BINDUNG.into()),
+                wiederaufnehmbar: true,
+            }),
+        }
+    }
+
     async fn transition_abgleich(
         &self,
         id: &Identitaet,
@@ -406,10 +426,7 @@ impl YouTubeLive {
             });
         };
         let leben = b.life_cycle_status.as_deref().unwrap_or("");
-        let bindung_fremd = b
-            .bound_stream_id
-            .as_deref()
-            .is_some_and(|bound| bound != sid.as_str());
+        let bound = b.bound_stream_id.clone();
         match schritt {
             Schritt::TransitionLive => {
                 if leben == "complete" {
@@ -431,21 +448,11 @@ impl YouTubeLive {
                         youtube_bestaetigt: true,
                     });
                 }
-                if bindung_fremd {
-                    self.store
-                        .schritt_loeschen(run.run_id, run.connection_generation)
-                        .await?;
-                    return Ok(Zustand::Fehler {
-                        refs: Some(refs),
-                        fehler: ApiFehler::Ungueltig("fremde Bindung".into()),
-                        wiederaufnehmbar: false,
-                    });
-                }
                 if leben == "live" {
                     self.store
                         .schritt_abschliessen(run.run_id, run.connection_generation, None, None)
                         .await?;
-                    return self.abschluss_live(run).await;
+                    return self.live_oder_fehler(run, bound.as_deref()).await;
                 }
                 if leben == "liveStarting" {
                     self.store
@@ -454,6 +461,16 @@ impl YouTubeLive {
                     return Ok(Zustand::Sendet {
                         refs,
                         stream_status: "unbekannt".into(),
+                    });
+                }
+                let stream = self
+                    .holen(id, Some(refs.clone()), |t| self.api.stream_lesen(t, &sid))
+                    .await?;
+                let stream_status = stream.and_then(|s| s.stream_status).unwrap_or_default();
+                if stream_status != "active" {
+                    return Ok(Zustand::Sendet {
+                        refs,
+                        stream_status,
                     });
                 }
                 let neu = self
@@ -465,11 +482,11 @@ impl YouTubeLive {
                     .schritt_abschliessen(run.run_id, run.connection_generation, None, None)
                     .await?;
                 if neu.life_cycle_status.as_deref() == Some("live") {
-                    self.abschluss_live(run).await
+                    self.live_oder_fehler(run, bound.as_deref()).await
                 } else {
                     Ok(Zustand::Sendet {
                         refs,
-                        stream_status: "unbekannt".into(),
+                        stream_status,
                     })
                 }
             }
@@ -575,27 +592,19 @@ impl YouTubeLive {
                     run.connection_generation,
                     None,
                     Some(false),
-                    Some("Broadcast widerrufen"),
+                    Some(TEXT_REVOKED),
                 )
                 .await?;
             return Ok(Zustand::Fehler {
                 refs: Some(refs),
-                fehler: ApiFehler::Ungueltig("revoked".into()),
-                wiederaufnehmbar: false,
-            });
-        }
-        if b.bound_stream_id
-            .as_deref()
-            .is_some_and(|bound| bound != sid.as_str())
-        {
-            return Ok(Zustand::Fehler {
-                refs: Some(refs),
-                fehler: ApiFehler::Ungueltig("fremde Bindung".into()),
+                fehler: ApiFehler::Ungueltig(TEXT_REVOKED.into()),
                 wiederaufnehmbar: false,
             });
         }
         if leben == "live" {
-            return self.abschluss_live(run).await;
+            return self
+                .live_oder_fehler(run, b.bound_stream_id.as_deref())
+                .await;
         }
         let gebunden = b.bound_stream_id.as_deref() == Some(sid.as_str());
         if transition_nachfuehren
@@ -613,7 +622,9 @@ impl YouTubeLive {
                 .schritt_abschliessen(run.run_id, run.connection_generation, None, None)
                 .await?;
             if neu.life_cycle_status.as_deref() == Some("live") {
-                return self.abschluss_live(run).await;
+                return self
+                    .live_oder_fehler(run, b.bound_stream_id.as_deref())
+                    .await;
             }
             return Ok(Zustand::Sendet {
                 refs,
@@ -847,6 +858,7 @@ impl YouTubeLive {
         let leben = b.life_cycle_status.as_deref().unwrap_or("");
         if !matches!(leben, "created" | "ready")
             || b.bound_stream_id.as_deref() != Some(sid.as_str())
+            || b.privacy_status.as_deref() != Some(run.sichtbarkeit.as_str())
             || b.enable_auto_start != Some(run.auto_start)
             || b.enable_auto_stop != Some(run.auto_stop)
         {
@@ -1015,13 +1027,24 @@ impl YouTubeLive {
             RunZustand::Vorbereitet | RunZustand::Sendet | RunZustand::Live
         ) {
             let z = self.berichten(id, &run, false).await?;
-            let ingest = match &z {
+            match z {
                 Zustand::Vorbereitet { .. } | Zustand::Sendet { .. } | Zustand::Live { .. } => {
-                    self.ingest_lesen(id, &run).await?
+                    let ingest = self.ingest_lesen(id, &run).await?;
+                    return Ok(Vorbereitung { zustand: z, ingest });
                 }
-                _ => None,
-            };
-            return Ok(Vorbereitung { zustand: z, ingest });
+                Zustand::Beendet { .. } => {
+                    let neu = self
+                        .run_neu(id, &anforderung.uplink_session, &gespeichert)
+                        .await?;
+                    return self.praeparieren(id, neu).await;
+                }
+                andere => {
+                    return Ok(Vorbereitung {
+                        zustand: andere,
+                        ingest: None,
+                    });
+                }
+            }
         }
 
         self.praeparieren(id, run).await
@@ -1108,19 +1131,17 @@ impl YouTubeLive {
                 youtube_bestaetigt: true,
             });
         }
-        if leben == "revoked"
-            || b.bound_stream_id
-                .as_deref()
-                .is_some_and(|bound| bound != sid.as_str())
-        {
+        if leben == "revoked" {
             return Ok(Zustand::Fehler {
                 refs: Some(refs),
-                fehler: ApiFehler::Ungueltig("fremde Bindung".into()),
+                fehler: ApiFehler::Ungueltig(TEXT_REVOKED.into()),
                 wiederaufnehmbar: false,
             });
         }
         if leben == "live" {
-            return self.abschluss_live(&run).await;
+            return self
+                .live_oder_fehler(&run, b.bound_stream_id.as_deref())
+                .await;
         }
         if stream_status != "active" {
             return Ok(Zustand::Sendet {
@@ -1174,7 +1195,74 @@ impl YouTubeLive {
         if let Some(schritt) = run.schritt {
             match schritt {
                 Schritt::TransitionLive | Schritt::TransitionComplete => {
-                    return self.transition_abgleich(id, &run, schritt).await;
+                    let refs = refs_opt(&run)
+                        .ok_or(Abbruch::Fehler(LiveFehler::Store("Referenzen fehlen.")))?;
+                    let bid = refs.broadcast_id.clone();
+                    let aktuell = self
+                        .holen(id, Some(refs.clone()), |t| {
+                            self.api.broadcast_lesen(t, &bid)
+                        })
+                        .await?;
+                    let leben = aktuell
+                        .as_ref()
+                        .and_then(|b| b.life_cycle_status.as_deref())
+                        .unwrap_or("");
+                    if leben == "complete" {
+                        self.store
+                            .run_schliessen(
+                                run.run_id,
+                                run.connection_generation,
+                                Some(grund.as_str()),
+                                Some(true),
+                                None,
+                            )
+                            .await?;
+                        return Ok(Zustand::Beendet {
+                            refs,
+                            grund,
+                            youtube_bestaetigt: true,
+                        });
+                    }
+                    if matches!(leben, "live" | "liveStarting" | "testing" | "testStarting") {
+                        self.post(id, &run, Schritt::TransitionComplete, |t| {
+                            self.api.transition(t, &bid, "complete")
+                        })
+                        .await?;
+                        self.store
+                            .schritt_abschliessen(run.run_id, run.connection_generation, None, None)
+                            .await?;
+                        self.store
+                            .run_schliessen(
+                                run.run_id,
+                                run.connection_generation,
+                                Some(grund.as_str()),
+                                Some(true),
+                                None,
+                            )
+                            .await?;
+                        return Ok(Zustand::Beendet {
+                            refs,
+                            grund,
+                            youtube_bestaetigt: true,
+                        });
+                    }
+                    self.store
+                        .schritt_loeschen(run.run_id, run.connection_generation)
+                        .await?;
+                    self.store
+                        .run_schliessen(
+                            run.run_id,
+                            run.connection_generation,
+                            Some(grund.as_str()),
+                            Some(false),
+                            None,
+                        )
+                        .await?;
+                    return Ok(Zustand::Beendet {
+                        refs,
+                        grund,
+                        youtube_bestaetigt: false,
+                    });
                 }
                 Schritt::StreamInsert => {
                     self.store

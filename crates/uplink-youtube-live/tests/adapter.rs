@@ -127,7 +127,7 @@ async fn fabriziere(
         .await
         .unwrap();
     store
-        .referenzen_setzen(run.run_id, generation, stream_id, broadcast_id)
+        .schritt_abschliessen(run.run_id, generation, stream_id, broadcast_id)
         .await
         .unwrap();
     if zustand != "vorbereitung" {
@@ -1091,7 +1091,7 @@ async fn fremder_run_kanal_blockiert_ohne_requests() {
         .await
         .unwrap();
     store
-        .referenzen_setzen(run.run_id, 1, Some("S1"), Some("B1"))
+        .schritt_abschliessen(run.run_id, 1, Some("S1"), Some("B1"))
         .await
         .unwrap();
     store
@@ -1638,4 +1638,365 @@ fn debug_maskiert_ingest_und_vorbereitung() {
         ingest: Some(ingest),
     };
     assert!(!format!("{vorbereitung:?}").contains("streng-geheim"));
+}
+
+#[tokio::test]
+async fn finish_offener_transition_live_bei_ready_ohne_live_post() {
+    let (server, adapter, store) = harness().await;
+    fabriziere(
+        &store,
+        1,
+        false,
+        "sendet",
+        Some(Schritt::TransitionLive),
+        Some("S1"),
+        Some("B1"),
+    )
+    .await;
+    get(
+        &server,
+        "/liveBroadcasts",
+        &[("id", "B1")],
+        slist(broadcast_item("B1", "ready", Some("S1"))),
+    )
+    .await;
+
+    let z = adapter
+        .finish(&ident(1), Endegrund::NutzerStop)
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            z,
+            Zustand::Beendet {
+                youtube_bestaetigt: false,
+                ..
+            }
+        ),
+        "war {z:?}"
+    );
+    assert_eq!(
+        anzahl(&server, "POST", "/liveBroadcasts/transition").await,
+        0
+    );
+    assert!(store.aktiven_run_laden(77).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn finish_offener_transition_live_bei_live_macht_complete() {
+    let (server, adapter, store) = harness().await;
+    fabriziere(
+        &store,
+        1,
+        false,
+        "sendet",
+        Some(Schritt::TransitionLive),
+        Some("S1"),
+        Some("B1"),
+    )
+    .await;
+    get(
+        &server,
+        "/liveBroadcasts",
+        &[("id", "B1")],
+        slist(broadcast_item("B1", "live", Some("S1"))),
+    )
+    .await;
+    Mock::given(method("POST"))
+        .and(path("/liveBroadcasts/transition"))
+        .and(query_param("broadcastStatus", "complete"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(broadcast_item(
+            "B1",
+            "complete",
+            Some("S1"),
+        )))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let z = adapter
+        .finish(&ident(1), Endegrund::NutzerStop)
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            z,
+            Zustand::Beendet {
+                youtube_bestaetigt: true,
+                ..
+            }
+        ),
+        "war {z:?}"
+    );
+    assert_eq!(
+        anzahl(&server, "POST", "/liveBroadcasts/transition").await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn status_live_ohne_bindung_ist_nicht_live() {
+    let (server, adapter, store) = harness().await;
+    freigabe(&store, 1).await;
+    fabriziere(
+        &store,
+        1,
+        false,
+        "vorbereitet",
+        None,
+        Some("S1"),
+        Some("B1"),
+    )
+    .await;
+    get(
+        &server,
+        "/liveStreams",
+        &[("id", "S1")],
+        slist(stream_item("S1", "active")),
+    )
+    .await;
+    get(
+        &server,
+        "/liveBroadcasts",
+        &[("id", "B1")],
+        slist(broadcast_item("B1", "live", None)),
+    )
+    .await;
+
+    let z = adapter.status(&ident(1)).await.unwrap();
+    match z {
+        Zustand::Fehler {
+            fehler: ApiFehler::Ungueltig(m),
+            wiederaufnehmbar: true,
+            ..
+        } => {
+            assert_eq!(m, "Bindung nicht bestätigt");
+        }
+        anderes => panic!("erwartet Bindung-nicht-bestätigt, war {anderes:?}"),
+    }
+}
+
+#[tokio::test]
+async fn start_live_ohne_bindung_ist_nicht_live() {
+    let (server, adapter, store) = harness().await;
+    freigabe(&store, 1).await;
+    fabriziere(
+        &store,
+        1,
+        false,
+        "vorbereitet",
+        None,
+        Some("S1"),
+        Some("B1"),
+    )
+    .await;
+    get(
+        &server,
+        "/liveStreams",
+        &[("id", "S1")],
+        slist(stream_item("S1", "active")),
+    )
+    .await;
+    get(
+        &server,
+        "/liveBroadcasts",
+        &[("id", "B1")],
+        slist(broadcast_item("B1", "live", None)),
+    )
+    .await;
+
+    let z = adapter.start(&ident(1)).await.unwrap();
+    assert!(
+        matches!(
+            z,
+            Zustand::Fehler {
+                wiederaufnehmbar: true,
+                ..
+            }
+        ),
+        "war {z:?}"
+    );
+}
+
+#[tokio::test]
+async fn abgleich_transition_live_ohne_bindung_ist_nicht_live() {
+    let (server, adapter, store) = harness().await;
+    freigabe(&store, 1).await;
+    fabriziere(
+        &store,
+        1,
+        false,
+        "sendet",
+        Some(Schritt::TransitionLive),
+        Some("S1"),
+        Some("B1"),
+    )
+    .await;
+    get(
+        &server,
+        "/liveBroadcasts",
+        &[("id", "B1")],
+        slist(broadcast_item("B1", "live", None)),
+    )
+    .await;
+
+    let z = adapter.status(&ident(1)).await.unwrap();
+    assert!(
+        matches!(
+            z,
+            Zustand::Fehler {
+                wiederaufnehmbar: true,
+                ..
+            }
+        ),
+        "war {z:?}"
+    );
+}
+
+#[tokio::test]
+async fn abgleich_transition_live_ohne_active_ist_sendet_ohne_post() {
+    let (server, adapter, store) = harness().await;
+    freigabe(&store, 1).await;
+    fabriziere(
+        &store,
+        1,
+        false,
+        "sendet",
+        Some(Schritt::TransitionLive),
+        Some("S1"),
+        Some("B1"),
+    )
+    .await;
+    get(
+        &server,
+        "/liveBroadcasts",
+        &[("id", "B1")],
+        slist(broadcast_item("B1", "ready", Some("S1"))),
+    )
+    .await;
+    get(
+        &server,
+        "/liveStreams",
+        &[("id", "S1")],
+        slist(stream_item("S1", "ready")),
+    )
+    .await;
+
+    let z = adapter.status(&ident(1)).await.unwrap();
+    assert!(matches!(z, Zustand::Sendet { .. }), "war {z:?}");
+    assert_eq!(
+        anzahl(&server, "POST", "/liveBroadcasts/transition").await,
+        0
+    );
+}
+
+#[tokio::test]
+async fn prepare_nach_abgeschlossenem_broadcast_legt_neuen_run_an() {
+    let (server, adapter, store) = harness().await;
+    freigabe(&store, 1).await;
+    store.stream_id_merken(77, 1, "S1").await.unwrap();
+    fabriziere(
+        &store,
+        1,
+        false,
+        "vorbereitet",
+        None,
+        Some("S1"),
+        Some("B1"),
+    )
+    .await;
+    get(
+        &server,
+        "/liveStreams",
+        &[("id", "S1")],
+        slist(stream_item("S1", "ready")),
+    )
+    .await;
+    get(
+        &server,
+        "/liveBroadcasts",
+        &[("id", "B1")],
+        slist(broadcast_item("B1", "complete", Some("S1"))),
+    )
+    .await;
+    post(
+        &server,
+        "/liveBroadcasts",
+        broadcast_item("B-neu", "created", None),
+    )
+    .await;
+    post(
+        &server,
+        "/liveBroadcasts/bind",
+        broadcast_item("B-neu", "created", Some("S1")),
+    )
+    .await;
+    get(
+        &server,
+        "/liveBroadcasts",
+        &[("id", "B-neu")],
+        slist(broadcast_item("B-neu", "created", Some("S1"))),
+    )
+    .await;
+
+    let v = adapter.prepare(&ident(1), anforderung()).await.unwrap();
+    match &v.zustand {
+        Zustand::Vorbereitet { refs } => assert_eq!(refs.broadcast_id, "B-neu"),
+        anderes => panic!("erwartet Vorbereitet, war {anderes:?}"),
+    }
+    assert!(v.ingest.is_some());
+    assert_eq!(anzahl(&server, "POST", "/liveBroadcasts").await, 1);
+    let run = store.aktiven_run_laden(77).await.unwrap().unwrap();
+    assert_eq!(run.broadcast_id.as_deref(), Some("B-neu"));
+}
+
+#[tokio::test]
+async fn kontrolle_privacy_abweichung_ist_fehler() {
+    let (server, adapter, store) = harness().await;
+    freigabe(&store, 1).await;
+    store.stream_id_merken(77, 1, "S1").await.unwrap();
+    get(
+        &server,
+        "/liveStreams",
+        &[("id", "S1")],
+        slist(stream_item("S1", "ready")),
+    )
+    .await;
+    post(
+        &server,
+        "/liveBroadcasts",
+        broadcast_item("B1", "created", None),
+    )
+    .await;
+    post(
+        &server,
+        "/liveBroadcasts/bind",
+        broadcast_item("B1", "created", Some("S1")),
+    )
+    .await;
+    get(
+        &server,
+        "/liveBroadcasts",
+        &[("id", "B1")],
+        json!({ "items": [{
+            "id": "B1",
+            "snippet": { "title": "Mein Stream", "publishedAt": Utc::now().to_rfc3339() },
+            "status": { "lifeCycleStatus": "created", "privacyStatus": "public" },
+            "contentDetails": { "boundStreamId": "S1", "enableAutoStart": false, "enableAutoStop": false }
+        }] }),
+    )
+    .await;
+
+    let v = adapter.prepare(&ident(1), anforderung()).await.unwrap();
+    assert!(
+        matches!(
+            v.zustand,
+            Zustand::Fehler {
+                wiederaufnehmbar: false,
+                ..
+            }
+        ),
+        "war {:?}",
+        v.zustand
+    );
 }
