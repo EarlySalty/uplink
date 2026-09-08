@@ -438,6 +438,18 @@ async fn run(
             },
         }
     }
+    if let Some(reason) = error {
+        status.send_modify(|current| {
+            for output in &mut current.outputs {
+                if matches!(
+                    output.state,
+                    OutputState::Starting | OutputState::Publishing
+                ) {
+                    output.state = OutputState::Failed(reason);
+                }
+            }
+        });
+    }
     let final_status = status.borrow().clone();
     MediaReport {
         status: final_status,
@@ -609,4 +621,173 @@ async fn deliver(
             .map_err(|_| MediaError::Backpressure)??;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uplink_core::{Codec, FrameRate};
+    use uplink_ingest::{
+        AuthorizedSession, Authorizer, IngestLimits, IngestServer, MediaKind, WireTrack,
+    };
+
+    mod tls {
+        include!("../../uplink-ingest/tests/support/tls.rs");
+    }
+    struct Auth;
+    impl Authorizer for Auth {
+        async fn authorize(
+            &self,
+            app: &str,
+            stream: &str,
+        ) -> std::result::Result<AuthorizedSession, ()> {
+            if app == "live" && stream == "local-fixture" {
+                AuthorizedSession::new(1, 1).map_err(|_| ())
+            } else {
+                Err(())
+            }
+        }
+    }
+    fn target(id: &str, port: u16) -> PublishTarget {
+        PublishTarget {
+            id: id.into(),
+            endpoint: format!("rtmps://localhost:{port}/live"),
+            playpath: PublishSecret::new(b"local-fixture".to_vec()).unwrap(),
+            tls: None,
+            allowed_hosts: vec!["localhost".into()],
+            allow_loopback: true,
+            allow_unencrypted: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn source_ending_before_first_video_marks_every_output_failed() {
+        timeout(std::time::Duration::from_secs(3), async {
+            let tls = tls::test_tls();
+            drop(tls.certificate_pem);
+            let server = IngestServer::bind_loopback(
+                0,
+                tls.server,
+                Arc::new(Auth),
+                IngestLimits::local_probe(),
+            )
+            .await
+            .unwrap();
+            let mut source_target = target("source", server.local_addr().unwrap().port());
+            source_target.tls = Some(tls.client);
+            let input = tokio::spawn(async move {
+                let mut connection = server.accept().await.unwrap();
+                let first = connection.next().await.unwrap();
+                assert_eq!(first.identity.track.kind, MediaKind::Audio);
+                while connection.next().await.is_some() {}
+                let _ = connection.finish().await;
+                first
+            });
+            let pusher = RunningPusher::start(source_target, MediaLimits::default())
+                .await
+                .unwrap();
+            pusher
+                .try_send(Arc::new(
+                    FlvTag::new(8, 0, Arc::from(&b"\xaf\x00\x11\x90"[..]), 64).unwrap(),
+                ))
+                .unwrap();
+            pusher.finish().await.unwrap();
+            let first = input.await.unwrap();
+            let identity = TrackIdentity {
+                track: WireTrack {
+                    kind: MediaKind::Video,
+                    wire_id: 0,
+                },
+                ..first.identity
+            };
+            let output_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = output_listener.local_addr().unwrap().port();
+            let outputs: Vec<_> = ["one", "two"]
+                .into_iter()
+                .map(|id| DesiredOutput {
+                    target: target(id, port),
+                    video: DesiredVideo {
+                        width: 320,
+                        height: 180,
+                        fps: FrameRate::new(25, 1).unwrap(),
+                        bitrate_kbps: 384,
+                        codec: Codec::H264,
+                    },
+                    live_audio_track: 0,
+                    vod_audio_track: None,
+                    layout: None,
+                })
+                .collect();
+            let observation = SourceObservation {
+                video_wire_track: 0,
+                codec: "h264".into(),
+                width: 320,
+                height: 180,
+                fps_numerator: 25,
+                fps_denominator: 1,
+                pixel_format: "yuv420p".into(),
+                color_primaries: None,
+                color_transfer: None,
+                color_matrix: None,
+                color_range: None,
+                rate_control: None,
+                gop_frames: None,
+                audio: vec![AudioObservation {
+                    wire_track: 0,
+                    codec: "aac".into(),
+                    sample_rate: 48000,
+                    channels: 2,
+                }],
+                sampled_events: 1,
+                sampled_bytes: 4,
+                sampled_duration_ms: 0,
+            };
+            let graph = Graph::observed(&observation, &outputs).unwrap();
+            let routes = outputs
+                .into_iter()
+                .map(|output| TargetRoute {
+                    output_id: output.target.id.clone(),
+                    target: output.target,
+                })
+                .collect();
+            let engine = MediaEngine::new(EngineConfig {
+                ffmpeg: "/usr/bin/false".into(),
+                ffprobe: "/usr/bin/false".into(),
+                work_directory: "/not-created-by-this-test".into(),
+                limits: MediaLimits::default(),
+            })
+            .unwrap();
+            let (sender, receiver) = mpsc::channel(1);
+            drop(sender);
+            let running = engine
+                .start_graph(
+                    identity,
+                    routes,
+                    graph,
+                    receiver,
+                    VecDeque::from([first]),
+                    None,
+                )
+                .unwrap();
+            let observer = running.observer();
+            let report = running.finish().await;
+            assert_eq!(report.error, Some(MediaError::MissingTrack));
+            assert_eq!(report.status.outputs.len(), 2);
+            for status in [report.status, observer.snapshot()] {
+                for output in status.outputs {
+                    assert_eq!(output.state, OutputState::Failed(MediaError::MissingTrack));
+                }
+            }
+            assert!(
+                timeout(
+                    std::time::Duration::from_millis(30),
+                    output_listener.accept()
+                )
+                .await
+                .is_err()
+            );
+        })
+        .await
+        .expect("früher Eingangsfehler muss ohne Worker-/Ausgangsstart abschließen");
+    }
 }
