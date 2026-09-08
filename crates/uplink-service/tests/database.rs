@@ -555,6 +555,119 @@ async fn waitlist_write_is_visible_for_new_and_existing_users() {
 
 #[tokio::test]
 #[ignore = "Benötigt isolierte PostgreSQL-16-Testinstanz und lokales TLS."]
+async fn zero_media_sessions_keep_authorized_end_reasons_and_reject_anonymous_changes() {
+    use tokio::io::AsyncReadExt;
+    let (database, state) = fixture().await;
+    let certificates = tls::test_tls();
+    let (ready, bound) = tokio::sync::oneshot::channel();
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let identities = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let task = tokio::spawn(uplink_service::runtime::serve_with_ready(
+        state.clone(),
+        certificates.server,
+        Arc::new(Collector(identities.clone())),
+        async {
+            let _ = stopped.await;
+        },
+        Some(ready),
+    ));
+    let (api, address) = bound.await.unwrap();
+    let mut previous = 0;
+    for (mode, expected, failed) in [
+        ("truncated", "MediaRejected(Truncated)", true),
+        ("stop", "ExplicitStop", false),
+        ("disconnect", "PeerClosed", true),
+    ] {
+        let socket = tokio::net::TcpStream::connect(address).await.unwrap();
+        let mut peer = tokio_rustls::TlsConnector::from(certificates.client.clone())
+            .connect("localhost".try_into().unwrap(), socket)
+            .await
+            .unwrap();
+        rtmp::publish(&mut peer, "rsr_00000000000000000000000000000000").await;
+        match mode {
+            "truncated" => rtmp::message(&mut peer, 8, 1, &[0xaf]).await,
+            "stop" => rtmp::stop(&mut peer).await,
+            _ => {
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    while state.registry.active_count() != 1 {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .unwrap();
+            }
+        }
+        if mode != "disconnect" {
+            let mut response = Vec::new();
+            let _ = tokio::time::timeout(
+                Duration::from_secs(3),
+                (&mut peer).take(16 * 1024).read_to_end(&mut response),
+            )
+            .await
+            .unwrap();
+        }
+        drop(peer);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let statuses = state.registry.status(11);
+                if state.registry.active_count() == 0
+                    && statuses.first().is_some_and(|status| status.id != previous)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("http://{api}/v1/me/status?streamer_id=11"))
+            .header("X-Relay-Auth", "synthetic-api")
+            .send()
+            .await
+            .unwrap();
+        let value: serde_json::Value = response.json().await.unwrap();
+        let status = &value["sessions"][0];
+        assert_eq!(status["received_events"], 0);
+        assert_eq!(
+            status["ingest_end_reason"], expected,
+            "Abschluss ohne MediaEvent muss zugeordnet bleiben"
+        );
+        assert_eq!(status["error"].is_string(), failed);
+        assert_eq!(status["state"], if failed { "Fehler" } else { "Beendet" });
+        previous = status["id"].as_u64().unwrap();
+    }
+    let before = serde_json::to_value(state.registry.status(11)).unwrap();
+    let socket = tokio::net::TcpStream::connect(address).await.unwrap();
+    let mut peer = tokio_rustls::TlsConnector::from(certificates.client)
+        .connect("localhost".try_into().unwrap(), socket)
+        .await
+        .unwrap();
+    rtmp::publish(&mut peer, "rsr_11111111111111111111111111111111").await;
+    let mut response = Vec::new();
+    let _ = tokio::time::timeout(
+        Duration::from_secs(3),
+        peer.take(16 * 1024).read_to_end(&mut response),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(state.registry.status(11)).unwrap(),
+        before
+    );
+    assert!(state.registry.status(99).is_empty());
+    assert_eq!(state.registry.active_count(), 0);
+    assert!(identities.lock().unwrap().is_empty());
+    stop.send(()).unwrap();
+    task.await.unwrap().unwrap();
+    database.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "Benötigt isolierte PostgreSQL-16-Testinstanz und lokales TLS."]
 async fn rejected_media_after_valid_prelude_stays_failed_in_session_status() {
     let (database, state) = fixture().await;
     let certificates = tls::test_tls();

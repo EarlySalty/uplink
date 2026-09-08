@@ -15,6 +15,7 @@ struct Auth {
 
 struct LeaseAuth {
     released: std::sync::atomic::AtomicUsize,
+    completed: std::sync::Mutex<Vec<EndReason>>,
 }
 
 struct RetainedAuth {
@@ -83,6 +84,11 @@ impl Authorizer for LeaseAuth {
         self.released
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
+    fn completed(&self, session: AuthorizedSession, report: &SessionReport) {
+        assert_eq!(session.tenant_id(), 11);
+        assert_eq!(self.released.load(std::sync::atomic::Ordering::SeqCst), 0);
+        self.completed.lock().unwrap().push(report.reason);
+    }
 }
 
 #[tokio::test]
@@ -91,6 +97,7 @@ async fn explicit_tls_admission_releases_authorization_on_finish_and_cancellatio
         let certificates = tls::test_tls();
         let auth = Arc::new(LeaseAuth {
             released: std::sync::atomic::AtomicUsize::new(0),
+            completed: std::sync::Mutex::new(Vec::new()),
         });
         let server = IngestServer::bind_tls(
             "127.0.0.1:0".parse().unwrap(),
@@ -112,6 +119,14 @@ async fn explicit_tls_admission_releases_authorization_on_finish_and_cancellatio
         }
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert_eq!(auth.released.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            *auth.completed.lock().unwrap(),
+            vec![if cancel {
+                EndReason::TaskFailed
+            } else {
+                EndReason::ExplicitStop
+            }]
+        );
     }
 }
 impl Authorizer for Auth {

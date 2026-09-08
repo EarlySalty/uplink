@@ -163,7 +163,9 @@ impl Reservation {
         self.update(|status| {
             status.received_events = status.received_events.saturating_add(1);
             status.received_bytes = status.received_bytes.saturating_add(bytes as u64);
-            status.state = "Medien werden empfangen";
+            if status.error.is_none() {
+                status.state = "Medien werden empfangen";
+            }
         });
     }
 }

@@ -56,6 +56,10 @@ pub trait Authorizer: Send + Sync + 'static {
     /// Synchroner, kurzer Abschluss jeder erfolgreichen Autorisierung, auch bei
     /// Taskabbruch. Verbraucher halten benötigte eigene Reservationsanteile.
     fn release(&self, _session: AuthorizedSession) {}
+    /// Genau ein kurzer, synchroner Abschluss vor release, auch ohne Medien.
+    /// Nur erfolgreich autorisierte Sessions werden zugeordnet. Bei Taskabbruch
+    /// bleibt ein bereits belegter Fehler erhalten, sonst lautet er TaskFailed.
+    fn completed(&self, _session: AuthorizedSession, _report: &SessionReport) {}
     /// Optionaler, nicht serialisierbarer Reservationsanteil. Handler und alle
     /// weitergereichten Medien halten ihn bis zum letzten Verbraucher.
     fn retention(&self, _session: AuthorizedSession) -> Option<Arc<dyn Any + Send + Sync>> {
@@ -381,6 +385,7 @@ struct Handler<A: Authorizer> {
     authorizer: Arc<A>,
     retention: Option<Arc<dyn Any + Send + Sync>>,
     session: Option<(u32, AuthorizedSession)>,
+    completion_session: Arc<Mutex<Option<AuthorizedSession>>>,
     generation: ConnectionGeneration,
     tracks: HashMap<WireTrack, TrackState>,
     limits: IngestLimits,
@@ -391,9 +396,31 @@ struct Handler<A: Authorizer> {
     event_budget: Arc<Semaphore>,
     slot: Arc<OwnedSemaphorePermit>,
 }
-impl<A: Authorizer> Drop for Handler<A> {
+// Lebt außerhalb des RTMP-Handlers, damit der endgültige Transport-Endgrund
+// bereits feststeht, wenn die autorisierte Reservierung freigegeben wird.
+struct AuthorizationCompletion<A: Authorizer> {
+    authorizer: Arc<A>,
+    session: Arc<Mutex<Option<AuthorizedSession>>>,
+    report: Arc<Mutex<SessionReport>>,
+    finished: bool,
+}
+impl<A: Authorizer> Drop for AuthorizationCompletion<A> {
     fn drop(&mut self) {
-        if let Some((_, session)) = self.session.take() {
+        let session = self
+            .session
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        if let Some(session) = session {
+            let mut report = self
+                .report
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone();
+            if !self.finished && report.reason == EndReason::ProtocolRejected {
+                report.reason = EndReason::TaskFailed;
+            }
+            self.authorizer.completed(session, &report);
             self.authorizer.release(session);
         }
     }
@@ -555,6 +582,10 @@ impl<A: Authorizer> SessionHandler for Handler<A> {
             .await
             .map_err(|()| self.reject(EndReason::AuthorizationRejected))?;
         self.session = Some((stream_id, session));
+        *self
+            .completion_session
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(session);
         self.retention = self.authorizer.retention(session);
         self.status.send_replace(Activity {
             published: true,
@@ -620,6 +651,12 @@ async fn run_connection<A: Authorizer>(
     report: Arc<Mutex<SessionReport>>,
     admission: Admission,
 ) -> SessionReport {
+    let mut completion = AuthorizationCompletion {
+        authorizer: authorizer.clone(),
+        session: Arc::new(Mutex::new(None)),
+        report: report.clone(),
+        finished: false,
+    };
     let deadline = admission.start_deadline;
     let reason = match timeout_at(deadline, TlsAcceptor::from(tls).accept(socket)).await {
         Err(_) => EndReason::StartTimeout,
@@ -634,6 +671,7 @@ async fn run_connection<A: Authorizer>(
                 authorizer,
                 retention: None,
                 session: None,
+                completion_session: completion.session.clone(),
                 generation,
                 tracks: HashMap::new(),
                 budget: Arc::new(Semaphore::new(limits.max_queued_bytes)),
@@ -677,6 +715,8 @@ async fn run_connection<A: Authorizer>(
     };
     let mut final_report = report.lock().unwrap_or_else(|e| e.into_inner()).clone();
     final_report.reason = reason;
+    *report.lock().unwrap_or_else(|error| error.into_inner()) = final_report.clone();
+    completion.finished = true;
     final_report
 }
 
@@ -717,6 +757,7 @@ mod tests {
             authorizer: Arc::new(UnusedAuthorizer),
             retention: None,
             session: Some((1, AuthorizedSession::new(1, 1).unwrap())),
+            completion_session: Arc::new(Mutex::new(None)),
             generation,
             tracks: HashMap::new(),
             limits: limits.clone(),

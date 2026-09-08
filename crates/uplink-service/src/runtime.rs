@@ -49,6 +49,11 @@ impl Authorizer for ServiceAuthorizer {
             active.remove(&session);
         }
     }
+    fn completed(&self, session: AuthorizedSession, report: &uplink_ingest::SessionReport) {
+        if let Some(reservation) = self.reservation(session) {
+            reservation.ingest_ended(&report.reason);
+        }
+    }
     fn retention(
         &self,
         session: AuthorizedSession,
@@ -128,9 +133,12 @@ pub async fn serve_with_ready<P: SessionProcessor>(
                 let Ok(mut connection) = connection else { continue; };
                 let processor = processor.clone();
                 let mut media_stopped=media_stopped.clone();
+                // Der autorisierte Endgrund kommt unabhängig vom ersten Event
+                // über completed. finish wartet nur noch den Producerabschluss;
+                // die Medienverarbeitung beendet danach ihre eigene Reservierung.
                 tasks.spawn(async move {
                     let first=tokio::select!{first=connection.next()=>first,_=media_stopped.changed()=>None};
-                    let Some(first) = first else { return; };
+                    let Some(first) = first else { let _=connection.finish().await; return; };
                     let Some(reservation) = first.authorization_retention().and_then(|value| value.downcast::<Reservation>().ok()) else { return; };
                     reservation.record(first.wire_body().len());
                     let (sender, receiver) = mpsc::channel(256);
@@ -147,8 +155,7 @@ pub async fn serve_with_ready<P: SessionProcessor>(
                             }
                         }
                     }
-                    let report = connection.finish().await;
-                    reservation.ingest_ended(&report.reason);
+                    let _ = connection.finish().await;
                     reservation.ended();
                 });
             }
