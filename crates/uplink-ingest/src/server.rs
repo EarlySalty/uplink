@@ -96,6 +96,8 @@ pub struct SessionReport {
     pub generation: ConnectionGeneration,
     pub received_events: u64,
     pub received_bytes: u64,
+    /// Größter vor Versand beobachteter Eventbudgetwert. Nebenläufige Drops
+    /// können frühere Spitzen verkürzen; kein exakter historischer Peak/RAM-Wert.
     pub max_queued_bytes: usize,
     pub track_count: usize,
     pub ignored_amf_messages: u64,
@@ -295,7 +297,11 @@ impl RunningConnection {
         // Verbraucher darf finish auch ohne vollständiges Leeren aufrufen.
         // Das Ende seiner Abnahme beendet dann den Producer sichtbar.
         self.receiver.close();
-        match self.task.take().expect("owned task").await {
+        // Keep ownership through the await so cancelling this future still
+        // lets Drop abort the producer and release its connection slot.
+        let result = self.task.as_mut().expect("owned task").await;
+        self.task.take();
+        match result {
             Ok(report) => report,
             Err(_) => {
                 let mut report = self
@@ -435,6 +441,9 @@ impl<A: Authorizer> Handler<A> {
             .clone()
             .try_acquire_owned()
             .map_err(|_| self.reject(EndReason::Backpressure))?;
+        // Observe while this event's permit is still owned here. A consumer
+        // may drop the published event before we acquire the report lock.
+        let observed_budget = self.limits.max_queued_bytes - self.budget.available_permits();
         let size = data.len();
         let event = MediaEvent {
             identity: TrackIdentity {
@@ -466,9 +475,7 @@ impl<A: Authorizer> Handler<A> {
         report.received_events += 1;
         report.received_bytes += size as u64;
         report.track_count = self.tracks.len();
-        report.max_queued_bytes = report
-            .max_queued_bytes
-            .max(self.limits.max_queued_bytes - self.budget.available_permits());
+        report.max_queued_bytes = report.max_queued_bytes.max(observed_budget);
         self.status.send_replace(Activity {
             published: true,
             last_media: Instant::now(),
@@ -613,4 +620,69 @@ async fn run_connection<A: Authorizer>(
     let mut final_report = report.lock().unwrap_or_else(|e| e.into_inner()).clone();
     final_report.reason = reason;
     final_report
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct UnusedAuthorizer;
+    impl Authorizer for UnusedAuthorizer {
+        async fn authorize(&self, _: &str, _: &str) -> Result<AuthorizedSession, ()> {
+            Err(())
+        }
+    }
+
+    #[test]
+    fn immediate_consumer_drop_cannot_erase_observed_event_budget() {
+        let limits = IngestLimits::local_probe();
+        let generation = ConnectionGeneration {
+            instance: [0; 16],
+            counter: 1,
+        };
+        let report = Arc::new(Mutex::new(SessionReport {
+            reason: EndReason::ProtocolRejected,
+            generation,
+            received_events: 0,
+            received_bytes: 0,
+            max_queued_bytes: 0,
+            track_count: 0,
+            ignored_amf_messages: 0,
+        }));
+        let budget = Arc::new(Semaphore::new(limits.max_queued_bytes));
+        let (sender, mut receiver) = mpsc::channel(1);
+        let (status, _) = watch::channel(Activity {
+            published: true,
+            last_media: Instant::now(),
+        });
+        let mut handler = Handler {
+            authorizer: Arc::new(UnusedAuthorizer),
+            session: Some((1, AuthorizedSession::new(1, 1).unwrap())),
+            generation,
+            tracks: HashMap::new(),
+            limits: limits.clone(),
+            sender,
+            budget: budget.clone(),
+            status,
+            report: report.clone(),
+            event_budget: Arc::new(Semaphore::new(limits.max_queued_events)),
+            slot: Arc::new(Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap()),
+        };
+        // Deterministic interleaving: the consumer frees the event while the
+        // producer is waiting to update the report. No timing/race lottery.
+        let guard = report.lock().unwrap();
+        let producer = std::thread::spawn(move || {
+            handler.media(
+                1,
+                MediaKind::Audio,
+                0,
+                Bytes::from_static(&[0xaf, 0, 0x11, 0x90]),
+            )
+        });
+        drop(receiver.blocking_recv().unwrap());
+        assert_eq!(budget.available_permits(), limits.max_queued_bytes);
+        drop(guard);
+        producer.join().unwrap().unwrap();
+        assert_eq!(report.lock().unwrap().max_queued_bytes, 4);
+    }
 }

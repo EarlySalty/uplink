@@ -331,6 +331,34 @@ async fn tls_start_deadline_and_handshake_eof_are_distinct() {
 }
 
 #[tokio::test]
+async fn cancelled_finish_closes_silent_producer_and_releases_connection_slot() {
+    let mut limits = IngestLimits::local_probe();
+    limits.max_connections = 1;
+    limits.start_timeout = Duration::from_secs(60);
+    let (server, config) = server(true, limits).await;
+    let mut silent = TcpStream::connect(server.local_addr().unwrap())
+        .await
+        .unwrap();
+    let connection = server.accept().await.unwrap();
+    assert!(
+        timeout(Duration::from_millis(20), connection.finish())
+            .await
+            .is_err()
+    );
+    let mut byte = [0];
+    assert_eq!(
+        timeout(Duration::from_millis(500), silent.read(&mut byte))
+            .await
+            .expect("cancelled finish must close producer before the 60-second start deadline")
+            .unwrap(),
+        0
+    );
+    let (replacement, client) = connect(&server, config).await;
+    drop(replacement);
+    drop(client);
+}
+
+#[tokio::test]
 async fn missing_media_reaches_idle_timeout_after_authorized_publish() {
     let mut limits = IngestLimits::local_probe();
     limits.media_idle_timeout = Duration::from_millis(100);

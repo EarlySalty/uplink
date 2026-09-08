@@ -37,6 +37,29 @@ Ein zwischenzeitlicher Formatierungsfehler im gleichzeitig bearbeiteten
 Probe-Beispiel wurde ebenfalls korrigiert; die Pflichtprüfungen wurden danach
 erneut ausgeführt.
 
+## Nachreview der Gate-Befunde auf `baf240c`
+
+Die zwei anschließend vom zentralen Gate benannten Korrekturen wurden gemeinsam
+mit ihren Regressionstests gezielt nachgeprüft:
+
+- `finish()` hält den Producer-JoinHandle jetzt bis zum abgeschlossenen `await`
+  im Besitzer. Beim Abbruch der Future erreicht dessen `Drop` den Handle und
+  beendet den Producer. Der Transporttest verwendet einen stillen TCP-Peer und
+  eine Startfrist von 60 Sekunden: Nach dem Abbruch muss innerhalb von 500 ms
+  EOF eintreffen und eine Ersatzverbindung wieder einen Slot erhalten.
+- Die Budgetbelegung wird vor `try_send` erfasst, solange die eigene Byte-Permit
+  noch beim Producer liegt. Ein deterministischer Test blockiert dessen
+  Reportaktualisierung, lässt den Consumer das Ereignis freigeben und prüft
+  anschließend den erhaltenen Messwert von vier Bytes. Der Wert bleibt das
+  Maximum beobachteter Messpunkte; gleichzeitige Freigaben älterer Ereignisse
+  erlauben keine Zusage eines atomar erfassten historischen Höchststands.
+
+Beide Tests waren laut Fixer vor der Korrektur rot. Im unabhängigen Nachreview
+bestanden sie zusammen mit allen Ingest-/Beispieltests in Debug und Release;
+Check, Clippy und Formatierung waren ebenfalls grün. Die übrigen unveränderten
+Vendorpfade wurden dafür nicht erneut breit geprüft. Keine weiteren offenen
+Befunde aus diesem Nachreview.
+
 ## Gemeinsam geprüfte Grenzen
 
 - RTMP-Nachrichtenlänge, AMF-Nachrichtenlänge, Chunkstreamzahl und die Summe
@@ -88,7 +111,7 @@ verwendeten die Rustup-Toolchain und höchstens zwei Cargo-Baujobs je Aufruf.
 | --- | --- | --- |
 | Scuffle RTMP | 78 Tests + 1 Doctest | 78 Tests + 1 Doctest |
 | Scuffle AMF mit Serde | 61 Tests + 1 Doctest | 61 Tests + 1 Doctest |
-| Uplink-Ingest inklusive TLS-Transport | 22 Tests | 22 Tests |
+| Uplink-Ingest inklusive TLS-Transport | 24 Tests | 24 Tests |
 | FFmpeg-Probe, portable Referenztests | 3 Tests | 3 Tests |
 
 Zwei geerbte RTMP-Medientests benötigen fehlende Upstream-Testdateien und sind
@@ -104,6 +127,10 @@ AAC-Pakete, jeweils drei SequenceHeader auf drei eindeutig zugeordneten Spuren.
 Größen und SHA-256 stimmen mit den versionierten Referenzen überein; jedes
 Paket behält DTS/PTS mit gemeinsamer Verschiebung **0 ms**. Beide Sessions enden
 mit `ExplicitStop` und verschiedenen Generationen.
+Dieser eigenständige FFmpeg-Lauf erfolgte vor den beiden Gate-Korrekturen;
+Medienparser, TLS-Testaufbau und Probequelltext sind seitdem unverändert.
+Der korrigierte Lebensdauer-/Metrikpfad wurde anschließend wie oben beschrieben
+in beiden Buildprofilen nachgeprüft.
 
 Die unabhängige Negativmessung über den DNS-Namen `localhost` bestätigte:
 falsche CA sowie falscher SAN bei ausdrücklich vertrautem Zertifikat führen
@@ -122,7 +149,7 @@ SHA-256 des unabhängig ausgeführten und nachgeprüften Stands:
 
 | Datei | SHA-256 |
 | --- | --- |
-| `crates/uplink-ingest/src/server.rs` | `2950963aaf98565300ddcb118d300baafadd2ec7df1d6e11526da9801258c494` |
+| `crates/uplink-ingest/src/server.rs` | `258ab908b77d9d42c0d38f04f732087559ca6cd6bfb702c6406d085aa3af410d` |
 | `crates/uplink-ingest/src/media.rs` | `f6efa48adb63e4359f32ae82f5d8c8279d268d4637803945c09245f6cc956ac0` |
 | `crates/uplink-ingest/examples/rtmps_probe.rs` | `00c05835548d818244868f1d43cca84bf3c0fd8fc7a277395267fa0bfd995740` |
 | `crates/uplink-ingest/tests/support/tls.rs` | `3d93965beeec5befa0d84433ad8f96dab8ebfbc6ddc351d8b1f06f9b0963f2f3` |

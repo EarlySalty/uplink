@@ -3,6 +3,9 @@
 Stand: 8. September 2026. Unabhängige Prüfung des Arbeitsstands auf
 `feat/rtmps-ingest` gegen `02567c2d865825e374c7c5ead78e84f200307608`, einschließlich
 des korrigierten Metadata-Tracklimits und der Codec-/Headerzuordnung.
+Ergänzend wurde der enge Gate-Nachfix gegen
+`baf240cf53b6460d20cb276e96c20dadd45a6f4a` unabhängig geprüft: Abbruch von
+`finish()` und Messung des beobachteten Eventbudgets.
 
 **Ergebnis:** Kein weiterer konkreter Sicherheitsblocker im geprüften
 Loopback-Baustein. Der Stand kann für diesen Entwicklungsumfang übernommen
@@ -21,7 +24,7 @@ nicht untersucht oder geändert.
 SHA-256 über die sortierten Pfade und SHA-256-Werte aller Rust-Dateien und
 Manifeste/Lockfiles dieses Bereichs einschließlich Root-Cargo/CI:
 
-`09e8ca09ec521f9a3d29421d4783fc5c41a9a0200ff34cb33b38676afc215cb4`
+`07da3a8f31dbf74449cc931a33b35d126c80ed63abce11763371adafcc01d1e5`
 
 Reproduktion aus der Repositorywurzel; Buildverzeichnisse bleiben ausgeschlossen:
 
@@ -87,6 +90,9 @@ rg --files crates/uplink-ingest third_party/scuffle-rtmp third_party/scuffle-amf
 
 ## Eigenständig ausgeführte Prüfungen
 
+Die folgenden Läufe gehören zum ersten vollständigen Review vor dem engen
+Gate-Nachfix; dessen zusätzliche Prüfungen stehen unmittelbar darunter.
+
 | Prüfung | Ergebnis |
 | --- | --- |
 | `cargo +1.97.1 test -p uplink-ingest --test transport --locked -j2` | 15 bestanden, 0 fehlgeschlagen, einschließlich Metadata-Fix, TLS, Autorisierung, Fristen und gehaltenen Eventbudgets |
@@ -110,6 +116,42 @@ Autor nach dem Metadata-Fix erneut ausgeführt und im
 [RTMPS-Nachweis](rtmps-nachweis.md) dokumentiert. Sie wurden in diesem
 Sicherheitsreview nicht erneut gestartet. Breite Debug-/Releaseprüfungen und
 der abschließende Gate-Lauf werden zentral gebündelt.
+
+## Gezielter Nachreview nach dem Gate
+
+Gegen `baf240c` änderten sich ausschließlich `crates/uplink-ingest/src/server.rs`,
+der zugehörige Transporttest und `docs/rtmps-nachweis.md`. Die bestehenden
+Parser-, Abhängigkeits- und Secretprüfungen wurden deshalb nicht wiederholt.
+
+`finish()` behält den JoinHandle bis nach dem vollständigen Await in `self.task`.
+Wird die Future abgebrochen, erreicht `RunningConnection::drop` weiterhin den
+Handle und bricht den Producer ab. Nach dessen Ende werden Socket und Slot
+freigegeben; extern gehaltene Events behalten ihren bisherigen Slotbesitz.
+Zwischen abgeschlossenem Await und Entnahme des Handles liegt keine weitere
+Unterbrechungsstelle.
+
+Die Budgetbelegung wird jetzt vor `try_send` erfasst, während der Producer die
+Byte-Permits des aktuellen Events hält. Der Bericht verwendet diesen erfassten
+Wert auch dann, wenn der Consumer das Event sofort freigibt. Die Änderung
+beeinflusst keine Admission- oder Speichergrenze. `max_queued_bytes` ist
+ausdrücklich das Maximum dieser Messpunkte: Nebenläufige Drops älterer Events
+können Zwischenpeaks verdecken. Rustdoc und Nachweis versprechen deshalb keinen
+atomaren historischen Höchststand oder gemessenen RAM-Verbrauch.
+
+Beide neuen Regressionen wurden im Nachreview mit Rust 1.97.1, `--locked -j2`
+einzeln ausgeführt und bestanden:
+
+- `--lib immediate_consumer_drop_cannot_erase_observed_event_budget` erzwingt
+  das relevante Interleaving über den Berichts-Mutex und prüft vier beobachtete
+  Bytes nach vollständiger Consumer-Freigabe.
+- `--test transport cancelled_finish_closes_silent_producer_and_releases_connection_slot`
+  bricht `finish()` bei einem stillen TCP-Peer ab und prüft Socket-Ende sowie
+  eine neue Slotreservierung deutlich vor der konfigurierten 60-Sekunden-Frist.
+
+`git diff --check` blieb erfolgreich. Der oben angegebene Fingerprint wurde
+über den aktualisierten Gesamtprüfbereich neu berechnet. Ergebnis des engen
+Nachreviews: beide Befunde geschlossen, keine zusätzlichen Sicherheitsblocker
+im freigegebenen lokalen Entwicklungsumfang.
 
 ## Aussagegrenzen
 

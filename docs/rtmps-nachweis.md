@@ -58,7 +58,11 @@ Verbindungsslot bleibt bis zum letzten Event belegt. Damit kann ein Consumer
 die Grenze nicht durch viele bereits beendete, aber noch gehaltene Sessions
 umgehen. Parserpuffer, TLS und Objektverwaltung haben zusätzlich begrenzte bzw.
 bibliothekseigene Allokationen; die Eventbytezahl ist kein gemessener Gesamt-Heap.
-`max_queued_bytes` ist die beobachtete Belegung des Eventbudgets.
+`max_queued_bytes` ist der größte beobachtete Eventbudgetwert vor Versand eines
+Events. Dessen eigene Byte-Permits sind bei der Messung noch im Producer; ein
+sofortiger Consumer-Drop kann den Wert nicht auf null verschwinden lassen.
+Ältere Events können nebenläufig freigegeben werden: dies ist ein Maximum von
+Messpunkten, kein atomar erfasster historischer Höchststand oder RAM-Messwert.
 
 Die Abgabe verwendet ausschließlich `try_send` und sofortige Budgetreservierung.
 Volle Budgets oder ein voller Kanal beenden die Session mit `Backpressure`, ein
@@ -66,6 +70,11 @@ geschlossener Consumer mit `ConsumerClosed`; kein unbeschränktes Warten auf ein
 langsamen Verbraucher. Fehlende Header, zu viele Tracks und sinkende Zeitstempel
 werden separat abgewiesen. Ein expliziter Stop schließt die Verbindung; ein
 weiterer Publish braucht eine neue Generation.
+
+Der Producer-Handle bleibt während `finish().await` im Besitzer. Wird diese
+Future abgebrochen, beendet `Drop` den Producer und gibt nach dessen Ende den
+Slot frei. Auch ein stiller Peer hält die Verbindung dann nicht bis zur sonst
+geltenden Startfrist belegt.
 
 Auch Metadaten vor dem ersten SequenceHeader belegen einen Track; Revision 0
 kennzeichnet dabei den fehlenden Header. Sie erlauben keine Frames und erben
@@ -83,9 +92,10 @@ ungefilterten Bibliotheksfehler.
 
 ## Portable Tests
 
-Der gezielte Lauf bestand mit 22 Tests: sieben reine Wirekopf-Prüfungen
-und 15 echte Loopback-TLS-/RTMP-Tests. Zusammen mit den bisherigen 24 Core-/CLI-
-Tests und drei Beispieltests bestanden 49 Workspace-Tests mit `--all-targets`.
+Der gezielte Lauf bestand mit 24 Tests: sieben Wirekopf-Prüfungen, eine deterministische
+Nebenläufigkeitsprüfung und 16 echte Loopback-TLS-/RTMP-Tests. Zusammen mit den
+bisherigen 24 Core-/CLI-Tests und drei Beispieltests bestanden 51 Workspace-Tests
+mit `--all-targets`.
 Ingest und Beispiel wurden auch im Releaseprofil geprüft. Geprüft wurden:
 
 - unbekannter Hostname und fremdes Zertifikat werden abgelehnt;
@@ -98,7 +108,10 @@ Ingest und Beispiel wurden auch im Releaseprofil geprüft. Geprüft wurden:
 - AAC-MultichannelConfig bleibt von Medienframes getrennt; unvollständige,
   widersprüchliche und nicht freigegebene Kanalbeschreibungen werden abgelehnt;
 - nach beendeter Session bleiben Slot und Budgets bis zum letzten gehaltenen
-  Event belegt und werden danach freigegeben.
+  Event belegt und werden danach freigegeben;
+- Abbruch von `finish()` beendet auch einen stillen Producer; sofortiges
+  Freigeben eines Events löscht dessen beobachteten Budgetwert nicht. Beide
+  Gate-Nachregressionen schlugen vor dem jeweiligen Fix tatsächlich fehl.
 
 Die Zertifikate werden für die Tests frisch im Prozess erzeugt. Private Schlüssel
 werden weder aus einer Datei gelesen noch in eine Datei geschrieben oder ausgegeben.
@@ -128,7 +141,7 @@ Pflichtprüfung in `cargo test`. Ein fehlender Binaryparameter oder FFmpeg 6
 beendet den Aufruf mit Fehler; diese Fälle werden nicht als bestandene
 Medienprüfung ausgegeben.
 
-Der abschließende Lauf nach dem Metadata-Reviewfix mit
+Der abschließende Lauf nach den Metadata- und Gate-Korrekturen mit
 `n8.1.2-50-g1a748fe2cd-20260831` bestätigte für
 beide Codecs jeweils 240 komprimierte Medienpakete und drei SequenceHeader
 auf drei Spuren. Sämtliche Nutzbytes und Header stimmen nach Größe und SHA-256
@@ -145,12 +158,11 @@ Objekt; daraus folgt kein geprüfter Farbraum oder HDR-Nachweis.
 
 | Eingang | Video / Audio 0 / Audio 1 | Header / Metadaten / SequenceEnd | Events / Bodybytes | Beobachtetes Eventbudget-Maximum |
 | --- | --- | --- | --- | --- |
-| AV1 + zwei AAC | 50 / 95 / 95 Pakete | 3 / 2 / 0 | 245 / 59.665 Bytes | 9.640 Bytes |
-| H.264 + zwei AAC | 50 / 95 / 95 Pakete | 3 / 1 / 1 | 245 / 141.520 Bytes | 23.527 Bytes |
+| AV1 + zwei AAC | 50 / 95 / 95 Pakete | 3 / 2 / 0 | 245 / 59.665 Bytes | 9.128 Bytes |
+| H.264 + zwei AAC | 50 / 95 / 95 Pakete | 3 / 1 / 1 | 245 / 141.520 Bytes | 14.959 Bytes |
 
-Die Tabelle zeigt den Debug-Nachlauf. Der abschließende Release-Aufruf bestand
-ebenfalls vollständig; seine Budgetspitzen lagen bei 8.004 beziehungsweise
-8.025 Bytes. Die Spitzenwerte hängen vom Scheduling ab; sie sind kein
+Die Tabelle zeigt den abschließenden Release-Nachlauf. Die beobachteten
+Spitzenwerte hängen vom Scheduling ab; sie sind kein
 Kapazitätsbenchmark. Der [native Reviewer](review-rtmps.md) wiederholte den
 echten Nachweis auf dem korrigierten Librarypfad unabhängig erfolgreich.
 Der [separate Sicherheitsreview](review-security-rtmps.md) bestätigt den finalen

@@ -33,9 +33,10 @@ Stand: 8. September 2026, nach Merge von PR #1 und PR #2 auf `main` (`001724fdac
 ## Lokaler RTMPS-Baustein
 
 - [x] Ausführbaren Rust-Eingang mit injizierter TLS-/Autorisierungskonfiguration, frischen Generationen und begrenzten Track-/Eventzuständen bauen.
-- [x] 22 Ingesttests und drei Beispieltests sowie echte FFmpeg-8-AV1-/H.264-plus-zwei-AAC-Übertragung prüfen; TLS-CA-/Hostname-Negativfälle und numerische URL-Grenze dokumentieren.
+- [x] 24 Ingesttests und drei Beispieltests sowie echte FFmpeg-8-AV1-/H.264-plus-zwei-AAC-Übertragung prüfen; TLS-CA-/Hostname-Negativfälle und numerische URL-Grenze dokumentieren.
 - [x] Metadata-Tracklimit und fremde Codec-Revision mit roten Regressionstests beheben und unabhängig nachprüfen; [Nachweis](../../docs/rtmps-nachweis.md).
 - [x] Separaten [Sicherheitsreview](../../docs/review-security-rtmps.md) mit 59 gezielten Tests, drei Audits und Gitleaks abschließen.
+- [x] Eigene Gate-Prüfung auf `baf240c` ausführen; beide Hinweise zu `finish()`-Abbruch und Eventbudget-Messung mit zuerst roten Regressionen beheben. Finaler Gate nach Nachreview bleibt offen.
 - [ ] Regulären Gate, GitHub-CI und Merge dieses Bausteins abschließen und tatsächlichen Stand nachtragen.
 
 ## Vollständiger Produktumfang
