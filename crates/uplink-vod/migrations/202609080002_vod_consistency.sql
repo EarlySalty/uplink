@@ -9,12 +9,28 @@ ALTER TABLE relay.vod_jobs ADD COLUMN IF NOT EXISTS proof_blocked boolean NOT NU
 ALTER TABLE relay.vod_jobs ADD COLUMN IF NOT EXISTS publication_confirmed boolean NOT NULL DEFAULT false;
 ALTER TABLE relay.vod_jobs DROP CONSTRAINT IF EXISTS vod_jobs_state_check;
 ALTER TABLE relay.vod_jobs ADD CONSTRAINT vod_jobs_state_check CHECK(state IN ('waiting_source','prepared','starting','uploading','processing','publishing','ready','blocked','failed','cancelled'));
-DO $$ BEGIN
-    IF NOT EXISTS(SELECT 1 FROM pg_constraint WHERE conrelid='relay.vod_jobs'::regclass AND conname='vod_ready_has_total') THEN
-        ALTER TABLE relay.vod_jobs ADD CONSTRAINT vod_ready_has_total CHECK
-            (state<>'ready' OR (total_bytes IS NOT NULL AND (settings->>'privacy'='private' OR publication_confirmed)));
-    END IF;
-END $$;
+-- Frühere ready-Zeilen enthalten noch keinen Veröffentlichungsnachweis.
+-- Unbekannte Voraussetzungen sperren; vollständige autorisierte Aufträge
+-- erneut gegen YouTube abgleichen, statt eine Bestätigung zu erfinden.
+ALTER TABLE relay.vod_jobs DROP CONSTRAINT IF EXISTS vod_ready_has_total;
+UPDATE relay.vod_jobs SET state='blocked',resume_state=NULL,
+    last_error=CASE WHEN total_bytes IS NULL THEN 'incomplete' ELSE 'invalid' END,
+    lease_owner=NULL,lease_until=NULL,updated_at=now()
+WHERE state='ready' AND (total_bytes IS NULL
+    OR (settings->>'privacy' IN ('private','unlisted','public')) IS NOT TRUE
+    OR (settings->>'privacy' IN ('unlisted','public')
+        AND (settings->'publication_authorized'='true'::jsonb) IS NOT TRUE));
+UPDATE relay.vod_jobs SET state='processing',processing_succeeded=false,
+    last_error='ambiguous',lease_owner=NULL,lease_until=NULL,
+    next_attempt_at=now(),updated_at=now()
+WHERE state='ready' AND settings->>'privacy' IN ('unlisted','public')
+    AND NOT publication_confirmed;
+ALTER TABLE relay.vod_jobs ADD CONSTRAINT vod_ready_has_total CHECK
+    (state<>'ready' OR (total_bytes IS NOT NULL AND
+        (settings->>'privacy'='private' OR
+            (settings->>'privacy' IN ('unlisted','public')
+                AND settings->'publication_authorized'='true'::jsonb
+                AND publication_confirmed)) IS TRUE));
 CREATE INDEX IF NOT EXISTS vod_jobs_streamer_id ON relay.vod_jobs(streamer_id,id DESC);
 CREATE INDEX IF NOT EXISTS vod_objects_streamer_id ON relay.vod_objects(streamer_id);
 CREATE INDEX IF NOT EXISTS vod_twitch_bindings_streamer_id ON relay.vod_twitch_bindings(streamer_id);

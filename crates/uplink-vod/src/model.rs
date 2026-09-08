@@ -86,7 +86,7 @@ pub enum Error {
     Storage,
     #[error("Die dauerhafte VOD-Verwaltung ist nicht verfügbar.")]
     Database,
-    #[error("Der Auftrag gehört inzwischen einem anderen Worker.")]
+    #[error("Die Zuständigkeit des Workers ist abgelaufen oder nicht mehr bestätigt.")]
     LeaseLost,
     #[error("Die VOD-Verarbeitung wurde abgebrochen.")]
     Cancelled,

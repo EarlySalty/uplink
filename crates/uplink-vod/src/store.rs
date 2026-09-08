@@ -6,6 +6,11 @@ use serde_json::Value;
 use std::sync::Arc;
 use tokio_postgres::{Row, Transaction, types::ToSql};
 
+const LEASE_SECONDS: i64 = 120;
+fn lease_deadline() -> tokio::time::Instant {
+    tokio::time::Instant::now() + std::time::Duration::from_secs(LEASE_SECONDS as u64)
+}
+
 pub const MIGRATION: &str = concat!(
     include_str!("../migrations/202609080001_vod.sql"),
     "\n",
@@ -50,6 +55,7 @@ pub(crate) struct Job {
     pub video_id: Option<String>,
     pub lease_owner: String,
     pub ended_at: DateTime<Utc>,
+    pub lease_deadline: tokio::time::Instant,
 }
 impl Job {
     pub fn aad(&self) -> String {
@@ -174,7 +180,10 @@ impl Store {
         let mut random = [0; 16];
         getrandom::fill(&mut random).map_err(|_| Error::Invalid)?;
         let owner = hex::encode(random);
-        let rows=self.db.query("WITH next AS (SELECT id FROM relay.vod_jobs WHERE state NOT IN ('ready','blocked','failed','cancelled') AND next_attempt_at<=now() AND (lease_until IS NULL OR lease_until<now()) ORDER BY next_attempt_at,id FOR UPDATE SKIP LOCKED LIMIT 1) UPDATE relay.vod_jobs j SET lease_owner=$1,lease_until=now()+interval '120 seconds',attempts=attempts+1,updated_at=now() FROM next WHERE j.id=next.id RETURNING j.id,j.session_id,j.streamer_id,j.state,j.settings,j.object_id,j.upload_session_enc,j.total_bytes,j.video_id,j.ended_at",&[&owner]).await?;
+        // Vor dem DB-Aufruf beginnen: Antwort-/Poolwartezeit darf die lokal
+        // bestätigte Zuständigkeit niemals über die serverseitige Lease heben.
+        let lease_deadline = lease_deadline();
+        let rows=self.db.query("WITH next AS (SELECT id FROM relay.vod_jobs WHERE state NOT IN ('ready','blocked','failed','cancelled') AND next_attempt_at<=now() AND (lease_until IS NULL OR lease_until<clock_timestamp()) ORDER BY next_attempt_at,id FOR UPDATE SKIP LOCKED LIMIT 1) UPDATE relay.vod_jobs j SET lease_owner=$1,lease_until=clock_timestamp()+($2::bigint*interval '1 second'),attempts=attempts+1,updated_at=now() FROM next WHERE j.id=next.id RETURNING j.id,j.session_id,j.streamer_id,j.state,j.settings,j.object_id,j.upload_session_enc,j.total_bytes,j.video_id,j.ended_at",&[&owner,&LEASE_SECONDS]).await?;
         let Some(r) = rows.first() else {
             return Ok(None);
         };
@@ -190,6 +199,7 @@ impl Store {
             video_id: r.get(8),
             lease_owner: owner,
             ended_at: r.get(9),
+            lease_deadline,
         }))
     }
     pub(crate) async fn fenced(
@@ -250,9 +260,11 @@ impl Store {
         self.transact(&mut task).await?;
         task.result.ok_or(Error::Database)
     }
-    pub(crate) async fn heartbeat(&self, job: &Job) -> Result<()> {
-        self.fenced(job,"UPDATE relay.vod_jobs SET lease_until=now()+interval '120 seconds' WHERE id=$1 AND lease_owner=$2 AND lease_until>now() RETURNING id",&[]).await?;
-        Ok(())
+    pub(crate) async fn heartbeat(&self, job: &Job) -> Result<tokio::time::Instant> {
+        let deadline = lease_deadline();
+        self.fenced(job,"UPDATE relay.vod_jobs SET lease_until=clock_timestamp()+($3::bigint*interval '1 second') WHERE id=$1 AND lease_owner=$2 AND lease_until>clock_timestamp() RETURNING id",&[&LEASE_SECONDS]).await?;
+        // Erst nach bestätigtem Transaktionsabschluss an den Watchdog geben.
+        Ok(deadline)
     }
     pub(crate) async fn release(&self, job: &Job, delay: i32) -> Result<()> {
         self.fenced(job,"UPDATE relay.vod_jobs SET lease_owner=NULL,lease_until=NULL,next_attempt_at=now()+($3::integer*interval '1 second'),updated_at=now() WHERE id=$1 AND lease_owner=$2 AND lease_until>now() RETURNING id",&[&delay]).await?;

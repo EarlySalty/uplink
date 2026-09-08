@@ -73,26 +73,48 @@ impl Worker {
         let Some(job) = self.store.claim().await? else {
             return Ok(false);
         };
-        let step = self.step(&job);
-        tokio::pin!(step);
-        let heartbeat = async {
-            loop {
-                tokio::time::sleep(Duration::from_secs(30)).await;
-                match self.store.heartbeat(&job).await {
-                    Ok(()) | Err(Error::Database) => {}
-                    Err(error) => return error,
-                }
+        let result = {
+            let step = self.step(&job);
+            tokio::pin!(step);
+            // Beide Futures bleiben pollbar. Der Watchdog begrenzt auch einen
+            // hängenden Heartbeat; nur eine bestätigte Erneuerung verlängert ihn.
+            tokio::select! {
+                biased;
+                error=self.watch_lease(&job)=>Err(error),
+                result=&mut step=>result,
             }
         };
-        // Beide Futures bleiben pollbar, auch wenn ein begrenzter externer
-        // Schritt dieselbe DB-Verbindung hält und der Heartbeat darauf wartet.
-        let result = tokio::select! {result=&mut step=>result,error=heartbeat=>Err(error)};
+        // Die abgebrochene Vorbereitung samt Prozess-/Dateisperren ist hier
+        // bereits gedroppt, bevor irgendein weiterer DB-Abschluss wartet.
         match result {
             Ok(delay) => self.store.release(&job, delay).await?,
             Err(Error::LeaseLost) => return Err(Error::LeaseLost),
             Err(error) => self.store.error(&job, error).await?,
         }
         Ok(true)
+    }
+    async fn watch_lease(&self, job: &Job) -> Error {
+        let mut deadline = job.lease_deadline;
+        loop {
+            tokio::select! {
+                biased;
+                _=tokio::time::sleep_until(deadline)=>return Error::LeaseLost,
+                _=tokio::time::sleep(Duration::from_secs(30))=>{},
+            }
+            let renewal = tokio::select! {
+                biased;
+                _=tokio::time::sleep_until(deadline)=>return Error::LeaseLost,
+                result=self.store.heartbeat(job)=>result,
+            };
+            if tokio::time::Instant::now() >= deadline {
+                return Error::LeaseLost;
+            }
+            match renewal {
+                Ok(confirmed) => deadline = confirmed,
+                Err(Error::Database) => {} // Der bisherige Termin bleibt bestehen.
+                Err(error) => return error,
+            }
+        }
     }
     async fn step(&self, job: &Job) -> Result<i32> {
         match job.state.as_str() {
@@ -272,7 +294,21 @@ impl Worker {
         let mut random = [0u8; 16];
         getrandom::fill(&mut random).map_err(|_| Error::Storage)?;
         let owner = hex::encode(random);
-        let rows=self.store.db.query("WITH candidate AS (SELECT o.id FROM relay.vod_objects o WHERE o.state IN ('available','deleting') AND (o.cleanup_until IS NULL OR o.cleanup_until<now()) AND o.complete=true AND EXISTS(SELECT 1 FROM relay.vod_jobs j WHERE j.object_id=o.id AND j.streamer_id=o.streamer_id AND j.state='ready' AND j.processing_succeeded=true AND j.video_id IS NOT NULL AND j.total_bytes IS NOT NULL AND j.confirmed_bytes=j.total_bytes AND j.proof_blocked=false) AND NOT EXISTS(SELECT 1 FROM relay.vod_jobs j WHERE j.object_id=o.id AND (j.streamer_id<>o.streamer_id OR j.state<>'ready' OR j.processing_succeeded=false OR j.proof_blocked=true)) ORDER BY o.created_at FOR UPDATE OF o SKIP LOCKED LIMIT 1) UPDATE relay.vod_objects o SET state='deleting',cleanup_owner=$1,cleanup_until=now()+interval '120 seconds' FROM candidate WHERE o.id=candidate.id RETURNING o.id,o.session_id,o.streamer_id",&[&owner]).await?;
+        let rows=self.store.db.query("WITH candidate AS (
+            SELECT o.id FROM relay.vod_objects o
+            WHERE o.state IN ('available','deleting') AND (o.cleanup_until IS NULL OR o.cleanup_until<now()) AND o.complete=true
+            AND EXISTS(SELECT 1 FROM relay.vod_jobs j WHERE j.object_id=o.id AND j.streamer_id=o.streamer_id
+                AND j.state='ready' AND j.processing_succeeded=true AND j.video_id IS NOT NULL
+                AND j.total_bytes IS NOT NULL AND j.confirmed_bytes=j.total_bytes AND j.proof_blocked=false)
+            AND NOT EXISTS(SELECT 1 FROM relay.vod_jobs j WHERE j.object_id=o.id AND
+                (j.streamer_id<>o.streamer_id OR j.state<>'ready' OR j.processing_succeeded=false OR j.proof_blocked=true
+                OR (j.settings->>'privacy'='private' OR
+                    (j.settings->>'privacy' IN ('unlisted','public')
+                        AND j.settings->'publication_authorized'='true'::jsonb
+                        AND j.publication_confirmed)) IS NOT TRUE))
+            ORDER BY o.created_at FOR UPDATE OF o SKIP LOCKED LIMIT 1)
+            UPDATE relay.vod_objects o SET state='deleting',cleanup_owner=$1,cleanup_until=now()+interval '120 seconds'
+            FROM candidate WHERE o.id=candidate.id RETURNING o.id,o.session_id,o.streamer_id",&[&owner]).await?;
         let Some(row) = rows.first() else {
             return Ok(false);
         };
@@ -308,7 +344,17 @@ impl crate::TransactionTask for CleanupTask<'_> {
         if held.len() != 1 {
             return Err(Error::LeaseLost);
         }
-        let invalid=tx.query("SELECT j.id FROM relay.vod_jobs j WHERE j.object_id=$1 AND (j.streamer_id<>$2 OR j.state<>'ready' OR j.proof_blocked OR NOT j.processing_succeeded OR j.video_id IS NULL OR j.total_bytes IS NULL OR j.confirmed_bytes<>j.total_bytes OR (j.settings->>'source'='twitch_vod' AND NOT EXISTS(SELECT 1 FROM relay.vod_twitch_bindings b WHERE b.session_id=j.session_id AND b.streamer_id=j.streamer_id AND NOT b.conflicted AND b.binding->>'vod_audio_confirmed'='true')))",&[&self.id,&self.streamer]).await.map_err(|_|Error::Database)?;
+        let invalid=tx.query("SELECT j.id FROM relay.vod_jobs j WHERE j.object_id=$1 AND
+            (j.streamer_id<>$2 OR j.state<>'ready' OR j.proof_blocked OR NOT j.processing_succeeded
+            OR j.video_id IS NULL OR j.total_bytes IS NULL OR j.confirmed_bytes<>j.total_bytes
+            OR (j.settings->>'privacy'='private' OR
+                (j.settings->>'privacy' IN ('unlisted','public')
+                    AND j.settings->'publication_authorized'='true'::jsonb
+                    AND j.publication_confirmed)) IS NOT TRUE
+            OR (j.settings->>'source'='twitch_vod' AND NOT EXISTS(
+                SELECT 1 FROM relay.vod_twitch_bindings b WHERE b.session_id=j.session_id
+                AND b.streamer_id=j.streamer_id AND NOT b.conflicted AND b.binding->>'vod_audio_confirmed'='true')))",
+            &[&self.id,&self.streamer]).await.map_err(|_|Error::Database)?;
         if !invalid.is_empty() {
             return Err(Error::LeaseLost);
         }

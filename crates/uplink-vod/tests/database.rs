@@ -1032,3 +1032,219 @@ async fn twitch_quelle_ersetzt_keine_vollstaendige_eingangsaufnahme() {
     );
     fixture.stop().await;
 }
+
+struct HeartbeatsUnavailable {
+    db: Arc<Db>,
+    failures: Arc<AtomicU64>,
+}
+#[async_trait]
+impl Database for HeartbeatsUnavailable {
+    async fn query(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<Vec<Row>> {
+        self.db.query(sql, params).await
+    }
+    async fn transaction(&self, _: &mut (dyn TransactionTask + Send)) -> Result<()> {
+        self.failures.fetch_add(1, Ordering::SeqCst);
+        Err(Error::Database)
+    }
+}
+struct LeaseHoldingSource {
+    storage: Storage,
+    object: String,
+    entered: Arc<tokio::sync::Notify>,
+    calls: Arc<AtomicU64>,
+}
+#[async_trait]
+impl SourceProvider for LeaseHoldingSource {
+    async fn prepare(&self, _: SourceRequest) -> Result<PreparedSource> {
+        let _lock = self.storage.lock_preparation(&self.object)?;
+        self.entered.notify_one();
+        loop {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+}
+#[tokio::test]
+async fn regression_expired_lease_cancels_source_and_releases_file_lock() {
+    let fixture = Fixture::new().await;
+    let store = Store::new(fixture.db.clone());
+    store.save_settings(7, &settings()).await.unwrap();
+    fixture.finish_session(1, 7, true).await;
+    let (_directory, storage) = private_storage();
+    let object = storage.create_object().unwrap();
+    let failures = Arc::new(AtomicU64::new(0));
+    let calls = Arc::new(AtomicU64::new(0));
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let worker = Worker::new(
+        Store::new(Arc::new(HeartbeatsUnavailable {
+            db: fixture.db.clone(),
+            failures: failures.clone(),
+        })),
+        storage.clone(),
+        Arc::new(LeaseHoldingSource {
+            storage: storage.clone(),
+            object: object.clone(),
+            entered: entered.clone(),
+            calls: calls.clone(),
+        }),
+        Arc::new(YouTube::for_test(Arc::new(Broker), "http://127.0.0.1:9").unwrap()),
+        Arc::new(Protected),
+    );
+    let mut running = tokio::spawn(async move { worker.run_one().await });
+    tokio::time::timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .unwrap();
+    // Echte 120 Sekunden PostgreSQL-Lease, keine verkürzte Testkonfiguration.
+    tokio::time::sleep(Duration::from_secs(122)).await;
+    let (client, driver) = fixture.another_client().await;
+    let rows=client.query("WITH next AS (SELECT id FROM relay.vod_jobs WHERE state NOT IN ('ready','blocked','failed','cancelled') AND next_attempt_at<=now() AND (lease_until IS NULL OR lease_until<now()) ORDER BY next_attempt_at,id FOR UPDATE SKIP LOCKED LIMIT 1) UPDATE relay.vod_jobs j SET lease_owner='second-regression-owner',lease_until=now()+interval '120 seconds',attempts=attempts+1,updated_at=now() FROM next WHERE j.id=next.id RETURNING j.id",&[]).await.unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "Ein zweiter DB-Owner muss die echte abgelaufene Lease übernehmen"
+    );
+    assert!(failures.load(Ordering::SeqCst) >= 1);
+    let result = tokio::time::timeout(Duration::from_secs(2), &mut running).await;
+    if result.is_err() {
+        running.abort();
+        let _ = running.await;
+    }
+    assert!(
+        result.is_ok(),
+        "Abgelaufener Worker muss trotz fehlerhafter Heartbeats selbst enden"
+    );
+    assert_eq!(result.unwrap().unwrap(), Err(Error::LeaseLost));
+    assert!(
+        storage.lock_preparation(&object).is_ok(),
+        "Quellvorbereitung darf die Objektsperre nicht zurücklassen"
+    );
+    let before = calls.load(Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert_eq!(calls.load(Ordering::SeqCst), before);
+    driver.abort();
+    fixture.stop().await;
+}
+
+#[tokio::test]
+async fn regression_unknown_privacy_cannot_become_ready() {
+    let fixture = Fixture::new().await;
+    for privacy in [None, Some(json!(null)), Some(json!("unknown"))] {
+        let mut cfg = serde_json::to_value(settings()).unwrap();
+        cfg.as_object_mut().unwrap().remove("privacy");
+        if let Some(value) = privacy {
+            cfg["privacy"] = value;
+        }
+        assert!(fixture.db.query("INSERT INTO relay.vod_jobs(session_id,streamer_id,ended_at,end_reason,settings,state,total_bytes,confirmed_bytes,video_id,processing_succeeded) VALUES(1,7,now(),'explicit_stop',$1,'ready',9,9,'synthetic',true)",&[&cfg]).await.is_err(),"Unbekannte Sichtbarkeit darf ready nicht freigeben");
+    }
+    fixture.stop().await;
+}
+
+#[tokio::test]
+async fn regression_cleanup_keeps_source_without_confirmed_privacy() {
+    let fixture = Fixture::new().await;
+    let store = Store::new(fixture.db.clone());
+    let (_directory, storage) = private_storage();
+    let object = storage.create_object().unwrap();
+    tokio::fs::write(storage.path(&object, "export.mp4").unwrap(), b"synthetic")
+        .await
+        .unwrap();
+    storage.reserve(9).unwrap().commit();
+    store
+        .register_object(1, 7, &object, &json!({}), true)
+        .await
+        .unwrap();
+    // Auch vor vollständiger Schemareparatur muss die Laufzeit nichts löschen.
+    fixture
+        .db
+        .0
+        .lock()
+        .await
+        .batch_execute("ALTER TABLE relay.vod_jobs DROP CONSTRAINT vod_ready_has_total")
+        .await
+        .unwrap();
+    fixture.db.query("INSERT INTO relay.vod_jobs(session_id,streamer_id,ended_at,end_reason,settings,state,object_id,total_bytes,confirmed_bytes,video_id,processing_succeeded) VALUES(1,7,now(),'explicit_stop','{\"source\":\"input_recording\"}'::jsonb,'ready',$1,9,9,'synthetic',true)",&[&object]).await.unwrap();
+    let worker = Worker::new(
+        store,
+        storage.clone(),
+        Arc::new(Ready {
+            storage: storage.clone(),
+            object: object.clone(),
+        }),
+        Arc::new(YouTube::for_test(Arc::new(Broker), "http://127.0.0.1:9").unwrap()),
+        Arc::new(Protected),
+    );
+    assert!(
+        !worker.cleanup_one().await.unwrap(),
+        "Unbekannte Sichtbarkeit muss Löschung verhindern"
+    );
+    assert!(storage.path(&object, "export.mp4").unwrap().exists());
+    fixture.stop().await;
+}
+
+#[tokio::test]
+async fn regression_migration_rechecks_legacy_ready_jobs_without_inventing_proof() {
+    let fixture = Fixture::new().await;
+    let client = fixture.db.0.lock().await;
+    client.batch_execute("DROP SCHEMA relay CASCADE; CREATE SCHEMA relay; CREATE TABLE relay.users(streamer_id bigint PRIMARY KEY); CREATE TABLE relay.sessions(id bigint PRIMARY KEY,streamer_id bigint NOT NULL REFERENCES relay.users(streamer_id),ended_at timestamptz); INSERT INTO relay.users VALUES(7); INSERT INTO relay.sessions VALUES(1,7,now()),(2,7,now()),(3,7,now()),(4,7,now()),(5,7,now());").await.unwrap();
+    client
+        .batch_execute(include_str!("../migrations/202609080001_vod.sql"))
+        .await
+        .unwrap();
+    for (id, privacy, total) in [
+        (1, Some(Privacy::Public), Some(9i64)),
+        (2, Some(Privacy::Unlisted), Some(9)),
+        (3, Some(Privacy::Private), None),
+        (4, None, Some(9)),
+        (5, Some(Privacy::Private), Some(9)),
+    ] {
+        let mut cfg = settings();
+        cfg.privacy = privacy.unwrap_or(Privacy::Private);
+        cfg.publication_authorized = cfg.privacy != Privacy::Private;
+        let mut cfg = serde_json::to_value(cfg).unwrap();
+        if privacy.is_none() {
+            cfg.as_object_mut().unwrap().remove("privacy");
+        }
+        client.execute("INSERT INTO relay.vod_jobs(session_id,streamer_id,ended_at,end_reason,settings,state,total_bytes,confirmed_bytes,video_id,processing_succeeded) VALUES($1,7,now(),'explicit_stop',$2,'ready',$3,9,'synthetic',true)",&[&(id as i64),&cfg,&total]).await.unwrap();
+    }
+    client
+        .batch_execute(include_str!(
+            "../migrations/202609080002_vod_consistency.sql"
+        ))
+        .await
+        .expect("Gültiger alter Datenbestand muss sicher migrierbar bleiben");
+    let first=client.query("SELECT session_id,state,publication_confirmed,settings,total_bytes FROM relay.vod_jobs ORDER BY session_id",&[]).await.unwrap();
+    for row in &first {
+        assert!(
+            !row.get::<_, bool>(2),
+            "Migration erfindet keine Veröffentlichungsbestätigung"
+        );
+    }
+    assert_eq!(
+        first
+            .iter()
+            .map(|r| r.get::<_, String>(1))
+            .collect::<Vec<_>>(),
+        vec!["processing", "processing", "blocked", "blocked", "ready"]
+    );
+    assert_eq!(first[2].get::<_, Option<i64>>(4), None);
+    assert!(
+        first[3]
+            .get::<_, serde_json::Value>(3)
+            .get("privacy")
+            .is_none()
+    );
+    client.batch_execute(MIGRATION).await.unwrap();
+    let second = client
+        .query(
+            "SELECT state,publication_confirmed FROM relay.vod_jobs ORDER BY session_id",
+            &[],
+        )
+        .await
+        .unwrap();
+    for (a, b) in first.iter().zip(second.iter()) {
+        assert_eq!(a.get::<_, String>(1), b.get::<_, String>(0));
+        assert_eq!(a.get::<_, bool>(2), b.get::<_, bool>(1));
+    }
+    drop(client);
+    fixture.stop().await;
+}
