@@ -8,6 +8,8 @@ publish.workspace = true
 [dependencies]
 aes-gcm = "0.10"
 axum = "0.8"
+base64 = "0.22"
+filedescriptor = "0.8.3"
 getrandom = "0.4"
 hex = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

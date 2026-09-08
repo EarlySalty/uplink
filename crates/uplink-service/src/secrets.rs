@@ -19,9 +19,15 @@ pub struct ServiceSecrets {
 
 pub async fn read_fd(fd: u32, limit: usize) -> Result<Secret, &'static str> {
     protect_fd(fd)?;
-    let file = tokio::fs::File::open(format!("/proc/self/fd/{fd}"))
-        .await
+    // A real duplicate keeps the provider's already-authorized open description.
+    // Reopening /proc/self/fd would recheck inode permissions after a UID change.
+    // Both duplicates use F_DUPFD_CLOEXEC on Linux; the original stays with its owner.
+    let descriptor = filedescriptor::FileDescriptor::dup(&(fd as i32))
         .map_err(|_| "Credential-FD ist nicht verfügbar.")?;
+    let file = descriptor
+        .as_file()
+        .map_err(|_| "Credential-FD ist nicht verfügbar.")?;
+    let file = tokio::fs::File::from_std(file);
     let mut data = Zeroizing::new(Vec::new());
     tokio::time::timeout(
         Duration::from_secs(5),
@@ -171,13 +177,7 @@ pub async fn fetch(config: &Config) -> Result<ServiceSecrets, &'static str> {
             .filter(|s| !s.expose().is_empty())
             .ok_or("Benötigter Dienstzugang fehlt.")
     };
-    let encryption = take("RS_RELAY_KEY_ENC")?;
-    let encryption = Secret::new(
-        hex::decode(encryption.expose()).map_err(|_| "Speicherschlüssel ist ungültig.")?,
-    );
-    if encryption.expose().len() != 32 {
-        return Err("Speicherschlüssel ist ungültig.");
-    }
+    let encryption = decode_encryption_key(take("RS_RELAY_KEY_ENC")?)?;
     let tls_material = if let TlsConfig::Infisical {
         certificate_secret,
         private_key_secret,
@@ -195,6 +195,35 @@ pub async fn fetch(config: &Config) -> Result<ServiceSecrets, &'static str> {
         bot_internal: take("RS_RELAY_BOT_INTERNAL_TOKEN")?,
         tls_material,
     })
+}
+
+fn decode_encryption_key(encoded: Secret) -> Result<Secret, &'static str> {
+    use base64::{
+        Engine, alphabet,
+        engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig},
+    };
+    // Existing RS_RELAY_KEY_ENC contract: standard Base64, optional padding and
+    // ASCII whitespace, exactly 32 decoded bytes. Never guess a second encoding.
+    let compact = Zeroizing::new(
+        encoded
+            .expose()
+            .iter()
+            .copied()
+            .filter(|byte| !byte.is_ascii_whitespace())
+            .collect::<Vec<_>>(),
+    );
+    let engine = GeneralPurpose::new(
+        &alphabet::STANDARD,
+        GeneralPurposeConfig::new().with_decode_padding_mode(DecodePaddingMode::Indifferent),
+    );
+    let mut decoded = Zeroizing::new([0_u8; 32]);
+    let length = engine
+        .decode_slice(&compact, decoded.as_mut())
+        .map_err(|_| "Speicherschlüssel ist ungültig.")?;
+    if length != 32 {
+        return Err("Speicherschlüssel ist ungültig.");
+    }
+    Ok(Secret::new(decoded.to_vec()))
 }
 
 pub async fn tls(
@@ -233,4 +262,45 @@ pub async fn tls(
     .with_single_cert(certs, key)
     .map_err(|_| "TLS-Zertifikat und Schlüssel passen nicht zusammen.")?;
     Ok(Arc::new(tls))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::{Engine, engine::general_purpose::STANDARD};
+
+    #[test]
+    fn existing_base64_key_preserves_exact_bytes_and_optional_padding() {
+        for bytes in [[0; 32], [7; 32], [255; 32]] {
+            let padded = STANDARD.encode(bytes);
+            for text in [
+                padded.clone(),
+                padded.trim_end_matches('=').to_owned(),
+                format!(" \n{}\t{}\r\n", &padded[..8], &padded[8..]),
+            ] {
+                assert!(
+                    decode_encryption_key(Secret::new(text.into_bytes()))
+                        .unwrap()
+                        .matches(&bytes)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn encryption_key_rejects_wrong_length_alphabet_hex_and_noncanonical_bits() {
+        let mut noncanonical = STANDARD.encode([7; 32]);
+        noncanonical.replace_range(42..43, "d");
+        for text in [
+            String::new(),
+            STANDARD.encode([7; 31]),
+            STANDARD.encode([7; 33]),
+            "07".repeat(32),
+            "_".repeat(43),
+            "!".repeat(44),
+            noncanonical,
+        ] {
+            assert!(decode_encryption_key(Secret::new(text.into_bytes())).is_err());
+        }
+    }
 }

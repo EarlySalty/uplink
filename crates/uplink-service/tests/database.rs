@@ -732,7 +732,7 @@ async fn executable_smoke(database: &Database) {
     let reply = serde_json::json!({"secrets":[
         {"secretKey":"RS_RELAY_API_SECRET","secretValue":"synthetic-api"},
         {"secretKey":"RS_RELAY_ADMIN_SECRET","secretValue":"synthetic-admin"},
-        {"secretKey":"RS_RELAY_KEY_ENC","secretValue":"0707070707070707070707070707070707070707070707070707070707070707"},
+        {"secretKey":"RS_RELAY_KEY_ENC","secretValue":base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [7; 32])},
         {"secretKey":"RS_RELAY_DATABASE_URL","secretValue":format!("host={} user=uplink_test dbname=postgres",database.directory.display())},
         {"secretKey":"RS_RELAY_BOT_INTERNAL_TOKEN","secretValue":"synthetic-broker"},
         {"secretKey":"UPLINK_TLS_CERTIFICATE","secretValue":certificates.cert.pem()},
