@@ -877,3 +877,24 @@ async fn requested_unpublish_response_is_not_media_or_publication_confirmation()
     });
     assert_eq!(result.unwrap().state, OutputState::LocalEndUnconfirmed);
 }
+
+#[tokio::test]
+async fn delete_stream_uses_zero_transaction_id_on_the_connection_stream() {
+    let (mut peer, pusher) = raw_published().await;
+    let (result, ()) = tokio::join!(pusher.finish(), async {
+        let command = timeout(Duration::from_secs(1), peer.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(command.message_header.msg_type_id.0, 20);
+        assert_eq!(command.message_header.msg_stream_id, 0);
+        let values = Amf0Decoder::from_slice(&command.payload)
+            .decode_all()
+            .unwrap();
+        assert!(matches!(&values[0], Amf0Value::String(name) if name.as_str() == "deleteStream"));
+        assert!(matches!(values[1], Amf0Value::Number(0.0)));
+        assert!(matches!(values[2], Amf0Value::Null));
+        assert!(matches!(values[3], Amf0Value::Number(1.0)));
+    });
+    assert_eq!(result.unwrap().state, OutputState::LocalEndUnconfirmed);
+}

@@ -558,7 +558,7 @@ impl Client {
         self.ending = true;
         self.command(
             "deleteStream",
-            4.0,
+            0.0,
             0,
             &[Amf0Value::Null, Amf0Value::Number(self.stream_id as f64)],
         )
