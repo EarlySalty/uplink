@@ -17,7 +17,7 @@ Geprüft am 8. September 2026 gegen die offizielle Referenz (`developers.google.
 
 Mit `enableAutoStart=true` schaltet YouTube den Broadcast selbst live, sobald Daten am gebundenen Stream ankommen; mit `enableAutoStop=true` beendet YouTube ihn kurz nach dem Ende der Daten. Beides sind Zusagen von YouTube, keine Zusagen dieses Adapters: der Adapter prüft den Ist-Zustand immer über `list`.
 
-Ein Nutzerlauf kostet rund 200 Einheiten (Stream neu) oder 150 Einheiten (Stream wiederverwendet) plus je Statusabfrage 2 Einheiten. Das Standardkontingent von 10.000 Einheiten pro Tag reicht für etwa 40 Streams pro Tag über alle Nutzer, wenn der Aufrufer den Status alle 30 Sekunden abfragt und pro Stream zwei Stunden läuft. Der Adapter cached nichts über Prozessgrenzen hinweg und garantiert keine Exactly-once-Ausführung.
+Ein Nutzerlauf kostet rund 150 bis 200 Einheiten für die Vorbereitung (Stream wiederverwendet oder neu) plus je Statusabfrage 2 Einheiten. Bei 30-Sekunden-Takt und zwei Stunden Stream fallen allein für den Status rund 480 Einheiten an; mit der Vorbereitung sind das etwa 630 bis 680 Einheiten je Lauf. Das Standardkontingent von 10.000 Einheiten pro Tag reicht damit für rund 14 Streams pro Tag über alle Nutzer. Empfehlung an den Aufrufer: den Status nur alle 60 Sekunden abfragen (rund 22 Streams pro Tag) und bei Bedarf eine Kontingenterhöhung bei Google beantragen. Der Adapter cached nichts über Prozessgrenzen hinweg und garantiert keine Exactly-once-Ausführung.
 
 Benötigter OAuth-Scope: `https://www.googleapis.com/auth/youtube.force-ssl` (der bestehende Bot-Grant trägt genau diesen Scope) oder `https://www.googleapis.com/auth/youtube`. Fehlt beides, blockiert der Adapter mit `RechteFehlen`.
 
@@ -150,7 +150,8 @@ Liest Stream und Broadcast per `list` (je 1 Einheit). Zuordnung:
 | --- | --- |
 | kein aktiver Run | `Inaktiv` |
 | `lifeCycleStatus=live` und `boundStreamId == stream_id` | `Live` |
-| `lifeCycleStatus=live`, aber andere Bindung | `Fehler{wiederaufnehmbar:false}` (fremdes Ereignis, nicht übernehmen) |
+| `lifeCycleStatus=live`, aber fremde `boundStreamId` | `Fehler{wiederaufnehmbar:false}` (fremdes Ereignis, nicht übernehmen) |
+| `lifeCycleStatus=live`, aber `boundStreamId` fehlt | `Fehler{wiederaufnehmbar:true}` (Bindung noch nicht bestätigt) |
 | `start_angefordert_at` gesetzt, `streamStatus=active`, Broadcast `ready`/`created`, Bindung passt | Transition nach `live` nachführen, danach `Live` oder `Sendet` |
 | `streamStatus=active`, Broadcast `ready`, `liveStarting` oder `testing` | `Sendet` |
 | `streamStatus` nicht `active`, Broadcast `created`/`ready` | `Vorbereitet` |
@@ -165,7 +166,7 @@ Vermerkt nur, dass der Aufrufer keine Medien mehr liefert (`unterbrochen_at`). K
 
 ### `finish`
 
-Verlangt einen `Endegrund`. Ein TCP-Abbruch, ein Ingest-Timeout oder ein Neustart sind keine Endegründe; dafür gibt es `medien_unterbrochen`. Ablauf: Run laden, Generation prüfen, `lifeCycleStatus` lesen. `complete`: Run schließen, `youtube_bestaetigt=true`. `live`, `liveStarting`, `testing`: `transition?broadcastStatus=complete` als offener Schritt, danach Run schließen. `created`/`ready` (YouTube lässt hier kein `complete` zu): Run lokal schließen mit `youtube_bestaetigt=false`; der Broadcast bleibt als geplantes Ereignis stehen und wird beim nächsten `prepare` nicht wiederverwendet.
+Verlangt einen `Endegrund`. Ein TCP-Abbruch, ein Ingest-Timeout oder ein Neustart sind keine Endegründe; dafür gibt es `medien_unterbrochen`. Ablauf: Run laden, Generation prüfen, `lifeCycleStatus` lesen. `complete`: Run schließen, `youtube_bestaetigt=true`. `live`, `liveStarting`, `testing`: `transition?broadcastStatus=complete` als offener Schritt, danach Run schließen. `created`/`ready` (YouTube lässt hier kein `complete` zu): Run lokal schließen mit `youtube_bestaetigt=false`; der Broadcast bleibt als geplantes Ereignis stehen und wird beim nächsten `prepare` nicht wiederverwendet. Ein offener Schritt `TransitionLive` holt nie ein `transition live` nach: `finish` liest den Broadcast und beendet ihn nur, wenn er schon `live`/`liveStarting`/`testing` ist, sonst schließt es lokal. Anders als die übrigen Aufrufe umgeht `finish` bewusst die Generationsprüfung gegen die Einstellungen: ein Run darf seinen eigenen Broadcast derselben Generation beenden, auch wenn die Einstellungen inzwischen auf eine neue Verbindungsgeneration gewandert sind.
 
 ## Persistenz
 
