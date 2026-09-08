@@ -17,7 +17,7 @@ use crate::nachricht::{Badge, ChatNachricht, Ereignis, Fragment};
 pub const KICK_PUBLIC_KEY_URL: &str = "https://api.kick.com/public/v1/public-key";
 const FENSTER: Duration = Duration::from_secs(10 * 60);
 const KEY_FRIST: Duration = Duration::from_secs(10);
-const RELOAD_ENTPRELLUNG: Duration = Duration::from_secs(60);
+const KEY_BACKOFF: Duration = Duration::from_secs(60);
 
 pub struct KickZiel {
     pub eingang: mpsc::Sender<Ereignis>,
@@ -33,7 +33,8 @@ pub struct KickDrehkreuz {
     ziele: Mutex<HashMap<String, KickZiel>>,
     gesehen: Mutex<HashMap<String, Gesehen>>,
     schluessel: Mutex<Option<Vec<u8>>>,
-    letzter_reload: Mutex<Option<Instant>>,
+    letzter_key_versuch: Mutex<Option<Instant>>,
+    key_fetch: tokio::sync::Mutex<()>,
     naechster_token: AtomicU64,
     http: reqwest::Client,
     key_url: String,
@@ -64,7 +65,8 @@ impl KickDrehkreuz {
             ziele: Mutex::new(HashMap::new()),
             gesehen: Mutex::new(HashMap::new()),
             schluessel: Mutex::new(None),
-            letzter_reload: Mutex::new(None),
+            letzter_key_versuch: Mutex::new(None),
+            key_fetch: tokio::sync::Mutex::new(()),
             naechster_token: AtomicU64::new(0),
             http: reqwest::Client::builder()
                 .no_proxy()
@@ -112,19 +114,25 @@ impl KickDrehkreuz {
     }
 
     async fn reload_key(&self) -> Option<Vec<u8>> {
-        {
-            let mut letzter = self.letzter_reload.lock().expect("Kick-Reload");
-            if let Some(zeit) = *letzter
-                && zeit.elapsed() < RELOAD_ENTPRELLUNG
-            {
-                return None;
-            }
-            *letzter = Some(Instant::now());
-        }
         self.laden().await
     }
 
     async fn laden(&self) -> Option<Vec<u8>> {
+        // Webhooks teilen Request-Permits mit der Dock-Authentifizierung. Nur
+        // ein Request darf auf Kick warten; weitere geben sofort wieder frei.
+        // Der Guard wird auch bei Abbruch des aufrufenden Requests freigegeben.
+        let _fetch = self.key_fetch.try_lock().ok()?;
+        {
+            let mut letzter = self.letzter_key_versuch.lock().expect("Kick-Key-Backoff");
+            if let Some(zeit) = *letzter
+                && zeit.elapsed() < KEY_BACKOFF
+            {
+                return None;
+            }
+            // Vor dem await setzen: Fehler und Cancellation bleiben negativ
+            // gecacht, und ein frischer Key löst keinen direkten Reload aus.
+            *letzter = Some(Instant::now());
+        }
         let antwort = self.http.get(self.key_url.as_str()).send().await.ok()?;
         if !antwort.status().is_success() {
             return None;
@@ -180,9 +188,12 @@ impl KickDrehkreuz {
         {
             return WebhookAusgang::Fehlerhaft;
         }
-        let mut gueltig = self.public_key().await.is_some_and(|key| {
-            Self::signatur_gueltig(&key, message_id, timestamp, body, signatur_b64)
-        });
+        let Some(key) = self.public_key().await else {
+            // Ohne Schlüssel ist die Signatur ungeprüft, nicht falsch. Kick
+            // soll nach dem Ladefehler oder dem laufenden Fetch erneut liefern.
+            return WebhookAusgang::Ausgelastet;
+        };
+        let mut gueltig = Self::signatur_gueltig(&key, message_id, timestamp, body, signatur_b64);
         if !gueltig {
             gueltig = self.reload_key().await.is_some_and(|key| {
                 Self::signatur_gueltig(&key, message_id, timestamp, body, signatur_b64)
@@ -241,7 +252,7 @@ impl KickDrehkreuz {
 #[cfg(test)]
 impl KickDrehkreuz {
     fn reload_altern(&self) {
-        *self.letzter_reload.lock().expect("Kick-Reload") = None;
+        *self.letzter_key_versuch.lock().expect("Kick-Key-Backoff") = None;
     }
 }
 
@@ -743,6 +754,158 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn parallele_unauthentifizierte_webhooks_laden_nur_einmal_und_warten_nicht() {
+        let server = MockServer::start().await;
+        let fetch_gestartet = Arc::new(tokio::sync::Notify::new());
+        let signal = fetch_gestartet.clone();
+        Mock::given(method("GET"))
+            .and(path("/public/v1/public-key"))
+            .respond_with(move |_: &wiremock::Request| {
+                signal.notify_one();
+                ResponseTemplate::new(503).set_delay(Duration::from_secs(5))
+            })
+            .mount(&server)
+            .await;
+        let kreuz = Arc::new(drehkreuz(&server));
+        let erster = {
+            let kreuz = kreuz.clone();
+            tokio::spawn(async move {
+                kreuz
+                    .verarbeiten(
+                        "first",
+                        &Utc::now().to_rfc3339(),
+                        "chat.message.sent",
+                        "AAAA",
+                        b"{}",
+                    )
+                    .await
+                    .status()
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(2), fetch_gestartet.notified())
+            .await
+            .expect("Erster Key-Fetch gestartet");
+        let mut parallel = tokio::task::JoinSet::new();
+        for i in 0..32 {
+            let kreuz = kreuz.clone();
+            parallel.spawn(async move {
+                kreuz
+                    .verarbeiten(
+                        &format!("parallel-{i}"),
+                        &Utc::now().to_rfc3339(),
+                        "chat.message.sent",
+                        "AAAA",
+                        b"{}",
+                    )
+                    .await
+                    .status()
+            });
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while let Some(result) = parallel.join_next().await {
+                assert_eq!(result.unwrap(), StatusCode::SERVICE_UNAVAILABLE);
+            }
+        })
+        .await
+        .expect("Parallele Requests geben ihre API-Permits ohne Warten auf den Key-Fetch frei");
+        assert_eq!(key_abrufe(&server).await, 1);
+        erster.abort();
+        assert!(erster.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn key_fehler_hat_negativen_cache_und_retry_nach_backoff() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/public/v1/public-key"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let kreuz = drehkreuz(&server);
+        let ts = Utc::now().to_rfc3339();
+        for i in 0..5 {
+            assert_eq!(
+                kreuz
+                    .verarbeiten(
+                        &format!("failed-{i}"),
+                        &ts,
+                        "chat.message.sent",
+                        "AAAA",
+                        b"{}"
+                    )
+                    .await
+                    .status(),
+                StatusCode::SERVICE_UNAVAILABLE
+            );
+        }
+        assert_eq!(
+            key_abrufe(&server).await,
+            1,
+            "Auch der erste Fehler darf keinen direkten Reload auslösen"
+        );
+        let (privat, pem) = schluesselpaar();
+        server.reset().await;
+        Mock::given(method("GET"))
+            .and(path("/public/v1/public-key"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"data": {"public_key": pem}})),
+            )
+            .mount(&server)
+            .await;
+        kreuz.reload_altern();
+        let body = chat_body(123, 999);
+        let sig = signieren(&privat, "retry", &ts, &body);
+        assert_eq!(
+            kreuz
+                .verarbeiten("retry", &ts, "chat.message.sent", &sig, &body)
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(key_abrufe(&server).await, 1);
+    }
+
+    #[tokio::test]
+    async fn abgebrochener_key_fetch_gibt_single_flight_frei_und_behaelt_backoff() {
+        let server = MockServer::start().await;
+        let fetch_gestartet = Arc::new(tokio::sync::Notify::new());
+        let signal = fetch_gestartet.clone();
+        Mock::given(method("GET"))
+            .and(path("/public/v1/public-key"))
+            .respond_with(move |_: &wiremock::Request| {
+                signal.notify_one();
+                ResponseTemplate::new(503).set_delay(Duration::from_secs(5))
+            })
+            .mount(&server)
+            .await;
+        let kreuz = Arc::new(drehkreuz(&server));
+        let request = {
+            let kreuz = kreuz.clone();
+            tokio::spawn(async move { kreuz.public_key().await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), fetch_gestartet.notified())
+            .await
+            .unwrap();
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        assert!(kreuz.public_key().await.is_none());
+        assert_eq!(key_abrufe(&server).await, 1);
+        server.reset().await;
+        Mock::given(method("GET"))
+            .and(path("/public/v1/public-key"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        kreuz.reload_altern();
+        assert!(kreuz.public_key().await.is_none());
+        assert_eq!(
+            key_abrufe(&server).await,
+            1,
+            "Nach Cancellation und Backoff muss ein neuer Fetch möglich sein"
+        );
+    }
+
+    #[tokio::test]
     async fn reload_bei_fehlsignatur_wird_entprellt() {
         let (privat, pem) = schluesselpaar();
         let server = key_server(&pem).await;
@@ -762,6 +925,15 @@ mod tests {
             "erster Abruf laedt den Schluessel"
         );
 
+        kreuz
+            .verarbeiten("m-2", &ts, "chat.message.sent", "AAAA", &body)
+            .await;
+        assert_eq!(
+            key_abrufe(&server).await,
+            1,
+            "Frischer Key wird nicht sofort erneut geladen"
+        );
+        kreuz.reload_altern();
         kreuz
             .verarbeiten("m-2", &ts, "chat.message.sent", "AAAA", &body)
             .await;
