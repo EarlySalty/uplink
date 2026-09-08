@@ -40,8 +40,15 @@ jobs:
           sudo install -D -m 0755 "$media_tmp/ffmpeg" /opt/uplink/media/ffmpeg8-c733b4b2/ffmpeg
           sudo install -D -m 0755 "$media_tmp/ffprobe" /opt/uplink/media/ffmpeg8-c733b4b2/ffprobe
           cargo test -p uplink-service --test normalbetrieb --locked -j2 -- --ignored --test-threads=1
+      - name: Vier echte FFmpeg-Regressionen für Audioauswahl und AAC-Erhalt
+        run: cargo test -p uplink-media --lib prepare::review_tests --locked -j2 -- --ignored --test-threads=1
       - name: Release-Build
         run: cargo build --workspace --release --locked -j2
+      - name: Gekoppeltes Releasepaket einschließlich Bridge und TLS-Provider
+        run: |
+          sh deployment/tests/prepare-release.sh
+          deployment/prepare-release.sh "$(pwd)/target/release/uplink-service" "$(pwd)/target/release-package"
+          deployment/prepare-release.sh --check-package "$(pwd)/target/release-package"
       - name: Lokaler RTMPS-Eingang im Releaseprofil
         run: |
           cargo test -p uplink-ingest --release --locked -j2

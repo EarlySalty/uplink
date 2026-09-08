@@ -12,6 +12,18 @@ Der explizite Linux-Nachweis `cargo run -j2 -p uplink-service --example provider
 
 Das geprüfte Binary liegt unter `/opt/uplink/releases/<commit>/bin/uplink-service`, das Startskript daneben im Releasewurzelverzeichnis; `current` verweist atomar auf den freigegebenen Stand. FFmpeg und FFprobe sind unabhängig unter `/opt/uplink/media/ffmpeg8-c733b4b2/` installiert und werden ausdrücklich in TOML referenziert. Die normale Konfiguration liegt unter `/home/nathanael/.config/uplink/uplink.toml`. Kein Laufzeitpfad zeigt in das alte Repository.
 
+Das gekoppelte Release wird aus einem gemeinsamen Buildverzeichnis vorbereitet. Der Build muss `uplink-service`, `uplink-infisical-bridge` und `uplink-tls-provider` desselben geprüften Quellstands erzeugen:
+
+```sh
+cargo build --release --locked -j2 -p uplink-service -p uplink-infisical-transport -p uplink-tls-provider --bins
+deployment/prepare-release.sh "$(pwd)/target/release/uplink-service" /neues/release-verzeichnis
+deployment/prepare-release.sh --check-package /neues/release-verzeichnis
+```
+
+Das Paket enthält alle drei Binaries, den Launcher, den Override für die bestehende User-Unit, `infisical-bridge.service`, `tls-provider.service` und `tls-provider.timer`, die drei normalen TOML-Konfigurationen sowie alle SQL-Migrationen. Fehlende oder nicht ausführbare Binaries werden bereits vor dem Anlegen des Pakets abgewiesen. Die Paketprüfung verlangt den vollständigen Pflichtumfang und dessen Prüfsummen einschließlich aller Migrationen. FFmpeg und FFprobe werden am festgelegten Medienpfad gegen ihre gepinnten Prüfsummen geprüft und nicht in jedes Release kopiert. Testunits sind kein Bestandteil dieses Pakets.
+
+Bei der freigegebenen Installation gehören Releaseverzeichnis, Binaries und Systemunits root; der Dienstnutzer darf weder sie noch ihre Vorfahren ändern. Die beiden Systemkonfigurationen aus `config/` gehören nach `/etc/uplink/` (root:root, 0600), `config/uplink.toml` an den oben genannten normalen User-Configpfad. Die drei Systemunitdateien gehören nach `/etc/systemd/system/`; nur `rs-relay-override.conf` erweitert die vorhandene User-Unit. Bestehende normale Einstellungen vor Übernahme abgleichen, Credentialversorgung beibehalten und keine Secretquelldateien kopieren. Danach beide systemd-Manager neu laden und die in [Infisical-Bridge](infisical-bridge.md) dokumentierte Reihenfolge verwenden. Paketerstellung und Paketprüfung führen keine Installation, Migration oder Aktivierung aus.
+
 Die normale Bereitstellung verwendet ausschließlich dieselbe `rs-relay.service` mit neuem Binary. Die Dateien für den isolierten Ingesttest bleiben interne Testartefakte und werden dabei nicht installiert oder gestartet. Der normale Binaryaufruf weist eine Konfiguration mit `test_ingest` zurück. Die technische Beispielkonfiguration enthält bewusst keine nutzbare öffentliche OBS-Adresse. Beim endgültigen Wechsel müssen reale freie TCP-Bindung, DNS, TLS und Firewall gemeinsam passen; insbesondere weder Caddys belegten Port noch einen fremden TCP-8899-Dienst verdrängen. Die lokale API wird erst nach dem gekoppelten Dashboardnachweis auf den vorhandenen normalen Proxyvertrag umgestellt.
 
 Zum Betriebsnachweis gehört ein vollständiger Stop/Start derselben Unit mit dem neuen Release, einschließlich WorkingDirectory, vorhandenem LoadCredential-Provisioning, Infisical, TLS-Erneuerung, eigenen Medienbinaries und eingebundenen Dockassets. Der Start darf weder den alten Prozess noch einen geliehenen Credentialpfad einer anderen, bereits gestoppten Unit benötigen. Der vorhandene interne TLS-Provider samt Timer bleibt der Erneuerungsweg; dessen isolierte Vorabprüfung ersetzt diese normale Cutoverprüfung nicht.
