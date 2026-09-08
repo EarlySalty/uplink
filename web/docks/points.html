@@ -511,7 +511,10 @@ body.mehrere .karte .marke { display: block; }
 
   function statusAnzeigen(stand) {
     if (stand) letzterStand = stand;
-    var sichtbar = letzterStand.filter(function (p) { return p.eingerichtet || p.verbunden || p.hinweis || (p.zustand && p.zustand !== "disconnected"); });
+    var sichtbar = letzterStand.filter(function (p) {
+      if (p.zustand === "disconnected" && p.eingerichtet === false) return false;
+      return p.eingerichtet || p.verbunden || p.hinweis || (p.zustand && p.zustand !== "disconnected");
+    });
     if (!stand) {
       sichtbar = sichtbar.map(function (p) {
         return { platform: p.platform, eingerichtet: true, verbunden: false, hinweis: "Verbindung zu Uplink kommt gerade zurück", fehlende_scopes: p.fehlende_scopes };

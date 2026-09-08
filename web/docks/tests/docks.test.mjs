@@ -262,6 +262,20 @@ test('Docks: markup has no remote scripts or remote fonts', () => {
 });
 
 for (const name of ['chat', 'activity', 'points', 'stream-info']) {
+  test(`${name}: disconnected unconfigured platforms stay hidden despite a hint`, t => {
+    const app = dock(t, name);
+    const disconnected = { platform: 'kick', eingerichtet: false, verbunden: false, zustand: 'disconnected', hinweis: 'Nicht verbunden' };
+    app.message({ typ: 'status', generation: '11111111111111111111111111111111', plattformen: [
+      ...connected,
+      disconnected,
+      { platform: 'youtube', eingerichtet: true, verbunden: false, zustand: 'disconnected', hinweis: 'Verbindung wird wiederhergestellt' },
+    ] });
+    assert.match(app.element('plattformen').textContent, /Twitch/);
+    assert.match(app.element('plattformen').textContent, /YouTube.*wiederhergestellt/);
+    assert.doesNotMatch(app.element('plattformen').textContent, /Kick/);
+    app.message({ typ: 'status', generation: '11111111111111111111111111111111', plattformen: [disconnected] });
+    assert.equal(app.element('plattformen').textContent, 'Noch keine Plattform verbunden');
+  });
   test(`${name}: unavailable broker and unsupported integration stay visible`, t => {
     const app = dock(t, name);
     app.message({ typ: 'status', generation: '11111111111111111111111111111111', plattformen: [

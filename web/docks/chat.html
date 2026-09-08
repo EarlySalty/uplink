@@ -1137,7 +1137,10 @@ footer {
     /* Nur Plattformen, die der Streamer verbunden hat. `verbunden` faengt
        einen Server ab, der `eingerichtet` noch nicht schickt. */
     if (stand) letzterStand = stand;
-    var sichtbar = letzterStand.filter(function (p) { return p.eingerichtet || p.verbunden || p.hinweis || (p.zustand && p.zustand !== "disconnected"); });
+    var sichtbar = letzterStand.filter(function (p) {
+      if (p.zustand === "disconnected" && p.eingerichtet === false) return false;
+      return p.eingerichtet || p.verbunden || p.hinweis || (p.zustand && p.zustand !== "disconnected");
+    });
     if (!stand) {
       /* Kein frischer Stand: alles bleibt stehen, nichts ist mehr live. */
       sichtbar = sichtbar.map(function (p) {
