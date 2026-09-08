@@ -35,6 +35,8 @@ use uplink_media::{
 type ProbeResult<T> = Result<T, &'static str>;
 const DEADLINE: Duration = Duration::from_secs(30);
 const H264: &[u8] = include_bytes!("../../../experiments/scuffle-probe/fixtures/h264.flv");
+#[path = "media_probe/platform.rs"]
+mod platform;
 
 struct ProbeAuth;
 impl Authorizer for ProbeAuth {
@@ -127,9 +129,20 @@ async fn endpoint(
     id: &str,
     queued_events: usize,
 ) -> ProbeResult<(Arc<IngestServer<ProbeAuth>>, PublishTarget)> {
+    endpoint_budget(id, queued_events, 65536).await
+}
+async fn endpoint_budget(
+    id: &str,
+    queued_events: usize,
+    max_event: usize,
+) -> ProbeResult<(Arc<IngestServer<ProbeAuth>>, PublishTarget)> {
     let (server_tls, client_tls) = tls()?;
     let mut limits = IngestLimits::local_probe();
     limits.max_queued_events = queued_events;
+    limits.max_event_bytes = max_event;
+    limits.max_queued_bytes = (max_event * 4).max(limits.max_queued_bytes);
+    limits.rtmp.chunk.max_message_bytes = max_event;
+    limits.rtmp.chunk.max_partial_bytes = max_event * 4;
     limits.media_idle_timeout = DEADLINE;
     let server = Arc::new(
         IngestServer::bind_loopback(0, server_tls, Arc::new(ProbeAuth), limits)
@@ -261,6 +274,13 @@ struct InputTimes {
     video: Vec<(u32, i64)>,
     audio: BTreeMap<u8, Vec<(u32, i64)>>,
 }
+struct ProbeCase {
+    source_name: &'static str,
+    output_codec: Codec,
+    with_slow: bool,
+    audio_ids: [u8; 2],
+    with_stalled: bool,
+}
 impl InputTimes {
     fn add(&mut self, event: &uplink_ingest::MediaEvent) {
         if event.event_kind != EventKind::Frame {
@@ -293,13 +313,17 @@ async fn run(
     ffmpeg: PathBuf,
     ffprobe: PathBuf,
     fixture: Arc<[u8]>,
-    source_name: &'static str,
-    with_slow: bool,
-    audio_ids: [u8; 2],
-    with_stalled: bool,
+    case: ProbeCase,
 ) -> ProbeResult<ProbeReport> {
+    let ProbeCase {
+        source_name,
+        output_codec,
+        with_slow,
+        audio_ids,
+        with_stalled,
+    } = case;
     let directory = PrivateDirectory::create()?;
-    let (source_server, source_target) = endpoint("source", 512).await?;
+    let (source_server, source_target) = endpoint_budget("source", 512, 2 * 1024 * 1024).await?;
     let (left_server, left_target) = endpoint("left", 512).await?;
     let (right_server, right_target) = endpoint("right", 512).await?;
     let (first_frame, first_frame_rx) = oneshot::channel();
@@ -380,11 +404,14 @@ async fn run(
             Ok::<_, &'static str>(connection.finish().await)
         })));
     }
+    for output in &mut outputs {
+        output.video.codec = output_codec;
+    }
     let source = Task::new(tokio::spawn(async move {
         let pusher = RunningPusher::start(source_target, MediaLimits::default())
             .await
             .map_err(|_| "Quell-RTMPS konnte nicht starten")?;
-        let mut input = FlvReader::new(fixture.as_ref(), 65536);
+        let mut input = FlvReader::new(fixture.as_ref(), 2 * 1024 * 1024);
         let mut tags = Vec::new();
         while let Some(mut tag) = input.next().await.map_err(|_| "Quellfixture ungültig")? {
             if audio_ids != [0, 1] {
@@ -464,7 +491,14 @@ async fn run(
             }
         }
         drop(send);
-        (connection.finish().await, input_times)
+        let report = connection.finish().await;
+        if !matches!(
+            report.reason,
+            EndReason::PeerClosed | EndReason::ExplicitStop
+        ) {
+            eprintln!("Synthetischer Quellabschluss: {:?}", report.reason);
+        }
+        (report, input_times)
     }));
     let engine = MediaEngine::new(EngineConfig {
         ffmpeg,
@@ -615,7 +649,11 @@ async fn run(
     }
     let result = ProbeReport {
         source: source_name,
-        output: "H.264 256×144/25, 384 kbit/s, lokale TLS-Ziele",
+        output: match output_codec {
+            Codec::H264 => "H.264 256×144/25, 384 kbit/s, lokale TLS-Ziele",
+            Codec::Hevc => "HEVC 256×144/25, 384 kbit/s, lokale TLS-Ziele",
+            Codec::Av1 => "AV1 256×144/25, 384 kbit/s, lokale TLS-Ziele",
+        },
         encode_groups: report.status.encode_groups,
         video_decoders: report.status.video_decoders,
         identical_video_packets: left.video.len(),
@@ -803,6 +841,47 @@ async fn copy_packets(bytes: &[u8]) -> ProbeResult<BTreeMap<(u8, u8), Vec<Packet
     Ok(tracks)
 }
 async fn generate_av1(ffmpeg: &std::path::Path) -> ProbeResult<Arc<[u8]>> {
+    generate_source(ffmpeg, Codec::Av1).await
+}
+async fn generate_source(ffmpeg: &std::path::Path, codec: Codec) -> ProbeResult<Arc<[u8]>> {
+    let byte_limit = if codec == Codec::Hevc {
+        4 * 1024 * 1024
+    } else {
+        1024 * 1024
+    };
+    let source = if codec == Codec::Hevc {
+        "testsrc2=size=2560x1440:rate=25"
+    } else {
+        "testsrc2=size=320x180:rate=25"
+    };
+    let encoder: &[&str] = match codec {
+        Codec::H264 => &[
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-tune",
+            "zerolatency",
+            "-x264-params",
+            "colorprim=bt709:transfer=bt709:colormatrix=bt709",
+        ],
+        Codec::Hevc => &[
+            "-c:v",
+            "libx265",
+            "-preset",
+            "ultrafast",
+            "-x265-params",
+            "log-level=error:pools=2:frame-threads=2:bframes=0:rc-lookahead=0:colorprim=bt709:transfer=bt709:colormatrix=bt709",
+        ],
+        Codec::Av1 => &[
+            "-c:v",
+            "libsvtav1",
+            "-preset",
+            "12",
+            "-svtav1-params",
+            "lp=2",
+        ],
+    };
     let mut child = Command::new(ffmpeg)
         .args([
             "-hide_banner",
@@ -811,7 +890,7 @@ async fn generate_av1(ffmpeg: &std::path::Path) -> ProbeResult<Arc<[u8]>> {
             "-f",
             "lavfi",
             "-i",
-            "testsrc2=size=320x180:rate=25",
+            source,
             "-f",
             "lavfi",
             "-i",
@@ -828,18 +907,19 @@ async fn generate_av1(ffmpeg: &std::path::Path) -> ProbeResult<Arc<[u8]>> {
             "2:a",
             "-t",
             "2",
-            "-c:v",
-            "libsvtav1",
+        ])
+        .args(encoder)
+        .args([
             "-flags",
             "+global_header",
-            "-preset",
-            "12",
-            "-svtav1-params",
-            "lp=2",
             "-threads",
             "2",
             "-b:v",
-            "384k",
+            if codec == Codec::Hevc {
+                "4000k"
+            } else {
+                "384k"
+            },
             "-g",
             "50",
             "-pix_fmt",
@@ -871,12 +951,12 @@ async fn generate_av1(ffmpeg: &std::path::Path) -> ProbeResult<Arc<[u8]>> {
     let operation = async {
         let mut bytes = Vec::new();
         stdout
-            .take(1_048_577)
+            .take(byte_limit + 1)
             .read_to_end(&mut bytes)
             .await
             .map_err(|_| "AV1-Generatorausgabe unterbrochen")?;
-        if bytes.len() > 1_048_576 {
-            return Err("AV1-Probequelle überschreitet ihr RAM-Budget");
+        if bytes.len() as u64 > byte_limit {
+            return Err("Synthetische Probequelle überschreitet ihr RAM-Budget");
         }
         if !child
             .wait()
@@ -935,13 +1015,23 @@ async fn main() -> ExitCode {
         let (ffmpeg, ffprobe) = arguments()?;
         ffmpeg_listener(&ffmpeg).await?;
         let av1 = generate_av1(&ffmpeg).await?;
-        for (fixture, name, slow, audio_ids, stalled) in [
+        let hevc = generate_source(&ffmpeg, Codec::Hevc).await?;
+        for (fixture, name, slow, audio_ids, stalled, output_codec) in [
+            (
+                hevc,
+                "HEVC 2560×1440/25, synthetisches SDR + AAC 440/880 Hz",
+                false,
+                [0, 1],
+                false,
+                Codec::H264,
+            ),
             (
                 Arc::from(H264),
                 "H.264 320×180/25 + AAC 440/880 Hz",
                 false,
                 [0, 1],
                 true,
+                Codec::H264,
             ),
             (
                 av1.clone(),
@@ -949,6 +1039,7 @@ async fn main() -> ExitCode {
                 false,
                 [0, 1],
                 false,
+                Codec::H264,
             ),
             (
                 av1.clone(),
@@ -956,6 +1047,7 @@ async fn main() -> ExitCode {
                 true,
                 [0, 1],
                 false,
+                Codec::H264,
             ),
             (
                 av1,
@@ -963,6 +1055,23 @@ async fn main() -> ExitCode {
                 false,
                 [7, 12],
                 false,
+                Codec::H264,
+            ),
+            (
+                Arc::from(H264),
+                "H.264 320×180/25 + AAC 440/880 Hz",
+                false,
+                [0, 1],
+                false,
+                Codec::Hevc,
+            ),
+            (
+                Arc::from(H264),
+                "H.264 320×180/25 + AAC 440/880 Hz",
+                false,
+                [0, 1],
+                false,
+                Codec::Av1,
             ),
         ] {
             let report = timeout(
@@ -971,10 +1080,13 @@ async fn main() -> ExitCode {
                     ffmpeg.clone(),
                     ffprobe.clone(),
                     fixture,
-                    name,
-                    slow,
-                    audio_ids,
-                    stalled,
+                    ProbeCase {
+                        source_name: name,
+                        output_codec,
+                        with_slow: slow,
+                        audio_ids,
+                        with_stalled: stalled,
+                    },
                 ),
             )
             .await
@@ -985,6 +1097,7 @@ async fn main() -> ExitCode {
                     .map_err(|_| "Probebericht konnte nicht erzeugt werden")?
             );
         }
+        platform::run(&ffmpeg, &ffprobe).await?;
         Ok::<_, &'static str>(())
     }
     .await;

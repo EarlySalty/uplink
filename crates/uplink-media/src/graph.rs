@@ -19,9 +19,13 @@ pub(crate) struct EncodeProfile {
     /// Fehlende Farbmetadaten der Quelle bleiben unbekannt und werden nicht umetikettiert.
     pub signal_bt709: bool,
 }
+#[derive(Clone)]
 pub(crate) struct Routing {
+    /// Audio/Metadaten kommen nur aus dieser einen Gruppe, auch bei mehreren Videos.
     pub group: Option<usize>,
+    pub video: Vec<(Option<usize>, u8)>,
     pub audio: Vec<(u8, u8)>,
+    pub failure: Option<MediaError>,
 }
 pub(crate) struct Graph {
     pub profiles: Vec<EncodeProfile>,
@@ -65,7 +69,7 @@ impl Graph {
             match source.video.codec {
                 Codec::Av1 => WireCodec::Av1,
                 Codec::H264 => WireCodec::H264,
-                Codec::Hevc => return Err(MediaError::UnsupportedProfile),
+                Codec::Hevc => WireCodec::Hevc,
             },
         )]);
         let mut logical_audio = HashMap::new();
@@ -157,7 +161,12 @@ impl Graph {
                     ));
                 }
             }
-            routes.push(Routing { group, audio });
+            routes.push(Routing {
+                group,
+                video: vec![(group, 0)],
+                audio,
+                failure: None,
+            });
         }
         Ok(Self {
             profiles,
@@ -171,9 +180,8 @@ impl Graph {
 
     pub(crate) fn observed(source: &SourceObservation, outputs: &[DesiredOutput]) -> Result<Self> {
         use uplink_core::{Color, FrameRate, Gop, RateControl};
-        if outputs.is_empty()
-            || source.pixel_format != "yuv420p"
-            || !matches!(source.codec.as_str(), "av1" | "h264")
+        if source.pixel_format != "yuv420p"
+            || !matches!(source.codec.as_str(), "av1" | "h264" | "hevc")
             || source
                 .color_transfer
                 .as_deref()
@@ -198,10 +206,10 @@ impl Graph {
         let mut expected_tracks = HashSet::from([video_track]);
         let mut codecs = HashMap::from([(
             video_track,
-            if source.codec == "av1" {
-                WireCodec::Av1
-            } else {
-                WireCodec::H264
+            match source.codec.as_str() {
+                "av1" => WireCodec::Av1,
+                "hevc" => WireCodec::Hevc,
+                _ => WireCodec::H264,
             },
         )]);
         let mut input_audio = HashMap::new();
@@ -225,96 +233,124 @@ impl Graph {
         let mut routes = Vec::new();
         let mut ids = HashSet::new();
         for output in outputs {
-            let desired = &output.video;
-            if !ids.insert(output.target.id.as_str())
-                || output.target.id.is_empty()
-                || desired.codec != Codec::H264
-                || desired.width < 2
-                || desired.height < 2
-                || desired.width > 4096
-                || desired.height > 4096
-                || u64::from(desired.width) * u64::from(desired.height)
-                    > u64::from(source.width) * u64::from(source.height)
-                || desired.fps > source_fps
-                || desired.fps
-                    > FrameRate::new(60, 1).map_err(|_| MediaError::InvalidConfiguration)?
-                || desired.bitrate_kbps == 0
-                || desired.bitrate_kbps > 20000
-            {
-                return Err(MediaError::UnsupportedProfile);
+            if !ids.insert(output.target.id.as_str()) || output.target.id.is_empty() {
+                return Err(MediaError::InvalidConfiguration);
             }
-            let video = VideoProfile {
-                width: desired.width,
-                height: desired.height,
-                fps: desired.fps,
-                codec: Codec::H264,
-                codec_profile: "high".into(),
-                level: if u64::from(desired.width) * u64::from(desired.height) <= 1920 * 1080 {
-                    "4.2"
-                } else {
-                    "5.2"
+            let prior_profiles = profiles.len();
+            let route = (|| {
+                let desired = &output.video;
+                if desired.width < 2
+                    || desired.height < 2
+                    || desired.width > 4096
+                    || desired.height > 4096
+                    || u64::from(desired.width) * u64::from(desired.height)
+                        > u64::from(source.width) * u64::from(source.height)
+                    || desired.fps > source_fps
+                    || desired.fps
+                        > FrameRate::new(60, 1).map_err(|_| MediaError::InvalidConfiguration)?
+                    || desired.bitrate_kbps == 0
+                    || desired.bitrate_kbps > 20000
+                {
+                    return Err(MediaError::UnsupportedProfile);
                 }
-                .into(),
-                bit_depth: 8,
-                chroma: Chroma::Yuv420,
-                color: Color {
-                    primaries: ColorPrimaries::Bt709,
-                    transfer: Transfer::Bt709,
-                    matrix: Matrix::Bt709,
-                    range: ColorRange::Limited,
-                },
-                rate: RateControl {
-                    mode: RateMode::Cbr,
-                    target_kbps: desired.bitrate_kbps,
-                    max_kbps: desired.bitrate_kbps,
-                    buffer_kbits: desired.bitrate_kbps * 2,
-                },
-                gop: Gop {
-                    keyframe_interval_frames: u32::try_from(
-                        (u64::from(desired.fps.numerator()) * 2)
-                            .div_ceil(u64::from(desired.fps.denominator())),
-                    )
-                    .map_err(|_| MediaError::InvalidConfiguration)?,
-                    closed: true,
-                },
-            };
-            validate_encoder(&video)?;
-            if let Some(layout) = &output.layout {
-                validate_layout_dimensions(layout, source.width, source.height, &video)?;
-            }
-            let group = match profiles
-                .iter()
-                .position(|p| p.video == video && p.layout == output.layout)
-            {
-                Some(index) => index,
-                None => {
-                    profiles.push(EncodeProfile {
-                        video,
-                        layout: output.layout.clone(),
-                        signal_bt709: false,
-                    });
-                    profiles.len() - 1
+                let video = VideoProfile {
+                    width: desired.width,
+                    height: desired.height,
+                    fps: desired.fps,
+                    codec: desired.codec,
+                    codec_profile: if desired.codec == Codec::H264 {
+                        "high"
+                    } else {
+                        "main"
+                    }
+                    .into(),
+                    level: match desired.codec {
+                        Codec::H264
+                            if u64::from(desired.width) * u64::from(desired.height)
+                                <= 1920 * 1080 =>
+                        {
+                            "4.2"
+                        }
+                        Codec::H264 => "5.2",
+                        Codec::Hevc | Codec::Av1 => "5.1",
+                    }
+                    .into(),
+                    bit_depth: 8,
+                    chroma: Chroma::Yuv420,
+                    color: Color {
+                        primaries: ColorPrimaries::Bt709,
+                        transfer: Transfer::Bt709,
+                        matrix: Matrix::Bt709,
+                        range: ColorRange::Limited,
+                    },
+                    rate: RateControl {
+                        mode: RateMode::Cbr,
+                        target_kbps: desired.bitrate_kbps,
+                        max_kbps: desired.bitrate_kbps,
+                        buffer_kbits: desired.bitrate_kbps * 2,
+                    },
+                    gop: Gop {
+                        keyframe_interval_frames: u32::try_from(
+                            (u64::from(desired.fps.numerator()) * 2)
+                                .div_ceil(u64::from(desired.fps.denominator())),
+                        )
+                        .map_err(|_| MediaError::InvalidConfiguration)?,
+                        closed: true,
+                    },
+                };
+                validate_encoder(&video)?;
+                if let Some(layout) = &output.layout {
+                    validate_layout_dimensions(layout, source.width, source.height, &video)?;
                 }
-            };
-            let mut audio = Vec::new();
-            for (destination, wire_id) in [Some(output.live_audio_track), output.vod_audio_track]
-                .into_iter()
-                .enumerate()
-            {
-                if let Some(wire_id) = wire_id {
-                    let wire = WireTrack {
-                        kind: MediaKind::Audio,
-                        wire_id,
-                    };
-                    audio.push((
-                        *input_audio.get(&wire).ok_or(MediaError::MissingTrack)?,
-                        destination as u8,
-                    ));
+                let group = match profiles
+                    .iter()
+                    .position(|p| p.video == video && p.layout == output.layout)
+                {
+                    Some(index) => index,
+                    None => {
+                        profiles.push(EncodeProfile {
+                            video,
+                            layout: output.layout.clone(),
+                            signal_bt709: false,
+                        });
+                        profiles.len() - 1
+                    }
+                };
+                let mut audio = Vec::new();
+                for (destination, wire_id) in
+                    [Some(output.live_audio_track), output.vod_audio_track]
+                        .into_iter()
+                        .enumerate()
+                {
+                    if let Some(wire_id) = wire_id {
+                        let wire = WireTrack {
+                            kind: MediaKind::Audio,
+                            wire_id,
+                        };
+                        audio.push((
+                            *input_audio.get(&wire).ok_or(MediaError::MissingTrack)?,
+                            destination as u8,
+                        ));
+                    }
                 }
-            }
-            routes.push(Routing {
-                group: Some(group),
-                audio,
+                Ok(Routing {
+                    group: Some(group),
+                    video: vec![(Some(group), 0)],
+                    audio,
+                    failure: None,
+                })
+            })();
+            routes.push(match route {
+                Ok(route) => route,
+                Err(reason) => {
+                    profiles.truncate(prior_profiles);
+                    Routing {
+                        group: None,
+                        video: Vec::new(),
+                        audio: Vec::new(),
+                        failure: Some(reason),
+                    }
+                }
             });
         }
         Ok(Self {
@@ -325,6 +361,126 @@ impl Graph {
             video_track,
             codecs,
         })
+    }
+
+    pub(crate) fn program(
+        source: &SourceObservation,
+        outputs: &[crate::ProgramOutput],
+    ) -> Result<Self> {
+        let mut graph = Self::observed(source, &[])?;
+        let source_fps = uplink_core::FrameRate::new(source.fps_numerator, source.fps_denominator)
+            .map_err(|_| MediaError::InvalidMedia)?;
+        let mut target_ids = HashSet::new();
+        for output in outputs {
+            if output.target.id.is_empty() || !target_ids.insert(&output.target.id) {
+                return Err(MediaError::InvalidConfiguration);
+            }
+            let prior = graph.profiles.len();
+            let compiled = (|| {
+                if output.video.is_empty()
+                    || output.video.len() > 16
+                    || output.audio.is_empty()
+                    || output.audio.len() > 16
+                {
+                    return Err(MediaError::InvalidConfiguration);
+                }
+                let mut audio = Vec::new();
+                let mut audio_ids = HashSet::new();
+                for route in &output.audio {
+                    if !audio_ids.insert(route.destination_wire_track) {
+                        return Err(MediaError::InvalidConfiguration);
+                    }
+                    let wire = WireTrack {
+                        kind: MediaKind::Audio,
+                        wire_id: route.source_wire_track,
+                    };
+                    let source = *graph
+                        .input_audio
+                        .get(&wire)
+                        .ok_or(MediaError::MissingTrack)?;
+                    audio.push((source, route.destination_wire_track));
+                }
+                let mut video = Vec::new();
+                let mut video_ids = HashSet::new();
+                let mut canvases: HashMap<u8, Option<&LayoutSpec>> = HashMap::new();
+                for request in &output.video {
+                    let profile = &request.profile;
+                    if !video_ids.insert(request.wire_track)
+                        || request.canvas_index > 1
+                        || (request.canvas_index == 1 && request.layout.is_none())
+                        || profile.width < 2
+                        || profile.height < 2
+                        || profile.width > 4096
+                        || profile.height > 4096
+                        || u64::from(profile.width) * u64::from(profile.height)
+                            > u64::from(source.width) * u64::from(source.height)
+                        || profile.fps > source_fps
+                        || profile.rate.target_kbps == 0
+                        || profile.rate.target_kbps > 20_000
+                        || profile.rate.max_kbps != profile.rate.target_kbps
+                        || profile.rate.buffer_kbits == 0
+                        || profile.rate.buffer_kbits > profile.rate.target_kbps * 4
+                        || profile.gop.keyframe_interval_frames == 0
+                        || profile.gop.keyframe_interval_frames > 480
+                        || !profile.gop.closed
+                    {
+                        return Err(MediaError::UnsupportedProfile);
+                    }
+                    if let Some(previous) =
+                        canvases.insert(request.canvas_index, request.layout.as_ref())
+                        && previous != request.layout.as_ref()
+                    {
+                        return Err(MediaError::InvalidConfiguration);
+                    }
+                    validate_encoder(profile)?;
+                    // This API accepts a complete requested colour profile. Unlike the
+                    // basic desired-size API it cannot silently keep unknown colour tags.
+                    if source.color_primaries.as_deref() != Some("bt709")
+                        || source.color_transfer.as_deref() != Some("bt709")
+                        || source.color_matrix.as_deref() != Some("bt709")
+                        || source.color_range.as_deref() != Some("tv")
+                    {
+                        return Err(MediaError::UnsupportedProfile);
+                    }
+                    if let Some(layout) = &request.layout {
+                        validate_layout_dimensions(layout, source.width, source.height, profile)?;
+                    }
+                    let group = match graph.profiles.iter().position(|existing| {
+                        existing.video == *profile && existing.layout == request.layout
+                    }) {
+                        Some(index) => index,
+                        None => {
+                            graph.profiles.push(EncodeProfile {
+                                video: profile.clone(),
+                                layout: request.layout.clone(),
+                                signal_bt709: true,
+                            });
+                            graph.profiles.len() - 1
+                        }
+                    };
+                    video.push((Some(group), request.wire_track));
+                }
+                Ok(Routing {
+                    group: video[0].0,
+                    video,
+                    audio,
+                    failure: None,
+                })
+            })();
+            graph.routes.push(match compiled {
+                Ok(route) => route,
+                Err(reason) => {
+                    graph.profiles.truncate(prior);
+                    Routing {
+                        group: None,
+                        video: Vec::new(),
+                        audio: Vec::new(),
+                        failure: Some(reason),
+                    }
+                }
+            });
+        }
+        Ok(graph)
     }
 
     pub(crate) fn arguments(
@@ -561,26 +717,31 @@ impl EncodeProfile {
                 "-x264-params",
                 "nal-hrd=cbr:force-cfr=1",
             ],
-            Codec::Hevc => &[
-                "-c:v",
-                "libx265",
-                "-preset",
-                "fast",
-                "-x265-params",
-                "log-level=error:strict-cbr=1",
-            ],
+            Codec::Hevc => &["-c:v", "libx265", "-preset", "fast"],
             Codec::Av1 => &[
                 "-c:v",
-                "libaom-av1",
-                "-usage",
-                "realtime",
-                "-cpu-used",
+                "libsvtav1",
+                "-preset",
                 "8",
-                "-lag-in-frames",
-                "0",
+                "-flags",
+                "+global_header",
             ],
         };
         args.extend(codec_args.iter().map(OsString::from));
+        if video.codec == Codec::Hevc {
+            args.extend(["-x265-params".into(),format!("log-level=error:strict-cbr=1:pools={threads}:frame-threads={threads}:rc-lookahead=0:bframes=0:open-gop=0").into()]);
+        }
+        if video.codec == Codec::Av1 {
+            // lp bezeichnet eine Parallelitätsstufe, keine feste OS-Threadzahl.
+            args.extend([
+                "-svtav1-params".into(),
+                format!(
+                    "lp=2:pred-struct=1:irefresh-type=2:profile=0:level={}",
+                    video.level
+                )
+                .into(),
+            ]);
+        }
         for (name, value) in [
             ("-threads:v", threads.to_string()),
             ("-b:v", format!("{}k", video.rate.target_kbps)),
@@ -711,16 +872,84 @@ mod tests {
             Graph::observed(&hdr, &[output("one", 0, None)]),
             Err(MediaError::UnsupportedProfile)
         ));
-        assert!(matches!(
-            Graph::observed(&source(), &[output("one", 0, Some(7))]),
-            Err(MediaError::MissingTrack)
-        ));
+        let missing = Graph::observed(&source(), &[output("one", 0, Some(7))]).unwrap();
+        assert_eq!(missing.routes[0].failure, Some(MediaError::MissingTrack));
         let mut upscale = output("one", 0, None);
         upscale.video.width = 640;
-        assert!(matches!(
-            Graph::observed(&source(), &[upscale]),
-            Err(MediaError::UnsupportedProfile)
-        ));
+        let upscale = Graph::observed(&source(), &[upscale]).unwrap();
+        assert_eq!(
+            upscale.routes[0].failure,
+            Some(MediaError::UnsupportedProfile)
+        );
+    }
+    #[test]
+    fn multivideo_shares_profiles_but_keeps_one_audio_anchor_and_unique_track_ids() {
+        use crate::{ProgramAudio, ProgramOutput, ProgramVideo};
+        let mut source = source();
+        source.color_primaries = Some("bt709".into());
+        source.color_transfer = Some("bt709".into());
+        source.color_matrix = Some("bt709".into());
+        source.color_range = Some("tv".into());
+        let basic = output("shape", 0, None);
+        let mut declared = Graph::observed(&source, &[basic]).unwrap();
+        let profile = declared.profiles.remove(0).video;
+        let video = |id| ProgramVideo {
+            wire_track: id,
+            canvas_index: 0,
+            profile: profile.clone(),
+            layout: None,
+        };
+        let outputs = [
+            ProgramOutput {
+                target: output("multi", 0, None).target,
+                video: vec![video(0), video(7)],
+                audio: vec![
+                    ProgramAudio {
+                        source_wire_track: 0,
+                        destination_wire_track: 4,
+                    },
+                    ProgramAudio {
+                        source_wire_track: 1,
+                        destination_wire_track: 12,
+                    },
+                ],
+            },
+            ProgramOutput {
+                target: output("duplicate", 0, None).target,
+                video: vec![video(0), video(0)],
+                audio: vec![ProgramAudio {
+                    source_wire_track: 0,
+                    destination_wire_track: 0,
+                }],
+            },
+            ProgramOutput {
+                target: output("shared", 0, None).target,
+                video: vec![video(0)],
+                audio: vec![ProgramAudio {
+                    source_wire_track: 1,
+                    destination_wire_track: 0,
+                }],
+            },
+        ];
+        let graph = Graph::program(&source, &outputs).unwrap();
+        assert_eq!(graph.profiles.len(), 1);
+        assert_eq!(graph.routes[0].video, vec![(Some(0), 0), (Some(0), 7)]);
+        assert_eq!(graph.routes[0].group, Some(0));
+        assert_eq!(graph.routes[0].audio, vec![(0, 4), (1, 12)]);
+        assert_eq!(
+            graph.routes[1].failure,
+            Some(MediaError::UnsupportedProfile)
+        );
+        assert_eq!(graph.routes[2].failure, None);
+        source.color_transfer = None;
+        let unknown = Graph::program(&source, &outputs).unwrap();
+        assert!(unknown.profiles.is_empty());
+        assert!(
+            unknown
+                .routes
+                .iter()
+                .all(|route| route.failure == Some(MediaError::UnsupportedProfile))
+        );
     }
     #[test]
     fn large_reduced_frame_rate_components_do_not_overflow_gop() {
@@ -728,5 +957,29 @@ mod tests {
         desired.video.fps = FrameRate::new(4_000_000_001, 1_000_000_000).unwrap();
         let graph = Graph::observed(&source(), &[desired]).unwrap();
         assert_eq!(graph.profiles[0].video.gop.keyframe_interval_frames, 9);
+    }
+
+    #[test]
+    fn missing_vod_or_incompatible_target_does_not_cancel_healthy_outputs() {
+        let mut invalid = output("incompatible", 0, None);
+        invalid.video.width = 640;
+        let graph = Graph::observed(
+            &source(),
+            &[
+                output("missing-vod", 0, Some(12)),
+                output("healthy", 1, None),
+                invalid,
+            ],
+        )
+        .expect("separate target failures must preserve a healthy graph");
+        assert_eq!(graph.profiles.len(), 1);
+        assert_eq!(graph.routes.len(), 3);
+        assert_eq!(graph.routes[1].audio, vec![(1, 0)]);
+        assert_eq!(graph.routes[0].failure, Some(MediaError::MissingTrack));
+        assert_eq!(graph.routes[1].failure, None);
+        assert_eq!(
+            graph.routes[2].failure,
+            Some(MediaError::UnsupportedProfile)
+        );
     }
 }
