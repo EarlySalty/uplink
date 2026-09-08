@@ -41,7 +41,7 @@ Eingaben: gemessene Quelle `(qb, qh)` aus der Medienvorprüfung, Zielprofil `(zb
 | `gestapelt` | `Stacked { gameplay, camera, camera_height }` | `camera_height = gerade(round(kameraBand.hoehe × zh))`, muss `< zh − 2` sein |
 | `bild_im_bild` | `PictureInPicture { gameplay, camera, camera_box }` | `camera_box` aus `kameraBox × (zb, zh)`, gerade, vollständig im Zielbild |
 
-`gerade(n)` rundet auf die nächste gerade Zahl ab (mindestens 2). Nach der Rechnung läuft `validate_layout_dimensions` aus dem Graphen; ein Fehler dort ist ein sichtbarer Zielfehler (`output_state=failed`, `reason` mit Klartext), nie ein stilles Weglassen des Layouts. `Stacked` stapelt im heutigen Graphen Gameplay oben und Kamera unten (`vstack` in Reihenfolge Gameplay, Kamera); `kameraBand.lage = 'oben'` braucht die umgekehrte Reihenfolge im Filter, eine Zeile in `graph.rs`, die Codex mit übernimmt. Bis dahin lehnt der Dienst `lage = 'oben'` mit Klartext ab statt still `unten` zu liefern.
+`gerade(n)` rundet auf die nächste gerade Zahl ab; Größen (`w`, `h`, `camera_height`) haben die Untergrenze 2, Positionen (`x`, `y`) werden nach dem Runden so geklemmt, dass `x + w` und `y + h` in der jeweiligen Fläche bleiben (erst die Position zurückschieben, sonst die Größe um 2 verkleinern). Editor und Dienst rechnen identisch; der Editor sperrt das Speichern, wenn ein Rahmen nach der Pixelrechnung übersteht. `kameraBand.lage = 'oben'` bietet der Editor erst an, wenn der Graph die umgekehrte `vstack`-Reihenfolge kann; bis dahin lehnt auch die Editorprüfung `oben` ab. Nach der Rechnung läuft `validate_layout_dimensions` aus dem Graphen; ein Fehler dort ist ein sichtbarer Zielfehler (`output_state=failed`, `reason` mit Klartext), nie ein stilles Weglassen des Layouts. `Stacked` stapelt im heutigen Graphen Gameplay oben und Kamera unten (`vstack` in Reihenfolge Gameplay, Kamera); `kameraBand.lage = 'oben'` braucht die umgekehrte Reihenfolge im Filter, eine Zeile in `graph.rs`, die Codex mit übernimmt. Bis dahin lehnt der Dienst `lage = 'oben'` mit Klartext ab statt still `unten` zu liefern.
 
 `LayoutRevision { id, revision }`: `id` ist die Layoutzeilen-ID (`relay.hochkant_layouts.layout_id`), `revision` die Revisionsnummer. Beide ungleich 0, wie der Planer es verlangt.
 
@@ -109,7 +109,7 @@ export interface UplinkHochkantEditorProps {
 }
 ```
 
-Reine Funktionen in `components/uplink/hochkantLayout.ts` (getestet ohne DOM): `hochkantAnfang(quelle, ziel)`, `hochkantPruefen(layout, ziel) → Fehlerliste`, `seitenverhaeltnisSperren(rahmen, verhaeltnis, quelle)`, `rahmenBegrenzen(rahmen)`, `rahmenZiehen(rahmen, griff, dx, dy, grenzen)`, `zielPixel(layout, quelle, ziel) → { gameplay, kamera, kameraBand, kameraBox }` in geraden Pixeln (die Rechnung, die der Dienst nachvollzieht), `vorschauAusschnitt(rahmen, quelle, zielflaeche)` für die Zielvorschau.
+Reine Funktionen in `components/uplink/hochkantLayout.ts` (getestet ohne DOM): `hochkantAnfang(quelle, ziel)`, `hochkantPruefen(layout, ziel, quelle) → Fehlerliste` (Regeln 1 bis 3 plus Pixelüberstand nach `zielPixel`), `seitenverhaeltnisSperren(rahmen, verhaeltnis, quelle)`, `rahmenBegrenzen(rahmen)`, `rahmenZiehen(rahmen, griff, dx, dy, grenzen)`, `zielPixel(layout, quelle, ziel) → { gameplay, kamera, kameraBand, kameraBox }` in geraden Pixeln (die Rechnung, die der Dienst nachvollzieht), `vorschauAusschnitt(rahmen, quelle, zielflaeche)` für die Zielvorschau (liefert Pixelwerte relativ zur gemessenen Vorschaufläche).
 
 ## Offene Aufruferanforderungen
 
