@@ -7,6 +7,9 @@ impl Config {
     /// Dieselben Grenzen dienen Admission und Validierung. Auch anonyme
     /// Verbindungen können Parserpuffer füllen; sie zählen deshalb vollständig.
     pub fn ingest_limits(&self) -> Result<IngestLimits, &'static str> {
+        self.media_limits()
+            .validate_packet_limits()
+            .map_err(|_| "Paket- oder Queuegrenzen verletzen den gemeinsamen Medienvertrag.")?;
         let mut limits = IngestLimits::local_probe();
         limits.max_connections = self.max_sessions;
         limits.max_pending_connections = self.max_pending_connections;
@@ -18,6 +21,10 @@ impl Config {
         limits.rtmp.chunk.max_message_bytes = limits.max_event_bytes;
         limits.rtmp.chunk.max_partial_bytes = limits.max_event_bytes.saturating_mul(4);
         limits.rtmp.max_read_buffer_bytes = limits.max_event_bytes.saturating_mul(2);
+        limits
+            .rtmp
+            .validate()
+            .map_err(|_| "Die Eingangsgrenzen verletzen den RTMP-Parservertrag.")?;
         let bytes = self
             .ingest_allocation_bound(&limits)
             .ok_or("Die gemeinsamen Eingangsbudgets sind zu groß.")?;

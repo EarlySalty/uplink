@@ -126,6 +126,23 @@ pub struct MediaLimits {
     pub max_encode_groups: usize,
     pub worker_threads: usize,
 }
+impl MediaLimits {
+    /// Gemeinsamer Paketvertrag für Konfiguration und Engine. Die 24-Bit-Länge
+    /// bezeichnet den Taginhalt; die Queue hält zusätzlich 11 Headerbytes und
+    /// vier Bytes PreviousTagSize. Ein gültiges größtes Paket muss hineinpassen.
+    pub fn validate_packet_limits(&self) -> Result<()> {
+        if self.max_tag_bytes == 0
+            || self.max_tag_bytes > 0xff_ffff
+            || self
+                .max_tag_bytes
+                .checked_add(15)
+                .is_none_or(|framed| self.queue_bytes < framed)
+        {
+            return Err(MediaError::InvalidConfiguration);
+        }
+        Ok(())
+    }
+}
 impl Default for MediaLimits {
     fn default() -> Self {
         Self {
