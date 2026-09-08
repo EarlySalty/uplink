@@ -38,6 +38,7 @@ async fn run() -> Result<(), &'static str> {
         );
         return Ok(());
     }
+    uplink_service::secrets::protect_configured_fds(&config)?;
     let secrets = Arc::new(uplink_service::secrets::fetch(&config).await?);
     let tls = uplink_service::secrets::tls(&config, &secrets).await?;
     let store = Arc::new(Store::connect(&secrets.database, config.database_max_queries).await?);

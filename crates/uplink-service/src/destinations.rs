@@ -15,6 +15,9 @@ pub struct DestinationUpdate {
 }
 impl Drop for DestinationUpdate {
     fn drop(&mut self) {
+        if let Some(endpoint) = &mut self.rtmp_url {
+            endpoint.zeroize();
+        }
         if let Some(key) = &mut self.stream_key {
             key.zeroize();
         }
@@ -38,19 +41,57 @@ impl DestinationUpdate {
             return Err("Ziel oder gewünschtes Profil ist ungültig.");
         }
         if let Some(endpoint) = &self.rtmp_url {
-            let url =
-                reqwest::Url::parse(endpoint).map_err(|_| "Plattformadresse ist ungültig.")?;
-            if endpoint.len() > 2048
-                || !matches!(url.scheme(), "rtmp" | "rtmps")
-                || url.host_str().is_none()
-                || !url.username().is_empty()
-                || url.password().is_some()
-                || url.query().is_some()
-                || url.fragment().is_some()
-            {
-                return Err("Plattformadresse darf keine Zugangsdaten enthalten.");
-            }
+            public_endpoint(endpoint)?;
         }
         Ok(())
     }
+}
+
+/// Ausschließlich feste öffentliche RTMP-Appnamen; ein beliebiger Pfad ist
+/// potenziell selbst ein Zugang. Abweichende Provider benötigen einen geprüften
+/// Adapter und dürfen nicht als öffentliche URL gespeichert werden.
+pub fn public_endpoint(endpoint: &str) -> Result<(), &'static str> {
+    let url = reqwest::Url::parse(endpoint).map_err(|_| "Plattformadresse ist ungültig.")?;
+    let raw_path = endpoint
+        .split_once("://")
+        .and_then(|(_, authority)| authority.find('/').map(|index| &authority[index..]))
+        .unwrap_or("");
+    if endpoint.len() > 2048
+        || !matches!(url.scheme(), "rtmp" | "rtmps")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !matches!(
+            url.path(),
+            "" | "/"
+                | "/app"
+                | "/app/"
+                | "/live"
+                | "/live/"
+                | "/live2"
+                | "/live2/"
+                | "/game"
+                | "/game/"
+        )
+        || !matches!(
+            raw_path,
+            "" | "/"
+                | "/app"
+                | "/app/"
+                | "/live"
+                | "/live/"
+                | "/live2"
+                | "/live2/"
+                | "/game"
+                | "/game/"
+        )
+        || endpoint.contains('%')
+        || endpoint.contains('\\')
+        || endpoint.bytes().any(|byte| byte.is_ascii_control())
+    {
+        return Err("Plattformadresse muss eine öffentliche Serveradresse ohne Zugangsdaten sein.");
+    }
+    Ok(())
 }

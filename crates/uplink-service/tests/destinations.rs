@@ -21,3 +21,12 @@ fn partial_profile_update_preserves_omitted_credentials() {
     assert!(update.rtmp_url.is_none());
     assert!(update.stream_key.is_none());
 }
+
+#[test]
+fn endpoint_path_credentials_never_pass_as_public_server_addresses() {
+    for platform in ["twitch", "kick", "youtube", "tiktok"] {
+        let value = serde_json::json!({"platform":platform,"rtmp_url":"rtmps://publish.invalid/app/synthetic-private-publish-key"});
+        let update: DestinationUpdate = serde_json::from_value(value).unwrap();
+        assert!(update.validate().is_err());
+    }
+}

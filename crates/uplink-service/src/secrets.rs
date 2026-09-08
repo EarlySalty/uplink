@@ -18,9 +18,7 @@ pub struct ServiceSecrets {
 }
 
 pub async fn read_fd(fd: u32, limit: usize) -> Result<Secret, &'static str> {
-    if fd < 3 {
-        return Err("Credential-FD ist ungültig.");
-    }
+    protect_fd(fd)?;
     let file = tokio::fs::File::open(format!("/proc/self/fd/{fd}"))
         .await
         .map_err(|_| "Credential-FD ist nicht verfügbar.")?;
@@ -36,6 +34,37 @@ pub async fn read_fd(fd: u32, limit: usize) -> Result<Secret, &'static str> {
         return Err("Credential-Größe ist ungültig.");
     }
     Ok(Secret::new(std::mem::take(&mut *data)))
+}
+
+// Nur ausdrücklich injizierte Deskriptoren schützen; der Besitzer behält sie.
+// Das Original muss CLOEXEC tragen, nicht nur die zum Lesen geöffnete Kopie.
+fn protect_fd(fd: u32) -> Result<(), &'static str> {
+    use nix::fcntl::{FcntlArg, FdFlag, fcntl};
+    let raw = i32::try_from(fd)
+        .ok()
+        .filter(|fd| *fd >= 3)
+        .ok_or("Credential-FD ist ungültig.")?;
+    let flags = fcntl(raw, FcntlArg::F_GETFD).map_err(|_| "Credential-FD ist nicht verfügbar.")?;
+    fcntl(
+        raw,
+        FcntlArg::F_SETFD(FdFlag::from_bits_retain(flags) | FdFlag::FD_CLOEXEC),
+    )
+    .map_err(|_| "Credential-FD konnte nicht geschützt werden.")?;
+    Ok(())
+}
+
+/// Vor dem ersten möglichen Prozessstart alle autorisierten Original-FDs schützen.
+pub fn protect_configured_fds(config: &Config) -> Result<(), &'static str> {
+    protect_fd(config.infisical.credential_fd)?;
+    if let TlsConfig::Fds {
+        certificate_fd,
+        private_key_fd,
+    } = config.tls
+    {
+        protect_fd(certificate_fd)?;
+        protect_fd(private_key_fd)?;
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -189,12 +218,12 @@ pub async fn tls(
             (&material.0, &material.1)
         }
     };
-    let certs = rustls_pemfile::certs(&mut cert.expose())
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+    let certs = CertificateDer::pem_slice_iter(cert.expose())
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| "TLS-Zertifikat ist ungültig.")?;
-    let key = rustls_pemfile::private_key(&mut key.expose())
-        .map_err(|_| "TLS-Schlüssel ist ungültig.")?
-        .ok_or("TLS-Schlüssel fehlt.")?;
+    let key =
+        PrivateKeyDer::from_pem_slice(key.expose()).map_err(|_| "TLS-Schlüssel ist ungültig.")?;
     let tls = rustls::ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))

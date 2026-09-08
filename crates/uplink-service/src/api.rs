@@ -65,16 +65,18 @@ pub fn router(state: Arc<ServiceState>) -> Router {
                         )
                         .into_response();
                     };
-                    let mut response = match tokio::time::timeout(
-                        std::time::Duration::from_secs(timeout_seconds),
-                        next.run(request),
+                    let deadline = tokio::time::Instant::now()
+                        + std::time::Duration::from_secs(timeout_seconds);
+                    let mut response = match tokio::time::timeout_at(
+                        deadline + crate::store::CLEANUP_GRACE,
+                        crate::store::REQUEST_DEADLINE.scope(deadline, next.run(request)),
                     )
                     .await
                     {
                         Ok(response) => response,
                         Err(_) => failure(
                             StatusCode::GATEWAY_TIMEOUT,
-                            "Anfrage hat die Frist überschritten.",
+                            "Anfragefrist überschritten; Abschluss unklar, gespeicherten Stand vor Wiederholung prüfen.",
                         )
                         .into_response(),
                     };
@@ -144,7 +146,44 @@ async fn save_destinations(
         rows.push(json!({"platform":output.platform,"rtmp_url":output.rtmp_url,"stream_key_enc":ciphertext.map(|bytes|format!("\\x{}",hex::encode(bytes))),"enabled":output.enabled,"width":output.width,"height":output.height,"fps":output.fps,"bitrate_kbps":output.bitrate_kbps}));
     }
     let data = json!(rows);
-    let stored=state.store.query("WITH incoming AS (SELECT * FROM jsonb_to_recordset($2::jsonb) AS x(platform text,rtmp_url text,stream_key_enc bytea,enabled boolean,width integer,height integer,fps integer,bitrate_kbps integer)) INSERT INTO relay.destinations(streamer_id,platform,rtmp_url,stream_key_enc,enabled,width,height,fps,bitrate_kbps) SELECT $1,i.platform,COALESCE(i.rtmp_url,p.rtmp_url),COALESCE(i.stream_key_enc,p.stream_key_enc),COALESCE(i.enabled,p.enabled,true),COALESCE(i.width,p.width),COALESCE(i.height,p.height),COALESCE(i.fps,p.fps),COALESCE(i.bitrate_kbps,p.bitrate_kbps) FROM incoming i LEFT JOIN relay.destinations p ON p.streamer_id=$1 AND p.platform=i.platform WHERE EXISTS(SELECT 1 FROM relay.users WHERE streamer_id=$1 AND enabled=true) ON CONFLICT(streamer_id,platform) DO UPDATE SET rtmp_url=EXCLUDED.rtmp_url,stream_key_enc=EXCLUDED.stream_key_enc,enabled=EXCLUDED.enabled,width=EXCLUDED.width,height=EXCLUDED.height,fps=EXCLUDED.fps,bitrate_kbps=EXCLUDED.bitrate_kbps RETURNING platform",&[&request.streamer_id,&data]).await.map_err(|e|failure(StatusCode::SERVICE_UNAVAILABLE,e))?;
+    // INSERT benötigt Pflichtwerte auch für bestehende Ziele. Beim Konflikt
+    // zählen für ausgelassene Felder jedoch die jetzt gesperrten aktuellen
+    // Werte, niemals die vorher gelesenen INSERT-Snapshotwerte aus EXCLUDED.
+    let sql = r#"
+        WITH incoming AS (
+            SELECT * FROM jsonb_to_recordset($2::jsonb) AS x(
+                platform text, rtmp_url text, stream_key_enc bytea,
+                enabled boolean, width integer, height integer,
+                fps integer, bitrate_kbps integer
+            )
+        )
+        INSERT INTO relay.destinations(
+            streamer_id, platform, rtmp_url, stream_key_enc,
+            enabled, width, height, fps, bitrate_kbps
+        )
+        SELECT $1, i.platform, COALESCE(i.rtmp_url,p.rtmp_url),
+            COALESCE(i.stream_key_enc,p.stream_key_enc),
+            COALESCE(i.enabled,p.enabled,true), COALESCE(i.width,p.width),
+            COALESCE(i.height,p.height), COALESCE(i.fps,p.fps),
+            COALESCE(i.bitrate_kbps,p.bitrate_kbps)
+        FROM incoming i LEFT JOIN relay.destinations p
+            ON p.streamer_id=$1 AND p.platform=i.platform
+        WHERE EXISTS(SELECT 1 FROM relay.users WHERE streamer_id=$1 AND enabled=true)
+        ON CONFLICT(streamer_id,platform) DO UPDATE SET
+            rtmp_url=COALESCE((SELECT rtmp_url FROM incoming WHERE platform=EXCLUDED.platform),relay.destinations.rtmp_url),
+            stream_key_enc=COALESCE((SELECT stream_key_enc FROM incoming WHERE platform=EXCLUDED.platform),relay.destinations.stream_key_enc),
+            enabled=COALESCE((SELECT enabled FROM incoming WHERE platform=EXCLUDED.platform),relay.destinations.enabled),
+            width=COALESCE((SELECT width FROM incoming WHERE platform=EXCLUDED.platform),relay.destinations.width),
+            height=COALESCE((SELECT height FROM incoming WHERE platform=EXCLUDED.platform),relay.destinations.height),
+            fps=COALESCE((SELECT fps FROM incoming WHERE platform=EXCLUDED.platform),relay.destinations.fps),
+            bitrate_kbps=COALESCE((SELECT bitrate_kbps FROM incoming WHERE platform=EXCLUDED.platform),relay.destinations.bitrate_kbps)
+        RETURNING platform
+    "#;
+    let stored = state
+        .store
+        .query(sql, &[&request.streamer_id, &data])
+        .await
+        .map_err(|error| failure(StatusCode::SERVICE_UNAVAILABLE, error))?;
     if stored.len() != request.destinations.len() {
         return Err(failure(
             StatusCode::FORBIDDEN,
@@ -197,9 +236,17 @@ async fn rotate_key(
         json!({"ingest_key":key.as_str(),"ingest_url":state.config.public_ingest_url}),
     ))
 }
-async fn health(State(state): State<Arc<ServiceState>>) -> Json<Value> {
-    Json(
-        json!({"ok":state.store.ready(),"service":"uplink", "active_sessions":state.registry.active_count()}),
+async fn health(State(state): State<Arc<ServiceState>>) -> (StatusCode, Json<Value>) {
+    let ready = state.store.ready().await;
+    (
+        if ready {
+            StatusCode::OK
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        },
+        Json(
+            json!({"ok":ready,"service":"uplink", "active_sessions":state.registry.active_count()}),
+        ),
     )
 }
 async fn status(
@@ -218,18 +265,30 @@ async fn me(
     Query(query): Query<TenantQuery>,
 ) -> ApiResult {
     authorize(&state, &headers, query.streamer_id)?;
-    let rows = state.store.query("SELECT enabled,ingest_key_enc,dock_token_enc,reconnect_wait_s FROM relay.users WHERE streamer_id=$1", &[&query.streamer_id]).await.map_err(|e| failure(StatusCode::SERVICE_UNAVAILABLE,e))?;
-    let Some(row) = rows.first() else {
-        return Ok(Json(
-            json!({"enabled":false,"waitlisted":false,"ingest_key":"","ingest_url":state.config.public_ingest_url,"srt_hint":"","session":null,"public_visible":false,"status_text":"Zugang ist noch nicht freigeschaltet.","reconnect_wait_s":0,"reconnect_wait_max_s":0,"dock_url_vorhanden":false,"dock_urls":null,"chat":[]}),
-        ));
-    };
-    let enabled: bool = row.try_get(0).map_err(|_| {
+    let rows = state.store.query("SELECT u.enabled,u.ingest_key_enc,u.dock_token_enc,u.reconnect_wait_s,EXISTS(SELECT 1 FROM relay.waitlist WHERE streamer_id=$1) AS waitlisted FROM (SELECT $1::bigint AS streamer_id) requested LEFT JOIN relay.users u USING(streamer_id)", &[&query.streamer_id]).await.map_err(|e| failure(StatusCode::SERVICE_UNAVAILABLE,e))?;
+    let row = rows.first().ok_or_else(|| {
         failure(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Nutzerdaten sind ungültig.",
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Nutzerstatus ist nicht verfügbar.",
         )
     })?;
+    let waitlisted: bool = row.try_get(4).map_err(|_| {
+        failure(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Wartelistenstatus ist ungültig.",
+        )
+    })?;
+    let enabled: Option<bool> = row.try_get(0).map_err(|_| {
+        failure(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Nutzerstatus ist ungültig.",
+        )
+    })?;
+    let Some(enabled) = enabled else {
+        return Ok(Json(
+            json!({"enabled":false,"waitlisted":waitlisted,"ingest_key":"","ingest_url":state.config.public_ingest_url,"srt_hint":"","session":null,"public_visible":false,"status_text":"Zugang ist noch nicht freigeschaltet.","reconnect_wait_s":0,"reconnect_wait_max_s":0,"dock_url_vorhanden":false,"dock_urls":null,"chat":[]}),
+        ));
+    };
     let encrypted: Option<Vec<u8>> = row.try_get(1).map_err(|_| {
         failure(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -293,7 +352,7 @@ async fn me(
         )
     })?;
     Ok(Json(
-        json!({"enabled":enabled,"waitlisted":false,"ingest_key":key,"ingest_url":state.config.public_ingest_url,"srt_hint":"","session":null,"public_visible":false,"status_text":null,"reconnect_wait_s":wait,"reconnect_wait_max_s":300,"dock_url_vorhanden":!dock_urls.is_null(),"dock_urls":dock_urls,"chat":[],"uplink_sessions":state.registry.status(query.streamer_id as u64)}),
+        json!({"enabled":enabled,"waitlisted":waitlisted,"ingest_key":key,"ingest_url":state.config.public_ingest_url,"srt_hint":"","session":null,"public_visible":false,"status_text":null,"reconnect_wait_s":wait,"reconnect_wait_max_s":300,"dock_url_vorhanden":!dock_urls.is_null(),"dock_urls":dock_urls,"chat":[],"uplink_sessions":state.registry.status(query.streamer_id as u64)}),
     ))
 }
 async fn destinations(
@@ -311,7 +370,9 @@ async fn destinations(
                 "Zieldaten sind ungültig.",
             )
         };
-        outputs.push(json!({"platform":row.try_get::<_,String>(0).map_err(|_|invalid())?,"rtmp_url":row.try_get::<_,String>(1).map_err(|_|invalid())?,"enabled":row.try_get::<_,bool>(2).map_err(|_|invalid())?,"requested":{"width":row.try_get::<_,Option<i32>>(3).map_err(|_|invalid())?,"height":row.try_get::<_,Option<i32>>(4).map_err(|_|invalid())?,"fps":row.try_get::<_,Option<i32>>(5).map_err(|_|invalid())?,"bitrate_kbps":row.try_get::<_,Option<i32>>(6).map_err(|_|invalid())?}}));
+        let endpoint = zeroize::Zeroizing::new(row.try_get::<_, String>(1).map_err(|_| invalid())?);
+        let blocked = crate::destinations::public_endpoint(&endpoint).is_err();
+        outputs.push(json!({"platform":row.try_get::<_,String>(0).map_err(|_|invalid())?,"rtmp_url":if blocked {""} else {endpoint.as_str()},"enabled":row.try_get::<_,bool>(2).map_err(|_|invalid())?,"blocked":blocked,"error":if blocked {Some("Gespeicherte Zieladresse ist gesperrt; Serveradresse und Zugang müssen getrennt eingerichtet werden.")} else {None},"requested":{"width":row.try_get::<_,Option<i32>>(3).map_err(|_|invalid())?,"height":row.try_get::<_,Option<i32>>(4).map_err(|_|invalid())?,"fps":row.try_get::<_,Option<i32>>(5).map_err(|_|invalid())?,"bitrate_kbps":row.try_get::<_,Option<i32>>(6).map_err(|_|invalid())?}}));
     }
     Ok(Json(json!({"destinations": outputs})))
 }

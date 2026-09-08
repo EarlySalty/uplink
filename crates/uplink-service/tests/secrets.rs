@@ -14,6 +14,65 @@ use std::{
 use uplink_service::{config::Config, secrets::fetch};
 
 #[tokio::test]
+async fn bootstrap_protects_all_injected_fds_before_the_first_read() {
+    let descriptors: Vec<_> = (0..3)
+        .map(|_| {
+            memfd::MemfdOptions::default()
+                .close_on_exec(false)
+                .create("synthetic-bootstrap-and-tls")
+                .unwrap()
+        })
+        .collect();
+    let mut config = Config::parse(include_str!("../../../config/uplink-beispiel.toml")).unwrap();
+    config.infisical.credential_fd = descriptors[0].as_raw_fd() as u32;
+    config.tls = uplink_service::config::TlsConfig::Fds {
+        certificate_fd: descriptors[1].as_raw_fd() as u32,
+        private_key_fd: descriptors[2].as_raw_fd() as u32,
+    };
+    uplink_service::secrets::protect_configured_fds(&config).unwrap();
+    for descriptor in descriptors {
+        let status = tokio::process::Command::new("/usr/bin/test")
+            .arg("-e")
+            .arg(format!("/proc/self/fd/{}", descriptor.as_raw_fd()))
+            .status()
+            .await
+            .unwrap();
+        assert!(!status.success());
+    }
+}
+
+#[tokio::test]
+async fn inherited_bootstrap_and_tls_fds_do_not_reach_child_processes() {
+    for material in [
+        b"synthetic-bootstrap".as_slice(),
+        b"synthetic-tls-certificate",
+        b"synthetic-tls-private-key",
+    ] {
+        let memory = memfd::MemfdOptions::default()
+            .close_on_exec(false)
+            .create("synthetic-private-material")
+            .unwrap();
+        memory.as_file().write_all(material).unwrap();
+        memory.as_file().seek(SeekFrom::Start(0)).unwrap();
+        let fd = memory.as_raw_fd();
+        let loaded = uplink_service::secrets::read_fd(fd as u32, 1024)
+            .await
+            .unwrap();
+        assert!(loaded.matches(material));
+        let status = tokio::process::Command::new("/usr/bin/test")
+            .arg("-e")
+            .arg(format!("/proc/self/fd/{fd}"))
+            .status()
+            .await
+            .unwrap();
+        assert!(
+            !status.success(),
+            "Autorisierter Original-FD wurde an Kindprozess vererbt"
+        );
+    }
+}
+
+#[tokio::test]
 async fn infisical_reads_only_supplied_memory_fd_and_never_follows_redirects() {
     let memory = memfd::MemfdOptions::default()
         .create("synthetic-infisical-test")

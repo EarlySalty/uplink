@@ -77,6 +77,10 @@ impl SessionProcessor for Coordinator {
                 .find(|p| p.name == platform)
                 .ok_or("Für ein Ziel fehlt die geprüfte Konfiguration.")?;
             let endpoint: String = row.try_get(1).map_err(|_| "Zieladresse fehlt.")?;
+            if crate::destinations::public_endpoint(&endpoint).is_err() {
+                reservation.block_output(platform,"Gespeicherte Zieladresse ist geschützt gesperrt; Serveradresse und Zugang müssen getrennt eingerichtet werden.");
+                continue;
+            }
             let ciphertext: Vec<u8> = row.try_get(2).map_err(|_| "Zielzugang fehlt.")?;
             let secret = self
                 .state
@@ -118,6 +122,9 @@ impl SessionProcessor for Coordinator {
                 },
                 layout: None,
             });
+        }
+        if outputs.is_empty() {
+            return Err("Kein sicheres Ausgabeziel ist verfügbar; siehe Zielstatus.");
         }
         let running = self
             .engine

@@ -147,7 +147,8 @@ pub async fn serve_with_ready<P: SessionProcessor>(
                             }
                         }
                     }
-                    let _ = connection.finish().await;
+                    let report = connection.finish().await;
+                    reservation.ingest_ended(&report.reason);
                     reservation.ended();
                 });
             }

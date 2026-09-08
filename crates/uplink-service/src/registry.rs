@@ -19,6 +19,8 @@ pub struct SessionStatus {
     pub received_events: u64,
     pub received_bytes: u64,
     pub error: Option<&'static str>,
+    pub ingest_end_reason: Option<String>,
+    pub blocked_outputs: std::collections::BTreeMap<String, &'static str>,
     pub outputs: Option<serde_json::Value>,
     pub source_observation: Option<serde_json::Value>,
 }
@@ -66,6 +68,8 @@ impl Registry {
                     received_events: 0,
                     received_bytes: 0,
                     error: None,
+                    ingest_end_reason: None,
+                    blocked_outputs: std::collections::BTreeMap::new(),
                     outputs: None,
                     source_observation: None,
                 },
@@ -106,6 +110,22 @@ impl Registry {
     }
 }
 impl Reservation {
+    pub fn ingest_ended(&self, reason: &uplink_ingest::EndReason) {
+        self.update(|state| {
+            // EndReason/MediaError enthalten ausschließlich geprüfte Enumwerte,
+            // keine fremden Protokolltexte, Adressen oder Zugangsdaten.
+            state.ingest_end_reason=Some(format!("{reason:?}"));
+            if !matches!(reason,uplink_ingest::EndReason::ExplicitStop) && state.error.is_none() {
+                state.error=Some("Eingang wurde unterbrochen oder abgewiesen; der Endgrund ist im Status verfügbar.");
+                state.state="Fehler";
+            }
+        });
+    }
+    pub fn block_output(&self, platform: String, message: &'static str) {
+        self.update(|state| {
+            state.blocked_outputs.insert(platform, message);
+        });
+    }
     pub fn fail(&self, message: &'static str) {
         self.update(|state| {
             state.error = Some(message);

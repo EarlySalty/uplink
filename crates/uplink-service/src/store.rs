@@ -1,19 +1,17 @@
 use crate::crypto::Secret;
 use sha2::{Digest, Sha256};
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    time::Duration,
-};
+use std::{sync::Arc, time::Duration};
 use tokio::sync::Semaphore;
-use tokio_postgres::{Client, NoTls, Row, types::ToSql};
+use tokio::time::{Instant, timeout_at};
+use tokio_postgres::{NoTls, Row, types::ToSql};
+
+tokio::task_local! { pub static REQUEST_DEADLINE: Instant; }
+pub const CLEANUP_GRACE: Duration = Duration::from_secs(2);
+const QUERY_LIMIT: Duration = Duration::from_secs(10);
 
 pub struct Store {
-    client: Client,
-    ready: Arc<AtomicBool>,
-    slots: Semaphore,
+    connection: tokio_postgres::Config,
+    slots: Arc<Semaphore>,
 }
 impl Store {
     pub async fn connect(database: &Secret, max_queries: u32) -> Result<Self, &'static str> {
@@ -37,39 +35,88 @@ impl Store {
         {
             return Err("Datenbank benötigt eine explizite lokale Verbindung.");
         }
-        let (client, driver) =
-            tokio::time::timeout(Duration::from_secs(10), connection.connect(NoTls))
-                .await
-                .map_err(|_| "Datenbankstart hat die Frist überschritten.")?
-                .map_err(|_| "Datenbank ist nicht verfügbar.")?;
-        let ready = Arc::new(AtomicBool::new(true));
-        let flag = ready.clone();
-        tokio::spawn(async move {
-            let _ = driver.await;
-            flag.store(false, Ordering::Release);
-        });
-        Ok(Self {
-            client,
-            ready,
-            slots: Semaphore::new(max_queries as usize),
-        })
+        if !(1..=64).contains(&max_queries) {
+            return Err("Datenbankgrenze ist ungültig.");
+        }
+        let store = Self {
+            connection,
+            slots: Arc::new(Semaphore::new(max_queries as usize)),
+        };
+        store.query("SELECT 1", &[]).await?;
+        Ok(store)
     }
-    pub fn ready(&self) -> bool {
-        self.ready.load(Ordering::Acquire)
+    pub async fn ready(&self) -> bool {
+        self.query("SELECT 1", &[]).await.is_ok()
     }
     pub async fn query(
         &self,
         sql: &str,
         params: &[&(dyn ToSql + Sync)],
     ) -> Result<Vec<Row>, &'static str> {
-        let _slot = self
+        let slot = self
             .slots
-            .try_acquire()
+            .clone()
+            .try_acquire_owned()
             .map_err(|_| "Datenbank ist ausgelastet.")?;
-        tokio::time::timeout(Duration::from_secs(10), self.client.query(sql, params))
+        let deadline = REQUEST_DEADLINE
+            .try_with(|value| *value)
+            .unwrap_or_else(|_| Instant::now() + QUERY_LIMIT)
+            .min(Instant::now() + QUERY_LIMIT);
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err("Datenbankanfrage hat die Frist überschritten.");
+        }
+        let millis = remaining.as_millis().max(1);
+        let mut config = self.connection.clone();
+        // Serverfristen gelten auch nach einem abgebrochenen HTTP-Future.
+        // Jede Operation hat eine eigene Transaktion und Verbindung; andere
+        // Requests können deshalb keinen fremden CancelRequest abbekommen.
+        config.options(format!("-c statement_timeout={millis} -c lock_timeout={millis} -c idle_in_transaction_session_timeout={millis}"));
+        let (mut client, driver) = timeout_at(deadline, config.connect(NoTls))
             .await
             .map_err(|_| "Datenbankanfrage hat die Frist überschritten.")?
-            .map_err(|_| "Datenbankanfrage fehlgeschlagen.")
+            .map_err(|_| "Datenbank ist nicht verfügbar.")?;
+        // Der Treiber hält das Permit auch beim Abbruch des Aufrufers: der
+        // Transaction-Drop sendet ROLLBACK, der Client-Drop schließt danach.
+        // Nach der begrenzten Nachlaufzeit schließt Drop die Verbindung hart.
+        let driver = tokio::spawn(async move {
+            let _slot = slot;
+            let _ = timeout_at(deadline + CLEANUP_GRACE, driver).await;
+        });
+        let result = async {
+            let cancel = client.cancel_token();
+            let transaction = timeout_at(deadline, client.transaction()).await
+                .map_err(|_| "Datenbankanfrage hat die Frist überschritten.")?
+                .map_err(|_| "Datenbanktransaktion konnte nicht starten.")?;
+            let rows = {
+                let query = transaction.query(sql, params);
+                tokio::pin!(query);
+                match timeout_at(deadline, &mut query).await {
+                    Ok(Ok(rows)) => rows,
+                    Ok(Err(_)) => {
+                        return Err("Datenbankanfrage fehlgeschlagen oder Frist überschritten.");
+                    }
+                    Err(_) => {
+                        // Nicht nur das Client-Future fallenlassen: laufendes
+                        // Statement abbrechen und sein Ergebnis begrenzt abholen.
+                        let cleanup = deadline + CLEANUP_GRACE;
+                        let _ = timeout_at(cleanup, cancel.cancel_query(NoTls)).await;
+                        let _ = timeout_at(cleanup, &mut query).await;
+                        return Err("Datenbankanfrage hat die Frist überschritten.");
+                    }
+                }
+            };
+            if Instant::now() >= deadline {
+                return Err("Datenbankanfrage hat die Frist überschritten.");
+            }
+            timeout_at(deadline, transaction.commit()).await
+                .map_err(|_| "Datenbankabschluss ist unklar; gespeicherten Stand vor Wiederholung prüfen.")?
+                .map_err(|_| "Datenbankabschluss ist unklar; gespeicherten Stand vor Wiederholung prüfen.")?;
+            Ok(rows)
+        }.await;
+        drop(client);
+        let _ = driver.await;
+        result
     }
     pub async fn authenticate_ingest(&self, key: &str) -> Result<u64, &'static str> {
         if key.len() != 36

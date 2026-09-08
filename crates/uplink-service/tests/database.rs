@@ -38,6 +38,18 @@ struct Database {
     directory: PathBuf,
 }
 impl Database {
+    async fn raw(&self) -> (tokio_postgres::Client, tokio::task::JoinHandle<()>) {
+        let mut config = tokio_postgres::Config::new();
+        config
+            .host_path(&self.directory)
+            .user("uplink_test")
+            .dbname("postgres");
+        let (client, driver) = config.connect(tokio_postgres::NoTls).await.unwrap();
+        let task = tokio::spawn(async move {
+            let _ = driver.await;
+        });
+        (client, task)
+    }
     async fn start() -> Self {
         let mut random = [0; 8];
         getrandom::fill(&mut random).unwrap();
@@ -102,6 +114,351 @@ impl Database {
         self.child.wait().await.unwrap();
         std::fs::remove_dir_all(&self.directory).unwrap();
     }
+}
+
+async fn fixture() -> (Database, Arc<ServiceState>) {
+    let database = Database::start().await;
+    let store = Arc::new(database.connect().await);
+    for sql in [
+        "CREATE SCHEMA relay",
+        "CREATE TABLE relay.users(streamer_id bigint PRIMARY KEY,enabled boolean NOT NULL,ingest_key_enc bytea,dock_token_enc bytea,ingest_key_hash text,reconnect_wait_s integer NOT NULL DEFAULT 0)",
+        "CREATE TABLE relay.destinations(streamer_id bigint REFERENCES relay.users(streamer_id),platform text NOT NULL,rtmp_url text NOT NULL,stream_key_enc bytea NOT NULL,enabled boolean NOT NULL,width integer,height integer,fps integer,bitrate_kbps integer,UNIQUE(streamer_id,platform))",
+        "CREATE TABLE relay.waitlist(streamer_id bigint PRIMARY KEY)",
+    ] {
+        store.query(sql, &[]).await.unwrap();
+    }
+    let encryption = Secret::new(vec![7; 32]);
+    let key = encryption
+        .seal(b"rsr_00000000000000000000000000000000", "ingest_key:11")
+        .unwrap();
+    use sha2::Digest;
+    let hash = hex::encode(sha2::Sha256::digest(
+        b"rsr_00000000000000000000000000000000",
+    ));
+    store.query("INSERT INTO relay.users(streamer_id,enabled,ingest_key_enc,ingest_key_hash) VALUES(11,true,$1,$2)", &[&key,&hash]).await.unwrap();
+    let mut config = Config::parse(include_str!("../../../config/uplink-beispiel.toml")).unwrap();
+    config.api_bind = "127.0.0.1:0".parse().unwrap();
+    config.ingest_bind = "127.0.0.1:0".parse().unwrap();
+    config.request_timeout_seconds = 1;
+    let state = Arc::new(ServiceState {
+        config,
+        store,
+        secrets: Arc::new(ServiceSecrets {
+            api: Secret::new(b"synthetic-api".to_vec()),
+            admin: Secret::new(vec![]),
+            database: Secret::new(vec![]),
+            bot_internal: Secret::new(vec![]),
+            encryption,
+            tls_material: None,
+        }),
+        registry: Registry::new(2, 1).unwrap(),
+    });
+    (database, state)
+}
+
+fn request(method: &str, uri: &str, body: impl Into<Body>) -> Request<Body> {
+    Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("X-Relay-Auth", "synthetic-api")
+        .header("content-type", "application/json")
+        .body(body.into())
+        .unwrap()
+}
+
+#[tokio::test]
+#[ignore = "Benötigt isolierte PostgreSQL-16-Testinstanz."]
+async fn concurrent_profile_patch_keeps_key_committed_while_waiting() {
+    let (database, state) = fixture().await;
+    let old = state
+        .secrets
+        .encryption
+        .seal(b"old-key", "destination:11:twitch")
+        .unwrap();
+    let new = state
+        .secrets
+        .encryption
+        .seal(b"new-key", "destination:11:twitch")
+        .unwrap();
+    state.store.query("INSERT INTO relay.destinations(streamer_id,platform,rtmp_url,stream_key_enc,enabled,width) VALUES(11,'twitch','rtmps://live.twitch.tv/app',$1,true,1920)", &[&old]).await.unwrap();
+    let (mut locker, driver) = database.raw().await;
+    let transaction = locker.transaction().await.unwrap();
+    transaction
+        .execute(
+            "UPDATE relay.destinations SET stream_key_enc=$1 WHERE streamer_id=11",
+            &[&new],
+        )
+        .await
+        .unwrap();
+    let app = router(state.clone());
+    let patch = tokio::spawn(app.oneshot(request(
+        "PUT",
+        "/v1/me/destinations",
+        r#"{"streamer_id":11,"destinations":[{"platform":"twitch","width":1280}]}"#,
+    )));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            transaction.batch_execute("SELECT pg_stat_clear_snapshot()").await.unwrap();
+            if transaction.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE wait_event_type='Lock' AND pid<>pg_backend_pid())", &[]).await.unwrap().get::<_,bool>(0) {break;}
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+    transaction.commit().await.unwrap();
+    assert_eq!(patch.await.unwrap().unwrap().status(), StatusCode::OK);
+    let row = state
+        .store
+        .query(
+            "SELECT stream_key_enc,width FROM relay.destinations WHERE streamer_id=11",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        state
+            .secrets
+            .encryption
+            .open(&row[0].get::<_, Vec<u8>>(0), "destination:11:twitch")
+            .unwrap()
+            .expose(),
+        b"new-key"
+    );
+    assert_eq!(row[0].get::<_, i32>(1), 1280);
+    drop(locker);
+    driver.await.unwrap();
+    database.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "Benötigt isolierte PostgreSQL-16-Testinstanz."]
+async fn timed_out_key_rotation_cannot_commit_after_lock_release() {
+    let (database, state) = fixture().await;
+    let before: String = state
+        .store
+        .query(
+            "SELECT ingest_key_hash FROM relay.users WHERE streamer_id=11",
+            &[],
+        )
+        .await
+        .unwrap()[0]
+        .get(0);
+    let (mut locker, driver) = database.raw().await;
+    let transaction = locker.transaction().await.unwrap();
+    transaction
+        .query(
+            "SELECT streamer_id FROM relay.users WHERE streamer_id=11 FOR UPDATE",
+            &[],
+        )
+        .await
+        .unwrap();
+    let response = router(state.clone())
+        .oneshot(request(
+            "POST",
+            "/v1/me/key/rotate?streamer_id=11",
+            Body::empty(),
+        ))
+        .await
+        .unwrap();
+    assert!(response.status().is_server_error());
+    transaction.commit().await.unwrap();
+    let rows = tokio::time::timeout(
+        Duration::from_millis(500),
+        state.store.query(
+            "SELECT ingest_key_hash FROM relay.users WHERE streamer_id=11",
+            &[],
+        ),
+    )
+    .await
+    .expect("Keine festhängende vorherige Query")
+    .unwrap();
+    assert_eq!(
+        rows[0].get::<_, String>(0),
+        before,
+        "Abgelaufene Rotation darf nicht später schreiben"
+    );
+    drop(locker);
+    driver.await.unwrap();
+    database.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "Benötigt isolierte PostgreSQL-16-Testinstanz."]
+async fn cancelled_http_request_cannot_commit_a_late_rotation() {
+    let (database, state) = fixture().await;
+    let before: String = state
+        .store
+        .query(
+            "SELECT ingest_key_hash FROM relay.users WHERE streamer_id=11",
+            &[],
+        )
+        .await
+        .unwrap()[0]
+        .get(0);
+    let (mut locker, driver) = database.raw().await;
+    let transaction = locker.transaction().await.unwrap();
+    transaction
+        .query(
+            "SELECT streamer_id FROM relay.users WHERE streamer_id=11 FOR UPDATE",
+            &[],
+        )
+        .await
+        .unwrap();
+    let pending = tokio::spawn(router(state.clone()).oneshot(request(
+        "POST",
+        "/v1/me/key/rotate?streamer_id=11",
+        Body::empty(),
+    )));
+    tokio::time::timeout(Duration::from_secs(2),async {
+        loop {
+            transaction.batch_execute("SELECT pg_stat_clear_snapshot()").await.unwrap();
+            if transaction.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE wait_event_type='Lock' AND pid<>pg_backend_pid())",&[]).await.unwrap().get::<_,bool>(0) {break;}
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+    pending.abort();
+    let _ = pending.await;
+    transaction.commit().await.unwrap();
+    // Warten bis die abgebrochene Transaktion abgewickelt wurde, nicht nur auf
+    // einen MVCC-Snapshot schauen, während eine spätere Mutation noch wartet.
+    tokio::time::timeout(Duration::from_secs(3),async {
+        loop {
+            let count:i64=locker.query_one("SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() AND pid<>pg_backend_pid()",&[]).await.unwrap().get(0);
+            if count==0 {break;}
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+    let after: String = state
+        .store
+        .query(
+            "SELECT ingest_key_hash FROM relay.users WHERE streamer_id=11",
+            &[],
+        )
+        .await
+        .unwrap()[0]
+        .get(0);
+    assert_eq!(after, before);
+    drop(locker);
+    driver.await.unwrap();
+    database.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "Benötigt isolierte PostgreSQL-16-Testinstanz."]
+async fn unsafe_legacy_endpoint_is_redacted_and_other_targets_remain_visible() {
+    let (database, state) = fixture().await;
+    let ciphertext = state
+        .secrets
+        .encryption
+        .seal(b"synthetic-key", "destination:11:twitch")
+        .unwrap();
+    state.store.query("INSERT INTO relay.destinations(streamer_id,platform,rtmp_url,stream_key_enc,enabled) VALUES(11,'twitch','rtmps://publish.invalid/app/synthetic-private-key',$1,true),(11,'youtube','rtmps://a.rtmps.youtube.com/live2',$1,true)",&[&ciphertext]).await.unwrap();
+    let response = router(state.clone())
+        .oneshot(request(
+            "GET",
+            "/v1/me/destinations?streamer_id=11",
+            Body::empty(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 16384).await.unwrap();
+    assert!(!String::from_utf8_lossy(&body).contains("synthetic-private-key"));
+    let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["destinations"].as_array().unwrap().len(), 2);
+    assert_eq!(value["destinations"][0]["platform"], "twitch");
+    assert_eq!(value["destinations"][0]["blocked"], true);
+    assert_eq!(value["destinations"][0]["rtmp_url"], "");
+    assert!(value["destinations"][0]["error"].is_string());
+    assert_eq!(value["destinations"][1]["blocked"], false);
+    database.stop().await;
+    let response = router(state)
+        .oneshot(request("GET", "/v1/health", Body::empty()))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = to_bytes(response.into_body(), 16384).await.unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap()["ok"],
+        false
+    );
+}
+
+#[tokio::test]
+#[ignore = "Benötigt isolierte PostgreSQL-16-Testinstanz."]
+async fn waitlist_write_is_visible_for_new_and_existing_users() {
+    let (database, state) = fixture().await;
+    let app = router(state);
+    for tenant in [11, 99] {
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                &format!("/v1/me/waitlist?streamer_id={tenant}"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = app
+            .clone()
+            .oneshot(request(
+                "GET",
+                &format!("/v1/me?streamer_id={tenant}"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        let value: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 16384).await.unwrap()).unwrap();
+        assert_eq!(value["waitlisted"], true);
+    }
+    database.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "Benötigt isolierte PostgreSQL-16-Testinstanz und lokales TLS."]
+async fn rejected_media_after_valid_prelude_stays_failed_in_session_status() {
+    let (database, state) = fixture().await;
+    let certificates = tls::test_tls();
+    let (ready, bound) = tokio::sync::oneshot::channel();
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(uplink_service::runtime::serve_with_ready(
+        state.clone(),
+        certificates.server,
+        Arc::new(Collector(Arc::new(std::sync::Mutex::new(Vec::new())))),
+        async {
+            let _ = stopped.await;
+        },
+        Some(ready),
+    ));
+    let (_, address) = bound.await.unwrap();
+    let socket = tokio::net::TcpStream::connect(address).await.unwrap();
+    let mut peer = tokio_rustls::TlsConnector::from(certificates.client)
+        .connect("localhost".try_into().unwrap(), socket)
+        .await
+        .unwrap();
+    rtmp::publish(&mut peer, "rsr_00000000000000000000000000000000").await;
+    rtmp::message(&mut peer, 8, 1, &[0xaf, 0, 0x12, 0x10]).await;
+    rtmp::message(&mut peer, 8, 1, &[0xaf]).await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if state.registry.active_count() == 0 && !state.registry.status(11).is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let status = state.registry.status(11);
+    assert!(
+        status[0].error.is_some(),
+        "Ein Prozessor-Ok darf MediaRejected nicht überschreiben"
+    );
+    let value = serde_json::to_value(&status[0]).unwrap();
+    assert_eq!(value["ingest_end_reason"], "MediaRejected(Truncated)");
+    stop.send(()).unwrap();
+    task.await.unwrap().unwrap();
+    database.stop().await;
 }
 
 async fn executable_smoke(database: &Database) {
