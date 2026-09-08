@@ -4,7 +4,7 @@ Stand: 8. September 2026. Der [Produktvertrag v0.3](produktvertrag-v0.3.md) besc
 
 ## Tatsächlich vorhandene Grundlage
 
-Der Repo-/Rust-Grundlagenbaustein und der isolierte Scuffle-Nachweis sind über [PR #1](https://github.com/EarlySalty/uplink/pull/1) und [PR #2](https://github.com/EarlySalty/uplink/pull/2) gemergt. Der geprüfte funktionale Main-Stand nach PR #2 ist `001724fdacded263f16681ba0aec8e5f348de601`; der Dateibaum entspricht dem geprüften Stand `32653ca0a74d3c6a886d0f1a9b700268953153d2`. Die [Main-CI](https://github.com/EarlySalty/uplink/actions/runs/34221066802) ist erfolgreich. Beide Featurebranches sind lokal und auf GitHub gelöscht; nur `main` und ein Hauptworktree bleiben. Beide Bausteine sind abgeschlossen, der vollständige Live-Neubau bleibt offen.
+Der Repo-/Rust-Grundlagenbaustein und der isolierte Scuffle-Nachweis sind über [PR #1](https://github.com/EarlySalty/uplink/pull/1) und [PR #2](https://github.com/EarlySalty/uplink/pull/2) gemergt. Der geprüfte funktionale Main-Stand nach PR #2 ist `001724fdacded263f16681ba0aec8e5f348de601`; der Dateibaum entspricht dem geprüften Stand `32653ca0a74d3c6a886d0f1a9b700268953153d2`. Die [Main-CI](https://github.com/EarlySalty/uplink/actions/runs/34221066802) ist erfolgreich. Die Branches aus PR #1/#2 wurden lokal und auf GitHub gelöscht; anschließend begann der RTMPS-Baustein auf `feat/rtmps-ingest`. Beide Bausteine sind abgeschlossen, der vollständige Live-Neubau bleibt offen.
 
 `uplink-core` enthält lokale Fachregeln für variable Profile mit rational normalisierten Bildraten, getrennte Audiozuordnung, Mandanten-/Session-/Generationstrennung und deklarative Encode-Gruppen. Workerfähigkeiten werden für Decoder, Encoder und Kompositionslayout getrennt geprüft. Bekannte Audioverbote und fehlende Layoutrevisionen lehnen ein Ziel auch dann ab, wenn der Eingang noch aussteht. `shared_video_decode_count` zählt ausschließlich benötigte Video-Decoder; Audioverarbeitung ist darin nicht enthalten. Das Ergebnis ist ein Szenarioplan, kein ausführbarer Mediengraph; konkrete Codec-/Transform-Kompatibilität bleibt nachzuweisen.
 
@@ -14,7 +14,7 @@ Der [Offline-Mediennachweis](mediennachweis.md) belegt Dateimuxing/Remuxing und 
 
 Die [isolierte Scuffle-Probe](scuffle-nachweis.md) ergänzt 13 Debug-/13 Release-Tests mit kleinen künstlichen Fixtures und statischen FFmpeg-8-Paketmanifesten. Sie verändert das Root-Cargo nicht. Ein 35-Byte-AVCC-Header zeigte einen Abhängigkeitsfehler; deshalb beschränkt der Testadapter H.264 vor Scuffle auf den geprüften Baseline-SequenceHeader. Diese lokale Absicherung ist keine Produktionsfreigabe des Parsers.
 
-Es gibt noch keinen belegten produktiven Ingest, Encoderbetrieb oder vollständigen Plattformausgang. Lokale Prüfergebnisse stehen in der Aufgabenakte; sie schließen keine Live-Abnahme.
+`uplink-ingest` ist ein [lokal gemessener RTMPS-Eingang](rtmps-nachweis.md) mit Rustls, begrenztem Scuffle-RTMP, injizierter Autorisierung und serverseitig frischen Verbindungsgenerationen. AV1/H.264 mit zwei AAC-Spuren erhält pro Test 240 komprimierte Pakete und drei Header mit unveränderten Nutzdaten und Zeitstempeln. Metadaten zählen zum Trackbudget und übernehmen keine fremde Codec-Revision. Öffentliche Brokeranbindung, Standard-OBS, Encoderbetrieb und vollständige Plattformausgänge sind weiter offen.
 
 ## Technische Grenzen der Zielarchitektur
 
@@ -44,7 +44,7 @@ Konfiguration kommt aus normalen Dateien, Secrets aus Infisical bzw. dem vorhand
 ## Reihenfolge der weiteren Umsetzung
 
 1. **Medienkombination beweisen:** Kandidaten mit versionierten Vektoren auf E-RTMP, AV1/H.264/freigegebenes HEVC, Mehrspur-Audio, Zeitstempel und ausgehende Verpackung prüfen. Keine Enginewahl allein aus Bibliotheksbeschreibung. Parallel echte Plattform-/Kontorechte und bestehenden Broker prüfen.
-2. **Eingang bauen:** autorisiertes RTMPS, Standard-OBS, getrennte Audiofeeds, Track-/Generationsverwaltung, Fehlereingaben und Reconnect nachweisen. Eine konkrete OBS-Lücke offenlegen statt Plugin-Pflicht oder Verlust der VOD-Spur zu erfinden.
+2. **Eingang vervollständigen:** den lokal nachgewiesenen RTMPS-Eingang mit vorhandenem Broker und Standard-OBS verbinden; freigegebene Profile, reale Live-/VOD-Zuordnung und lange Sessions nachweisen. Eine konkrete OBS-Lücke offenlegen statt Plugin-Pflicht oder Verlust der VOD-Spur zu erfinden.
 3. **Medien und vier Ausgänge bauen:** gemeinsame Encodes und kompatibles Passthrough; Twitch Enhanced Broadcasting/HEVC-1440p/Dual Format/Audio, YouTube-Broadcast-Lifecycle und gegebenenfalls natives Dual Stream, belegte Kick-Profile sowie tragfähige TikTok-Integration. Ein Socket ist kein öffentlicher Livestream.
 4. **Bedienung und Störungen integrieren:** erhaltene Docks/Overlays und Konten neu anbinden, Hochkant/Layouts, Chat/Aktivitäten, gewünschte gegen aktive Profile, Puffer/Delay/Wartebild/Stop zusammen prüfen. F4–F6 begrenzen nur die davon abhängige Arbeit.
 5. **VOD vervollständigen:** F1–F3 entscheiden, Medienobjekt an reale Quelle anbinden, autorisierten YouTube-Upload mit Resume/Abschlussabgleich/Verarbeitung/Aufräumen bauen. Verbindung autorisiert keine automatische Veröffentlichung.
