@@ -763,6 +763,59 @@ async fn quota_bei_finish_ist_wiederaufnehmbar() {
 }
 
 #[tokio::test]
+async fn finish_offener_broadcast_insert_gleicht_ab_ohne_anlegen() {
+    let (server, adapter, store) = harness().await;
+    fabriziere(
+        &store,
+        1,
+        false,
+        "vorbereitung",
+        Some(Schritt::BroadcastInsert),
+        Some("S1"),
+        None,
+    )
+    .await;
+    get(
+        &server,
+        "/liveBroadcasts",
+        &[("mine", "true"), ("broadcastStatus", "upcoming")],
+        slist(broadcast_item("B1", "ready", Some("S1"))),
+    )
+    .await;
+    get(
+        &server,
+        "/liveBroadcasts",
+        &[("mine", "true"), ("broadcastStatus", "active")],
+        json!({ "items": [] }),
+    )
+    .await;
+    get(
+        &server,
+        "/liveBroadcasts",
+        &[("id", "B1")],
+        slist(broadcast_item("B1", "ready", Some("S1"))),
+    )
+    .await;
+
+    let z = adapter
+        .finish(&ident(1), Endegrund::AdminStop)
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            z,
+            Zustand::Beendet {
+                youtube_bestaetigt: false,
+                ..
+            }
+        ),
+        "war {z:?}"
+    );
+    assert_eq!(anzahl(&server, "POST", "/liveBroadcasts").await, 0);
+    assert!(store.aktiven_run_laden(77).await.unwrap().is_none());
+}
+
+#[tokio::test]
 async fn medien_unterbrochen_ohne_request_haelt_zustand() {
     let (server, adapter, store) = harness().await;
     fabriziere(&store, 1, false, "live", None, Some("S1"), Some("B1")).await;

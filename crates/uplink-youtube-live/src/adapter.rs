@@ -1171,17 +1171,88 @@ impl YouTubeLive {
             return Ok(z);
         }
         self.wache(id, &run, true).await?;
-        if run.schritt.is_some() {
-            let z = self.vortreiben(id, run).await?;
-            match z {
-                Zustand::Vorbereitet { .. } | Zustand::Sendet { .. } | Zustand::Live { .. } => {
-                    let Some(neu) = self.store.aktiven_run_laden(id.streamer_id).await? else {
-                        return Ok(Zustand::Inaktiv);
-                    };
-                    run = neu;
+        if let Some(schritt) = run.schritt {
+            match schritt {
+                Schritt::TransitionLive | Schritt::TransitionComplete => {
+                    return self.transition_abgleich(id, &run, schritt).await;
                 }
-                andere => return Ok(andere),
+                Schritt::StreamInsert => {
+                    self.store
+                        .run_schliessen(
+                            run.run_id,
+                            run.connection_generation,
+                            Some(grund.as_str()),
+                            Some(false),
+                            None,
+                        )
+                        .await?;
+                    return Ok(Zustand::Inaktiv);
+                }
+                Schritt::BroadcastInsert => {
+                    let seit = run.schritt_seit.unwrap_or_else(Utc::now);
+                    let mut kandidaten = self
+                        .holen(id, refs_opt(&run), |t| {
+                            self.api.broadcasts_eigene(t, "upcoming")
+                        })
+                        .await?;
+                    let aktive = self
+                        .holen(id, refs_opt(&run), |t| {
+                            self.api.broadcasts_eigene(t, "active")
+                        })
+                        .await?;
+                    kandidaten.extend(aktive);
+                    let treffer: Vec<_> = kandidaten
+                        .into_iter()
+                        .filter(|b| b.titel.as_deref() == Some(run.titel.as_str()))
+                        .filter(|b| im_fenster(b.published_at, seit))
+                        .filter(|b| match (&b.bound_stream_id, &run.stream_id) {
+                            (None, _) => true,
+                            (Some(bound), Some(sid)) => bound == sid,
+                            (Some(_), None) => false,
+                        })
+                        .collect();
+                    match treffer.len() {
+                        1 => {
+                            let bid = treffer[0].id.clone();
+                            self.store
+                                .schritt_abschliessen(
+                                    run.run_id,
+                                    run.connection_generation,
+                                    None,
+                                    Some(&bid),
+                                )
+                                .await?;
+                        }
+                        0 => {
+                            self.store
+                                .run_schliessen(
+                                    run.run_id,
+                                    run.connection_generation,
+                                    Some(grund.as_str()),
+                                    Some(false),
+                                    None,
+                                )
+                                .await?;
+                            return Ok(Zustand::Inaktiv);
+                        }
+                        _ => {
+                            return Err(Abbruch::Zustand(Zustand::Blockiert {
+                                grund: Blockgrund::UnklareZuordnung,
+                                refs: refs_opt(&run),
+                            }));
+                        }
+                    }
+                }
+                Schritt::Bind => {
+                    self.store
+                        .schritt_loeschen(run.run_id, run.connection_generation)
+                        .await?;
+                }
             }
+            let Some(neu) = self.store.aktiven_run_laden(id.streamer_id).await? else {
+                return Ok(Zustand::Inaktiv);
+            };
+            run = neu;
         }
         let (Some(bid), Some(sid)) = (run.broadcast_id.clone(), run.stream_id.clone()) else {
             self.store
