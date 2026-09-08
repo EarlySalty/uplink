@@ -60,6 +60,35 @@ Check, Clippy und Formatierung waren ebenfalls grün. Die übrigen unveränderte
 Vendorpfade wurden dafür nicht erneut breit geprüft. Keine weiteren offenen
 Befunde aus diesem Nachreview.
 
+## Nachreview der Kontrollnachrichten auf `b6c18f5`
+
+Der folgende Gate-Befund betraf die Fehlerquelle: Ein vollständig empfangener,
+aber verkürzter SetChunkSize- oder WindowAcknowledgementSize-Body erzeugte beim
+Lesen aus einem Cursor `UnexpectedEof`. Die Sitzungslogik behandelte dies wie
+einen geschlossenen Transport, obwohl der Peer noch offen war.
+
+Der enge Ursachenfix verlangt in beiden Kontrollparsern genau vier Bodybytes.
+Abweichende Längen ergeben `InvalidData` mit konstantem Fehlertext.
+`ServerSession::run()` gibt diesen Fehler weiter; der vorhandene Ingestpfad
+liefert dadurch `ProtocolRejected`. Die Einordnung echten Transport-EOF und
+von Zeitüberschreitungen wird nicht verändert.
+
+Unabhängig bestanden Check, Clippy und Formatierung sowie jeweils in Debug
+und Release drei Kontrollparser- und 16 Sessiontests. Darunter sind die beiden
+laut Fixer zuvor roten Fälle mit offen gehaltenem Duplex-Peer, falsche
+Bodylängen 0–3 und 5–8 sowie gültige Kontrollnachrichten mit anschließendem
+echtem EOF. Auch der vorhandene Ingest-Transporttest für TLS-Startfrist und
+Handshake-EOF bestand erneut in beiden Profilen.
+
+Zusätzlich führte der Reviewer beide fehlerhaften Kontrolltypen über die
+öffentliche Ingest-API und echte Loopback-TLS-Verbindungen: Nach autorisiertem
+Publish führte ein vollständig gerahmter Drei-Byte-Body bei weiterhin offenem
+Client jeweils zu `EndReason::ProtocolRejected`. Dieser unabhängige gekoppelte
+Test bestand in Debug und Release. Die temporäre Testumgebung wurde danach
+aufgeräumt; die dauerhaften Vendorregressionen liegen in
+[uplink_tests.rs](../third_party/scuffle-rtmp/src/session/server/uplink_tests.rs).
+Keine weiteren Befunde aus diesem Nachreview.
+
 ## Gemeinsam geprüfte Grenzen
 
 - RTMP-Nachrichtenlänge, AMF-Nachrichtenlänge, Chunkstreamzahl und die Summe
@@ -114,6 +143,11 @@ verwendeten die Rustup-Toolchain und höchstens zwei Cargo-Baujobs je Aufruf.
 | Uplink-Ingest inklusive TLS-Transport | 24 Tests | 24 Tests |
 | FFmpeg-Probe, portable Referenztests | 3 Tests | 3 Tests |
 
+Die RTMP-Zeile nennt den ursprünglichen unabhängigen Vollauf. Nach der
+Kontrollnachrichtenkorrektur kamen vier neue Tests hinzu; deren unabhängiger
+gezielter Nachlauf ist oben separat ausgewiesen. Der Fixer meldete die gesamte
+RTMP-Suite danach mit 82 Tests plus Doctest in beiden Profilen grün.
+
 Zwei geerbte RTMP-Medientests benötigen fehlende Upstream-Testdateien und sind
 ausdrücklich ignoriert. Sie zählen nicht als bestanden. Zusätzlich wurden die
 zwei unabhängig geschriebenen Metadata-Regressionsfälle vor und nach dem Fix
@@ -153,3 +187,5 @@ SHA-256 des unabhängig ausgeführten und nachgeprüften Stands:
 | `crates/uplink-ingest/src/media.rs` | `f6efa48adb63e4359f32ae82f5d8c8279d268d4637803945c09245f6cc956ac0` |
 | `crates/uplink-ingest/examples/rtmps_probe.rs` | `00c05835548d818244868f1d43cca84bf3c0fd8fc7a277395267fa0bfd995740` |
 | `crates/uplink-ingest/tests/support/tls.rs` | `3d93965beeec5befa0d84433ad8f96dab8ebfbc6ddc351d8b1f06f9b0963f2f3` |
+| `third_party/scuffle-rtmp/src/protocol_control_messages/reader.rs` | `eb124ed28c70465da00664063e2c23feaf26df9022ee1c94b47df880c0a9ad55` |
+| `third_party/scuffle-rtmp/src/session/server/uplink_tests.rs` | `06c384882fca9afdd34c9785a8fec63f34944eea73b74c66d7a3f2e3f5b5e9f7` |

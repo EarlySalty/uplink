@@ -60,6 +60,13 @@ bleiben eigene Grenzen. Schreiben umfasst ausdrücklich `write_all` und
 nicht länger als gewöhnliches Peer-Ende verschluckt. Nach einer begrenzten Zahl
 vollständiger Nachrichten gibt die Verarbeitung an Tokio zurück.
 
+Die Parser für SetChunkSize und WindowAcknowledgementSize erhalten vollständige
+RTMP-Nachrichtenkörper und verlangen genau vier Byte. Fehlende oder zusätzliche
+Bytes sind `InvalidData`. Sie ergeben kein Parser-`UnexpectedEof`, das sonst
+als Transportende behandelt würde. `ServerSession::run()` gibt diesen
+Protokollfehler weiter; die bestehende Ingest-Zuordnung ergibt `ProtocolRejected`.
+Tatsächliches Transport-EOF und Leerlauf-Zeitüberschreitung bleiben unverändert.
+
 Read- und Write-Puffer haben konfigurierbare Bytebudgets vor Wachstum.
 ACK-Fenster null wird abgewiesen; Empfangsbestätigungen melden die tatsächlich
 empfangene Bytezahl mit separatem Zähler seit dem letzten ACK und definiertem
@@ -100,12 +107,26 @@ und Medien vor Publish. Type 2 panikte nur im Debugprofil; Release-Wrapping
 war kein hinreichender Protokollnachweis. Ein zusätzlich zuerst roter ACK-Test
 zeigte die veraltete Bytezahl vor dem Read statt der aktuellen Empfangssumme.
 
-Nach dem Patch: RTMP **78 Bibliothekstests plus ein Doctest** sowohl Debug als
+Nach dem Patch: RTMP **82 Bibliothekstests plus ein Doctest** sowohl Debug als
 auch Release bestanden, Exit 0. Darunter neue Tests für präallokative Header-,
 CSID-, Partialanzahl-/Summengrenzen, Freigabe von Reservierungen, Type-3-Delta,
 ChunkSize-Ablehnung, absolute Ein-Byte-Slowloris-Frist, Idle/EOF-Unterschied,
 C2-Länge, Flush-Frist, Ausgabebudget, AMF-Bombe vor Handler und Fehlerredaktion.
 Clippy über alle Targets mit `-D warnings` sowie fmt bestanden.
+
+Nachkorrektur gegen Stand `b6c18f55fd30b6fc0669e444de5eceeae2f99751`:
+`uplink_short_set_chunk_size_is_protocol_error_while_transport_open` und
+`uplink_short_ack_window_is_protocol_error_while_transport_open` senden nach
+vollständigem RTMP-Handshake einen vollständig gerahmten, drei Byte langen
+Body und halten den Duplex-Transport offen, bis `ServerSession::run()` endet.
+Vor dem Fix lieferten beide `Ok(true)` statt eines Fehlers: Debug und Release
+je zwei Fehler, Exit 101. Nach dem Fix ergeben beide `InvalidData`,
+`is_client_closed()` ist falsch. Ein weiterer Test prüft für beide Parser
+die ungültigen Längen 0–3 und 5–8; ein vollständiger Sitzungstest bestätigt
+gültige vier Byte mit anschließendem echtem Transport-EOF als normales Ende.
+Es werden weder Fehlertexte verglichen noch künstliche Timeouts als
+Erkennung verwendet. Alle vier zusätzlichen Tests sowie die vorhandenen
+EOF-/Timeout-Regressionen sind in der oben genannten grünen Anzahl enthalten.
 
 AMF: zunächst neun neue Regressionen rot; danach **21 Grenztests plus
 40 Bibliothekstests und ein Doctest** mit Serde in Debug/Release bestanden.

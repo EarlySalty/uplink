@@ -90,6 +90,10 @@ als `ProtocolTimeout` ausgewiesen. `PeerClosed`, `ExplicitStop`, `TlsRejected`,
 Nach außen gelangen feste Fehlercodes, keine App-/Publishnamen, AMF-Inhalte oder
 ungefilterten Bibliotheksfehler.
 
+SetChunkSize und WindowAcknowledgementSize müssen genau vier Bodybytes enthalten.
+Abweichende Längen sind `InvalidData` und führen zu `ProtocolRejected`;
+ein Parserende wird dadurch nicht mehr als geschlossener Transport gemeldet.
+
 ## Portable Tests
 
 Der gezielte Lauf bestand mit 24 Tests: sieben Wirekopf-Prüfungen, eine deterministische
@@ -132,6 +136,12 @@ geerbte RTMP-Upstreamtests benötigen nicht mitgelieferte Monorepo-Testressource
 und bleiben ausdrücklich ignoriert; sie zählen nicht als bestanden. Sie sind
 kein Ersatz für den separaten echten FFmpeg-RTMPS-Nachweis.
 
+Der anschließende Kontrollnachrichten-Nachfix ergänzt vier Vendor-Regressionen:
+82 RTMP-Tests plus ein Doctest bestanden jeweils in Debug und Release.
+Die zwei ignorierten Upstreamtests sind darin nicht als bestanden gezählt.
+Die historischen Testzahlen in den nativen Reviewberichten bleiben ihrem
+jeweiligen Prüfstand zugeordnet.
+
 ## Externer FFmpeg-Nachweis
 
 Das separat ausführbare Beispiel `rtmps_probe` wird gegen das ausdrücklich
@@ -141,7 +151,7 @@ Pflichtprüfung in `cargo test`. Ein fehlender Binaryparameter oder FFmpeg 6
 beendet den Aufruf mit Fehler; diese Fälle werden nicht als bestandene
 Medienprüfung ausgegeben.
 
-Der abschließende Lauf nach den Metadata- und Gate-Korrekturen mit
+Der abschließende Lauf nach den Metadata-, Gate- und Kontrollnachrichten-Korrekturen mit
 `n8.1.2-50-g1a748fe2cd-20260831` bestätigte für
 beide Codecs jeweils 240 komprimierte Medienpakete und drei SequenceHeader
 auf drei Spuren. Sämtliche Nutzbytes und Header stimmen nach Größe und SHA-256
@@ -158,8 +168,8 @@ Objekt; daraus folgt kein geprüfter Farbraum oder HDR-Nachweis.
 
 | Eingang | Video / Audio 0 / Audio 1 | Header / Metadaten / SequenceEnd | Events / Bodybytes | Beobachtetes Eventbudget-Maximum |
 | --- | --- | --- | --- | --- |
-| AV1 + zwei AAC | 50 / 95 / 95 Pakete | 3 / 2 / 0 | 245 / 59.665 Bytes | 9.128 Bytes |
-| H.264 + zwei AAC | 50 / 95 / 95 Pakete | 3 / 1 / 1 | 245 / 141.520 Bytes | 14.959 Bytes |
+| AV1 + zwei AAC | 50 / 95 / 95 Pakete | 3 / 2 / 0 | 245 / 59.665 Bytes | 8.975 Bytes |
+| H.264 + zwei AAC | 50 / 95 / 95 Pakete | 3 / 1 / 1 | 245 / 141.520 Bytes | 7.269 Bytes |
 
 Die Tabelle zeigt den abschließenden Release-Nachlauf. Die beobachteten
 Spitzenwerte hängen vom Scheduling ab; sie sind kein

@@ -282,3 +282,72 @@ async fn uplink_ack_reports_received_bytes_after_u32_wrap() {
         .unwrap();
     assert_eq!(ack.payload.as_ref(), 0_u32.to_be_bytes());
 }
+
+async fn uplink_session_after_control_message(
+    message_type: MessageType,
+    body: &'static [u8],
+    close_transport: bool,
+) -> Result<bool, crate::error::RtmpError> {
+    let (server, mut client) = tokio::io::duplex(8192);
+    let session = tokio::spawn(ServerSession::new(server, Handler).run());
+    let mut c0c1 = [0; 1537];
+    c0c1[0] = 3;
+    client.write_all(&c0c1).await.unwrap();
+    let mut response = [0; 3073];
+    client.read_exact(&mut response).await.unwrap();
+    client.write_all(&response[1..1537]).await.unwrap();
+    let mut frame = Vec::new();
+    ChunkWriter::default()
+        .write_chunk(
+            &mut frame,
+            crate::chunk::Chunk::new(2, 0, message_type, 0, bytes::Bytes::from_static(body)),
+        )
+        .unwrap();
+    client.write_all(&frame).await.unwrap();
+    if close_transport {
+        client.shutdown().await.unwrap();
+    }
+    // In malformed-body cases the peer remains open until run() has returned.
+    // An end here cannot have been caused by transport EOF.
+    let result = session.await.unwrap();
+    drop(client);
+    result
+}
+
+#[tokio::test]
+async fn uplink_short_set_chunk_size_is_protocol_error_while_transport_open() {
+    let error = uplink_session_after_control_message(MessageType::SetChunkSize, &[0, 0, 0], false)
+        .await
+        .expect_err("a complete malformed message is not peer EOF");
+    assert!(
+        matches!(&error, crate::error::RtmpError::Io(io) if io.kind() == io::ErrorKind::InvalidData)
+    );
+    assert!(!error.is_client_closed());
+}
+
+#[tokio::test]
+async fn uplink_short_ack_window_is_protocol_error_while_transport_open() {
+    let error = uplink_session_after_control_message(
+        MessageType::WindowAcknowledgementSize,
+        &[0, 0, 0],
+        false,
+    )
+    .await
+    .expect_err("a complete malformed message is not peer EOF");
+    assert!(
+        matches!(&error, crate::error::RtmpError::Io(io) if io.kind() == io::ErrorKind::InvalidData)
+    );
+    assert!(!error.is_client_closed());
+}
+
+#[tokio::test]
+async fn uplink_valid_control_then_transport_eof_remains_peer_close() {
+    for message_type in [
+        MessageType::SetChunkSize,
+        MessageType::WindowAcknowledgementSize,
+    ] {
+        let result =
+            uplink_session_after_control_message(message_type, &[0, 0, 0, 128], true).await;
+        assert!(matches!(result, Ok(true)));
+    }
+}

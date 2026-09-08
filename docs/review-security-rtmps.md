@@ -6,6 +6,9 @@ des korrigierten Metadata-Tracklimits und der Codec-/Headerzuordnung.
 Ergänzend wurde der enge Gate-Nachfix gegen
 `baf240cf53b6460d20cb276e96c20dadd45a6f4a` unabhängig geprüft: Abbruch von
 `finish()` und Messung des beobachteten Eventbudgets.
+Ein weiterer enger Nachreview gegen
+`b6c18f55fd30b6fc0669e444de5eceeae2f99751` prüft die Trennung beschädigter
+Kontrollnachrichten von einem tatsächlichen Transport-EOF.
 
 **Ergebnis:** Kein weiterer konkreter Sicherheitsblocker im geprüften
 Loopback-Baustein. Der Stand kann für diesen Entwicklungsumfang übernommen
@@ -24,7 +27,7 @@ nicht untersucht oder geändert.
 SHA-256 über die sortierten Pfade und SHA-256-Werte aller Rust-Dateien und
 Manifeste/Lockfiles dieses Bereichs einschließlich Root-Cargo/CI:
 
-`07da3a8f31dbf74449cc931a33b35d126c80ed63abce11763371adafcc01d1e5`
+`40d22f5d4f51c06b467354f498c6635bda6c90dcd369b718f457d2eeacb6235b`
 
 Reproduktion aus der Repositorywurzel; Buildverzeichnisse bleiben ausgeschlossen:
 
@@ -152,6 +155,42 @@ einzeln ausgeführt und bestanden:
 über den aktualisierten Gesamtprüfbereich neu berechnet. Ergebnis des engen
 Nachreviews: beide Befunde geschlossen, keine zusätzlichen Sicherheitsblocker
 im freigegebenen lokalen Entwicklungsumfang.
+
+## Gezielter Nachreview der EOF-Klassifikation
+
+Der Produktionsdiff gegen `b6c18f5` beschränkt sich auf
+`third_party/scuffle-rtmp/src/protocol_control_messages/reader.rs`; zusätzlich
+wurden die Serverregressionen in `session/server/uplink_tests.rs` erweitert.
+Manifeste, Abhängigkeiten, AMF-Parser und Secretpfade blieben unverändert und
+wurden deshalb nicht erneut auditiert oder gescannt.
+
+Beide Kontrollnachrichten-Reader erhalten bereits vollständig gerahmte Bodies.
+Sie verlangen nun vor dem Auslesen exakt vier Bytes durch die Konvertierung
+in `[u8; 4]` mit `try_into` und wandeln eine abweichende Länge in `InvalidData` um.
+Der Fehlertext ist konstant und enthält weder die Eingabebytes noch Zugänge.
+Es gibt keine unkontrollierte Allokation und keinen Stringvergleich zur
+Fehlerklassifikation. Gültige Werte werden weiterhin Big-Endian gelesen.
+
+Damit bleiben Parserfehler über `RtmpError::Io(InvalidData)` von
+`is_client_closed()` ausgeschlossen und erreichen im Ingest den Zustand
+`ProtocolRejected`. Die Behandlung eines echten Transport-EOF wurde nicht
+geändert. Neben verkürzten Bodies werden auch überlange Bodies abgelehnt.
+
+Vier gezielte Regressionstests wurden eigenständig mit Rust 1.97.1,
+`--locked --target-dir target -j2` ausgeführt und bestanden:
+
+- `control_bodies_require_exactly_four_bytes`: beide Reader lehnen die Längen
+  0–3 und 5–8 mit `InvalidData` ab.
+- `uplink_short_set_chunk_size_is_protocol_error_while_transport_open` und
+  `uplink_short_ack_window_is_protocol_error_while_transport_open`: die volle
+  Server-Session liefert bei offenem Peer einen Protokollfehler.
+- `uplink_valid_control_then_transport_eof_remains_peer_close`: gültige
+  Vier-Byte-Nachrichten behalten bei anschließendem tatsächlichem EOF den
+  bisherigen normalen Verbindungsabschluss.
+
+`git diff --check` bestand; der Gesamtfingerprint oben wurde aktualisiert.
+Ergebnis: Befund geschlossen, keine zusätzlichen Sicherheitsblocker für den
+unverändert lokalen Entwicklungsumfang.
 
 ## Aussagegrenzen
 

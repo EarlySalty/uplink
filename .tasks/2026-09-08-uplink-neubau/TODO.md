@@ -37,6 +37,7 @@ Stand: 8. September 2026, nach Merge von PR #1 und PR #2 auf `main` (`001724fdac
 - [x] Metadata-Tracklimit und fremde Codec-Revision mit roten Regressionstests beheben und unabhängig nachprüfen; [Nachweis](../../docs/rtmps-nachweis.md).
 - [x] Separaten [Sicherheitsreview](../../docs/review-security-rtmps.md) mit 59 gezielten Tests, drei Audits und Gitleaks abschließen.
 - [x] Eigene Gate-Prüfung auf `baf240c` ausführen; beide Hinweise zu `finish()`-Abbruch und Eventbudget-Messung mit zuerst roten Regressionen beheben. Finaler Gate nach Nachreview bleibt offen.
+- [x] Weiteren Hinweis aus Gate-ALLOW auf `b6c18f5` beheben: falsche Kontrollnachrichtenlängen werden als Protokollfehler erkannt; vier Regressionen, 82 Vendor-Tests plus Doctest in Debug/Release und Sicherheitsnachreview grün.
 - [ ] Regulären Gate, GitHub-CI und Merge dieses Bausteins abschließen und tatsächlichen Stand nachtragen.
 
 ## Vollständiger Produktumfang

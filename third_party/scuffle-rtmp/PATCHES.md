@@ -21,11 +21,18 @@ Die konkrete API, Grenzen, Tests und Reproduktion stehen in
 
 Semantisch geänderte Quelldateien: `chunk/reader.rs`, `chunk/error.rs`,
 `command_messages/reader.rs`, `command_messages/error.rs`, `messages/reader.rs`,
-`error.rs`, `session/server/mod.rs`, `session/server/error.rs`,
+`error.rs`, `protocol_control_messages/reader.rs`, `session/server/mod.rs`, `session/server/error.rs`,
 `session/server/handler.rs`. Neu sind `session/server/limits.rs`,
 `session/server/output.rs` sowie die beiden `uplink_tests.rs`.
 `lib.rs` markiert zwei nicht portable Upstream-Tests ausdrücklich als ignoriert.
 Andere Quelldateien tragen nur Format-/Herkunftsänderungen.
+
+Nachkorrektur vor Push: Die Parser für SetChunkSize und WindowAcknowledgementSize
+verlangen einen vollständigen Body mit genau vier Byte. Andere Längen ergeben
+`InvalidData` statt eines aus Cursor-Lesen entstandenen `UnexpectedEof`.
+Ein fehlerhafter Nachrichtenkörper wird dadurch nicht länger als geschlossener
+Transport gemeldet. Beide offenen-Transport-Fälle wurden zuerst in Debug und
+Release rot gemessen; echte EOF- und Timeout-Semantik bleiben erhalten.
 
 Die Bibliothek allein ist weder eine öffentlich freigegebene Ingest-Schnittstelle
 noch eine Codec-, OBS-, Twitch- oder Plattformfreigabe. Die aufrufende Anwendung
