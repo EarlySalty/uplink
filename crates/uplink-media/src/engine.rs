@@ -77,13 +77,11 @@ type Sinks = Arc<Mutex<Vec<Sink>>>;
 impl MediaEngine {
     pub fn new(config: EngineConfig) -> Result<Self> {
         let limits = &config.limits;
+        limits.validate_packet_limits()?;
         if !config.ffmpeg.is_absolute()
             || !config.ffmpeg.is_file()
             || !config.ffprobe.is_absolute()
             || !config.ffprobe.is_file()
-            || limits.max_tag_bytes == 0
-            || limits.max_tag_bytes > 0xff_ffff
-            || limits.queue_bytes < limits.max_tag_bytes + 15
             || limits.worker_threads == 0
             || limits.worker_threads > 64
             || limits.max_outputs == 0

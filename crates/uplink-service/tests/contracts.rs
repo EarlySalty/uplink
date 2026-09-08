@@ -23,11 +23,12 @@ fn parser_allocations_are_part_of_the_global_ingest_budget() {
     let mut config: toml::Value =
         toml::from_str(include_str!("../../../config/uplink-beispiel.toml")).unwrap();
     config["max_sessions"] = 64.into();
-    config["media"]["max_event_bytes"] = (16 * 1024 * 1024).into();
-    config["media"]["max_queued_bytes"] = (16 * 1024 * 1024).into();
-    assert!(
-        Config::parse(&toml::to_string(&config).unwrap()).is_err(),
-        "1 GiB Queues plus mehrere GiB Parser dürfen das globale Limit nicht umgehen"
+    config["media"]["max_event_bytes"] = 0xff_ffff.into();
+    config["media"]["max_queued_bytes"] = (0xff_ffff + 15).into();
+    assert_eq!(
+        Config::parse(&toml::to_string(&config).unwrap()).err(),
+        Some("Parser und Medienpuffer überschreiten das gemeinsame Eingangsbudget."),
+        "Gültige Einzelpaketgrenzen dürfen das globale Parserbudget nicht umgehen"
     );
 }
 
@@ -58,6 +59,60 @@ fn media_engine_and_ingest_use_the_same_explicit_byte_and_event_limits() {
         ingest.max_pending_connections,
         config.max_pending_connections
     );
+}
+
+fn assert_packet_limit_contract(tag_bytes: usize, queue_bytes: usize, accepted: bool) {
+    let mut input: toml::Value =
+        toml::from_str(include_str!("../../../config/uplink-beispiel.toml")).unwrap();
+    input["max_sessions"] = 1.into();
+    input["max_pending_connections"] = 1.into();
+    input["media"]["max_event_bytes"] = (tag_bytes as i64).into();
+    input["media"]["max_queued_bytes"] = (queue_bytes as i64).into();
+    let parsed = Config::parse(&toml::to_string(&input).unwrap());
+    assert_eq!(
+        parsed.is_ok(),
+        accepted,
+        "Paketgrenze {tag_bytes}, Queuegrenze {queue_bytes}"
+    );
+    if let Ok(config) = parsed {
+        let limits = config.media_limits();
+        assert_eq!(limits.max_tag_bytes, tag_bytes);
+        assert_eq!(
+            limits.queue_bytes, queue_bytes,
+            "Keine stille Budgeterhöhung"
+        );
+        let ingest = config.ingest_limits().unwrap();
+        assert_eq!(ingest.max_event_bytes, tag_bytes);
+        assert_eq!(ingest.max_queued_bytes, queue_bytes);
+        ingest.rtmp.validate().unwrap();
+        // Der Konstruktor startet keine Prozesse. Ein vorhandenes Testbinary
+        // genügt für seine Dateiprüfung; kein lokaler FFmpeg-Pfad ist nötig.
+        let executable = std::env::current_exe().unwrap();
+        assert!(
+            uplink_media::MediaEngine::new(uplink_media::EngineConfig {
+                ffmpeg: executable.clone(),
+                ffprobe: executable,
+                work_directory: "/unused-uplink-limit-test".into(),
+                limits,
+            })
+            .is_ok()
+        );
+    }
+}
+
+#[test]
+fn packet_limits_require_room_for_the_complete_flv_frame() {
+    let payload = 2 * 1024 * 1024;
+    for overhead in [0, 14, 15, 16] {
+        assert_packet_limit_contract(payload, payload + overhead, overhead >= 15);
+    }
+}
+
+#[test]
+fn packet_limits_keep_the_exact_24_bit_wire_boundary() {
+    for tag in [0xff_fffe, 0xff_ffff, 0x100_0000] {
+        assert_packet_limit_contract(tag, tag + 15, tag <= 0xff_ffff);
+    }
 }
 
 #[test]

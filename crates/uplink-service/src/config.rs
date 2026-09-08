@@ -223,9 +223,6 @@ impl Config {
         if !config.media.ffmpeg.is_absolute()
             || !config.media.ffprobe.is_absolute()
             || !config.media.work_directory.is_absolute()
-            || config.media.max_event_bytes == 0
-            || config.media.max_event_bytes > 16 * 1024 * 1024
-            || config.media.max_queued_bytes < config.media.max_event_bytes
             || config.media.max_queued_events == 0
             || config.media.max_queued_events > 4096
             || config.media.max_tracks == 0
