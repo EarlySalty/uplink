@@ -86,11 +86,49 @@ struct GrantRequest {
     generation: std::sync::atomic::AtomicU64,
 }
 type GrantKey = (i64, Platform);
+
+/// Flüchtiger Empfänger normal bestätigter Grant-Wechsel für einen vorhandenen
+/// Ressourcenbesitzer. Er fragt selbst weder Tokens an noch erneuert er sie.
+pub(crate) struct GrantAbo {
+    konto: String,
+    scope: &'static str,
+    state: Mutex<GrantAboState>,
+}
+struct GrantAboState {
+    aktiv: bool,
+    neuester: Option<Grant>,
+}
+impl GrantAbo {
+    fn uebernehmen(&self, grant: &Grant) {
+        let mut state = self.state.lock().expect("Grant-Empfänger");
+        if state.aktiv
+            && grant.platform_user_id == self.konto
+            && grant.scopes.iter().any(|scope| scope == self.scope)
+        {
+            state.neuester = Some(grant.clone());
+        }
+    }
+
+    pub(crate) fn stoppen(&self) {
+        self.state.lock().expect("Grant-Empfänger").aktiv = false;
+    }
+
+    pub(crate) fn letzter(&self) -> Option<Grant> {
+        self.state.lock().expect("Grant-Empfänger").neuester.clone()
+    }
+
+    #[cfg(test)]
+    fn nehmen(&self) -> Option<Grant> {
+        self.state.lock().expect("Grant-Empfänger").neuester.take()
+    }
+}
+
 pub struct TokenQuelle {
     broker: Arc<dyn PlatformBroker>,
     cache: Mutex<HashMap<(i64, Platform), Grant>>,
     invalid: Mutex<std::collections::HashSet<(i64, Platform)>>,
     requests: Mutex<HashMap<GrantKey, std::sync::Weak<GrantRequest>>>,
+    empfaenger: Mutex<Vec<(GrantKey, std::sync::Weak<GrantAbo>)>>,
 }
 impl TokenQuelle {
     pub fn from_broker(broker: Arc<dyn PlatformBroker>) -> Self {
@@ -99,7 +137,38 @@ impl TokenQuelle {
             cache: Mutex::new(HashMap::new()),
             invalid: Mutex::new(Default::default()),
             requests: Mutex::new(HashMap::new()),
+            empfaenger: Mutex::new(Vec::new()),
         }
+    }
+
+    pub(crate) fn grant_wechsel(
+        &self,
+        id: i64,
+        platform: Platform,
+        konto: String,
+        scope: &'static str,
+    ) -> Result<Arc<GrantAbo>, TokenFehler> {
+        // Bindung und bereits bestätigter Anfangsstand sind gegenüber einer
+        // gleichzeitig eintreffenden normalen Brokerantwort atomar.
+        let cache = self.cache.lock().expect("Grants");
+        let mut empfaenger = self.empfaenger.lock().expect("Grant-Empfänger");
+        empfaenger.retain(|(_, weak)| weak.strong_count() > 0);
+        if empfaenger.len() >= 1024 {
+            return Err(TokenFehler::Netz("Kontoverwaltung ist ausgelastet".into()));
+        }
+        let abo = Arc::new(GrantAbo {
+            konto,
+            scope,
+            state: Mutex::new(GrantAboState {
+                aktiv: true,
+                neuester: None,
+            }),
+        });
+        if let Some(grant) = cache.get(&(id, platform)) {
+            abo.uebernehmen(grant);
+        }
+        empfaenger.push(((id, platform), Arc::downgrade(&abo)));
+        Ok(abo)
     }
     pub async fn zugang(&self, id: i64, p: Platform) -> Result<Grant, TokenFehler> {
         let uid = u64::try_from(id)
@@ -181,6 +250,18 @@ impl TokenQuelle {
         if c.len() < 1024 {
             c.insert((id, p), g.clone());
         }
+        // Erst nach Validierung und der bestehenden Generation-Prüfung. Keine
+        // Benachrichtigung durch Cache-Lesen, recheck, Fehler oder alte Antworten.
+        let mut empfaenger = self.empfaenger.lock().expect("Grant-Empfänger");
+        empfaenger.retain(|(key, weak)| {
+            let Some(abo) = weak.upgrade() else {
+                return false;
+            };
+            if *key == (id, p) {
+                abo.uebernehmen(&g);
+            }
+            true
+        });
         Ok(g)
     }
     pub fn recheck(&self, id: i64, p: Platform) {
@@ -410,6 +491,64 @@ mod cache_regressions {
     }
 
     #[tokio::test]
+    async fn grant_changes_only_reach_the_current_matching_owner() {
+        let source = TokenQuelle::from_broker(Arc::new(Counting {
+            calls: AtomicUsize::new(0),
+        }));
+        let old = source
+            .grant_wechsel(7, Platform::Twitch, "7".into(), "user:read:chat")
+            .unwrap();
+        let wrong_account = source
+            .grant_wechsel(7, Platform::Twitch, "8".into(), "user:read:chat")
+            .unwrap();
+        let wrong_scope = source
+            .grant_wechsel(7, Platform::Twitch, "7".into(), "events:subscribe")
+            .unwrap();
+        source.zugang(7, Platform::Twitch).await.unwrap();
+        assert!(old.nehmen().is_some());
+        assert!(wrong_account.nehmen().is_none());
+        assert!(wrong_scope.nehmen().is_none());
+        old.stoppen();
+        let current = source
+            .grant_wechsel(7, Platform::Twitch, "7".into(), "user:read:chat")
+            .unwrap();
+        source.recheck(7, Platform::Twitch);
+        source.zugang(7, Platform::Twitch).await.unwrap();
+        assert!(old.nehmen().is_none());
+        assert!(current.nehmen().is_some());
+        drop((old, current, wrong_account, wrong_scope));
+        source.recheck(7, Platform::Twitch);
+        source.zugang(7, Platform::Twitch).await.unwrap();
+        assert!(source.empfaenger.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn grant_receiver_count_is_bounded_and_dead_receivers_are_removed() {
+        let source = TokenQuelle::from_broker(Arc::new(Counting {
+            calls: AtomicUsize::new(0),
+        }));
+        let receivers: Vec<_> = (0..1024)
+            .map(|id| {
+                source
+                    .grant_wechsel(id, Platform::Kick, "7".into(), "events:subscribe")
+                    .unwrap()
+            })
+            .collect();
+        assert!(
+            source
+                .grant_wechsel(1025, Platform::Kick, "7".into(), "events:subscribe")
+                .is_err()
+        );
+        drop(receivers);
+        assert!(
+            source
+                .grant_wechsel(1025, Platform::Kick, "7".into(), "events:subscribe")
+                .is_ok()
+        );
+        assert_eq!(source.empfaenger.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn forgotten_identity_cannot_restore_an_inflight_grant() {
         struct Paused {
             started: tokio::sync::Notify,
@@ -430,7 +569,7 @@ mod cache_regressions {
                         expires_at: Utc::now() + chrono::Duration::hours(1),
                         platform_user_id: "7".into(),
                         platform_login: "unused".into(),
-                        scopes: vec![],
+                        scopes: vec!["user:read:chat".into()],
                     })
                 })
             }
@@ -440,6 +579,9 @@ mod cache_regressions {
             finish: tokio::sync::Notify::new(),
         });
         let source = Arc::new(TokenQuelle::from_broker(broker.clone()));
+        let receiver = source
+            .grant_wechsel(7, Platform::Twitch, "7".into(), "user:read:chat")
+            .unwrap();
         let cloned = source.clone();
         let request = tokio::spawn(async move { cloned.zugang(7, Platform::Twitch).await });
         broker.started.notified().await;
@@ -449,6 +591,7 @@ mod cache_regressions {
             request.await.unwrap().is_err(),
             "Dockentzug darf keinen vorher gestarteten Grant wieder aktivieren"
         );
+        assert!(receiver.nehmen().is_none());
         assert!(source.cache.lock().unwrap().is_empty());
     }
 }
