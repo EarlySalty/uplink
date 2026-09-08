@@ -140,7 +140,7 @@ Ein blockierter Run wird nie stillschweigend durch einen fremden Broadcast erset
 
 ### `start`
 
-Nur nötig bei `auto_start=false`. Der Aufrufer ruft `start`, sobald der Medienpfad Daten an YouTube sendet. Der Adapter prüft `streamStatus=active`; ist der Stream noch nicht aktiv, antwortet er `Sendet{stream_status}` ohne Transition. Bei `active` folgt `liveBroadcasts.transition?broadcastStatus=live` als offener Schritt. Bei `auto_start=true` ist `start` ein reiner Statusabruf.
+Nur nötig bei `auto_start=false`. Der Aufrufer ruft `start`, sobald der Medienpfad Daten an YouTube sendet. Der Adapter vermerkt den Wunsch als `start_angefordert_at` im Run und prüft `streamStatus=active`; ist der Stream noch nicht aktiv, antwortet er `Sendet{stream_status}` ohne Transition. Bei `active` und passender Bindung folgt `liveBroadcasts.transition?broadcastStatus=live` als offener Schritt. Bei `auto_start=true` ist `start` ein reiner Statusabruf. Weil `start_angefordert_at` gesetzt bleibt, führt der nächste `status` die Transition selbst nach, sobald der Stream aktiv wird; nach `Live` wird das Feld nicht mehr gebraucht.
 
 ### `status`
 
@@ -151,6 +151,7 @@ Liest Stream und Broadcast per `list` (je 1 Einheit). Zuordnung:
 | kein aktiver Run | `Inaktiv` |
 | `lifeCycleStatus=live` und `boundStreamId == stream_id` | `Live` |
 | `lifeCycleStatus=live`, aber andere Bindung | `Fehler{wiederaufnehmbar:false}` (fremdes Ereignis, nicht übernehmen) |
+| `start_angefordert_at` gesetzt, `streamStatus=active`, Broadcast `ready`/`created`, Bindung passt | Transition nach `live` nachführen, danach `Live` oder `Sendet` |
 | `streamStatus=active`, Broadcast `ready`, `liveStarting` oder `testing` | `Sendet` |
 | `streamStatus` nicht `active`, Broadcast `created`/`ready` | `Vorbereitet` |
 | `lifeCycleStatus=complete` | `Beendet{youtube_bestaetigt:true}`, Run wird geschlossen |
@@ -171,7 +172,7 @@ Verlangt einen `Endegrund`. Ein TCP-Abbruch, ein Ingest-Timeout oder ein Neustar
 Migration `db/migrations/20260908_youtube_live.sql` (additiv, Registrierung in `migrations.rs` übernimmt Codex):
 
 - `relay.youtube_live_settings`: eine Zeile je `streamer_id` (FK `relay.users`), `channel_id`, `connection_generation`, `titel`, `sichtbarkeit`, `auto_start`, `auto_stop`, `live_freigegeben_at`, `stream_id` (wiederverwendbarer Stream, kanalgebunden), `updated_at`.
-- `relay.youtube_live_runs`: `run_id` (Identity), `streamer_id`, `channel_id`, `connection_generation`, `uplink_session`, `zustand`, `schritt`, `schritt_seit`, `stream_id`, `broadcast_id`, `titel`, `sichtbarkeit`, `auto_start`, `auto_stop`, `fehler`, `ende_grund`, `youtube_bestaetigt`, `unterbrochen_at`, `live_seit`, `created_at`, `updated_at`, `ended_at`. Eindeutiger Teilindex: höchstens ein Run je `streamer_id` mit `ended_at IS NULL`.
+- `relay.youtube_live_runs`: `run_id` (Identity), `streamer_id`, `channel_id`, `connection_generation`, `uplink_session`, `zustand`, `schritt`, `schritt_seit`, `stream_id`, `broadcast_id`, `titel`, `sichtbarkeit`, `auto_start`, `auto_stop`, `fehler`, `ende_grund`, `youtube_bestaetigt`, `unterbrochen_at`, `live_seit`, `start_angefordert_at`, `created_at`, `updated_at`, `ended_at`. Eindeutiger Teilindex: höchstens ein Run je `streamer_id` mit `ended_at IS NULL`.
 
 Alle Zustandswechsel sind einzelne `UPDATE … WHERE zustand=… AND connection_generation=… RETURNING`-Statements (Compare-and-set). Ein Statement, das keine Zeile trifft, meldet `LiveFehler::Store("Run wurde zwischenzeitlich geändert.")`.
 
@@ -189,7 +190,7 @@ pub struct PostgresRunStore { sql: Arc<dyn SqlZugang> }
 
 1. `prepare` in eigener Tokio-Task mit Frist von höchstens 30 Sekunden aufrufen, nie innerhalb einer Sperre des Coordinators. Andere Plattformen starten unabhängig davon; das YouTube-Ziel bleibt bis zum Ergebnis `starting`.
 2. Ergebnis `Vorbereitung.ingest` in das YouTube-Ziel des Medienpfads übernehmen (`rtmps_url` plus `stream_name`); der Adapter schreibt nicht in `relay.destinations`.
-3. Nach Medienstart bei `auto_start=false` einmal `start` rufen, danach alle 30 Sekunden `status`. `Live` ist die einzige Beobachtung, die als `publication_confirmed=true` gelten darf.
+3. Nach Medienstart bei `auto_start=false` einmal `start` rufen, danach alle 30 Sekunden `status`. Ein `start` bei noch inaktivem Stream setzt nur `start_angefordert_at` und meldet `Sendet`; die eigentliche Transition holt der folgende `status` nach, sobald der Stream aktiv ist. `Live` ist die einzige Beobachtung, die als `publication_confirmed=true` gelten darf.
 4. Bei Ingest-Verlust `medien_unterbrochen`; `finish` nur mit Endegrund aus Nutzerknopf, bestätigtem Sessionende oder Admin.
 5. Nach einem Prozessneustart genügt `status`; der Adapter gleicht offene Schritte selbst ab.
 6. `Blockiert` und `Fehler{wiederaufnehmbar:false}` sind sichtbare Endzustände des Ziels; kein automatischer Neuversuch ohne Nutzeraktion.
@@ -225,5 +226,7 @@ Die Anbindung an `api/uplink.ts`, `UplinkZiel.tsx` und die Bot-Handler übernimm
 
 Stand der ersten Umsetzung des Crates `uplink-youtube-live`:
 
-- `Blockgrund::Quota` entsteht nur beim Vorbereiten (`prepare` samt der POST-Schritte Stream-Insert, Broadcast-Insert, Bind und Transition): ein erschöpftes Kontingent während der Vorbereitung ist ein sichtbarer, nicht selbsttätig wiederholter Blockzustand. Beim Beobachten (`status`, `start` nach der Transition, Vorabfrage in `finish`) bleibt Quota ein wiederaufnehmbarer `Fehler{wiederaufnehmbar:true}` gemäß der Statustabelle. Ratelimit und Transport sind überall wiederaufnehmbar.
 - `RunStore::einstellungen_speichern` nimmt zusätzlich die bestätigte `channel_id` entgegen (`einstellungen_speichern(streamer_id, channel_id, LiveEinstellungen)`), damit der kanalgebundene Stream in `youtube_live_settings.channel_id` verankert wird. `einstellungen_laden` liefert dazu passend `GespeicherteEinstellungen` mit `channel_id` und der gemerkten `stream_id`, und `run_anlegen` erhält die Anlagewerte über `RunNeu`.
+- Spalte `youtube_live_runs.start_angefordert_at` trägt den bei `start` (nur `auto_start=false`) angeforderten Live-Wunsch. Sie wird per Compare-and-set gesetzt; der nächste `status` führt die Transition nach, sobald der Stream aktiv ist, die Bindung passt und der Lebenszyklus in `ready`/`created` steht. Das erfüllt REQ-04, verlagert die Transition aber vom `start`-Aufruf in den folgenden `status`.
+- `liveStreams.list?mine=true` und `liveBroadcasts.list?mine=true` folgen `nextPageToken` über höchstens fünf Seiten (List-Antworten bis 1 MiB); reicht das für den Abgleich eines offenen Schritts nicht, meldet der Adapter `Blockiert(UnklareZuordnung)` statt blind fortzufahren. Kandidaten zählen nur mit parsbarem `publishedAt` im Fenster `[schritt_seit - 60 s, schritt_seit + 15 min]`; Stream-Kandidaten zusätzlich mit passender `snippet.channelId`, Broadcast-Kandidaten mit passendem Titel und leerer oder zum Stream passender `boundStreamId`.
+- `GoogleLiveApi::mit_basis`/`mit_basis_und_frist` akzeptieren nur `https://`-Basen auf `www.googleapis.com` oder einem `.googleapis.com`-Host und liefern sonst `Err`. Für Tests gegen lokale Gegenstellen gibt es `GoogleLiveApi::mit_basis_ungeprueft` (mit `#[doc(hidden)]` markiert), das die Prüfung überspringt.

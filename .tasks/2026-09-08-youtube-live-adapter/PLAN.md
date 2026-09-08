@@ -38,3 +38,11 @@ Ziel und Anforderungen stehen im Contract, die Schnittstelle in `docs/youtube-li
 
 - `gate_hook.py --review --repo <worktree> --base da83eb3e`, Befunde beheben, Commits auf `feat/youtube-live-lifecycle`, Push.
 - Stop-Regel: Gate meldet Scope-Verstoß außerhalb des Contracts.
+
+## Status
+
+- M1: erledigt 01386ea
+- M2: erledigt 79c9390
+- M3: erledigt 616056c
+- M4: erledigt 70fa80f
+- M4b Fix-Runde (Autor-Gate, Rust-Review, Security-Review): POST-5xx/Unklar-Schrittwahrung, Wächter vor jedem YouTube-Aufruf, Live nur bei passender Bindung, Quota überall wiederaufnehmbar, Abgleichfenster mit Kanal-/Bindungsfilter, praeparieren gegen run.*, generationsgebundene Setter mit RETURNING, Ingest-Pflichtprüfung, kombiniertes Schritt-Abschließen, start_angefordert_at plus status-Nachführung, Paginierung mit Deckel, finish-Abgleich, Token als Zeroizing im Header, Basis-URL-Schranke, Titel- und Kanal-ID-Prüfung, Sperrkarten-Aufräumen.
