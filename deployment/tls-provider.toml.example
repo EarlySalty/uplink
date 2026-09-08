@@ -1,0 +1,12 @@
+# Nur normale Konfiguration. Installiert unter /etc/uplink/tls-provider.toml,
+# root:root, höchstens 0644; Datei darf nicht für andere Benutzer schreibbar sein.
+hostname = "deutsche-deadlock-community.de"
+certificate_file = "/var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory/deutsche-deadlock-community.de/deutsche-deadlock-community.de.crt"
+private_key_file = "/var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory/deutsche-deadlock-community.de/deutsche-deadlock-community.de.key"
+source_owner_uid = 996
+identity_file = "/home/nathanael/Documents/Infisical/service_token.json"
+identity_owner_uid = 1000
+project_id = "2f5df3ca-12e5-4ae1-abf2-ca7fbd841705"
+environment = "prod"
+secret_path = "/"
+infisical_port = 8080

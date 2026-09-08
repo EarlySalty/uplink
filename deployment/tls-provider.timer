@@ -1,0 +1,11 @@
+[Unit]
+Description=Uplink-Zertifikat regelmäßig auf Erneuerung prüfen
+
+[Timer]
+OnBootSec=20s
+OnUnitInactiveSec=60s
+AccuracySec=5s
+Unit=tls-provider.service
+
+[Install]
+WantedBy=timers.target

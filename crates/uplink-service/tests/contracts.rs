@@ -1,6 +1,34 @@
 use uplink_service::{config::Config, crypto::Secret, registry::Registry};
 
 #[test]
+fn isolated_ingest_scope_requires_one_positive_explicit_identity() {
+    let example = include_str!("../../../config/uplink-beispiel.toml");
+    let valid = format!("{example}\n[test_ingest]\nallowed_streamer_ids = [11]\n");
+    assert!(Config::parse(&valid).is_ok());
+    for ids in ["[]", "[0]", "[11, 12]", "[18446744073709551615]"] {
+        assert!(Config::parse(&valid.replace("[11]", ids)).is_err());
+    }
+}
+
+#[test]
+fn public_ingest_never_accepts_private_test_roots_or_embedded_credentials() {
+    let example = include_str!("../../../config/uplink-beispiel.toml");
+    let local = format!("loopback_test_ca = \"/tmp/public-ca.pem\"\n{example}");
+    assert!(Config::parse(&local).is_ok());
+    assert!(Config::parse(&local.replace("127.0.0.1:8893", "0.0.0.0:8893")).is_err());
+    for bad in [
+        "rtmps://synthetic:key@example.org/live",
+        "rtmps://example.org/live?key=synthetic",
+        "rtmps://example.org/live/synthetic",
+    ] {
+        assert!(
+            Config::parse(&example.replace("rtmps://deutsche-deadlock-community.de:443/live", bad))
+                .is_err()
+        );
+    }
+}
+
+#[test]
 fn rejects_public_controlplane_and_unknown_configuration() {
     let example = include_str!("../../../config/uplink-beispiel.toml");
     assert!(Config::parse(example).is_ok());

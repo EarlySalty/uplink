@@ -141,6 +141,7 @@ async fn fixture() -> (Database, Arc<ServiceState>) {
     config.ingest_bind = "127.0.0.1:0".parse().unwrap();
     config.request_timeout_seconds = 1;
     let state = Arc::new(ServiceState {
+        tls: None,
         config,
         store,
         secrets: Arc::new(ServiceSecrets {
@@ -154,6 +155,114 @@ async fn fixture() -> (Database, Arc<ServiceState>) {
         registry: Registry::new(2, 1).unwrap(),
     });
     (database, state)
+}
+
+#[tokio::test]
+#[ignore = "Benötigt isolierte PostgreSQL-16-Testinstanz und lokales TLS."]
+async fn isolated_ingest_accepts_only_test_identity_and_cannot_write_or_publish() {
+    use uplink_ingest::Authorizer;
+    let (database, mut state) = fixture().await;
+    Arc::get_mut(&mut state).unwrap().config = Config::parse(&format!(
+        "{}\n[test_ingest]\nallowed_streamer_ids = [11]\n",
+        include_str!("../../../config/uplink-beispiel.toml")
+    ))
+    .unwrap();
+    {
+        let config = &mut Arc::get_mut(&mut state).unwrap().config;
+        config.api_bind = "127.0.0.1:0".parse().unwrap();
+        config.ingest_bind = "127.0.0.1:0".parse().unwrap();
+        config.media.ffmpeg = "/usr/bin/ffmpeg".into();
+        config.media.ffprobe = "/usr/bin/ffprobe".into();
+        config.media.work_directory = database.directory.join("media");
+    }
+    use sha2::Digest;
+    let other_key = "rsr_11111111111111111111111111111111";
+    state
+        .store
+        .query(
+            "INSERT INTO relay.users(streamer_id,enabled,ingest_key_hash) VALUES(12,true,$1)",
+            &[&hex::encode(sha2::Sha256::digest(other_key))],
+        )
+        .await
+        .unwrap();
+    let authorizer = uplink_service::runtime::ServiceAuthorizer::new(state.clone());
+    assert!(authorizer.authorize("live", other_key).await.is_err());
+    for (method, path, body) in [
+        ("POST", "/v1/me/key/rotate?streamer_id=11", ""),
+        ("POST", "/v1/me/waitlist?streamer_id=11", ""),
+        (
+            "PUT",
+            "/v1/me/destinations",
+            r#"{"streamer_id":11,"destinations":[]}"#,
+        ),
+    ] {
+        let response = router(state.clone())
+            .oneshot(request(method, path, body))
+            .await
+            .unwrap();
+        assert!(matches!(
+            response.status(),
+            StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
+        ));
+    }
+    let response = router(state.clone())
+        .oneshot(request("GET", "/v1/me/status?streamer_id=12", ""))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let certificates = tls::test_tls();
+    let processor = Arc::new(uplink_service::media::Coordinator::new(state.clone()).unwrap());
+    let (ready, bound) = tokio::sync::oneshot::channel();
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(uplink_service::runtime::serve_with_ready(
+        state.clone(),
+        certificates.server,
+        processor,
+        async {
+            let _ = stopped.await;
+        },
+        Some(ready),
+    ));
+    let (_, address) = bound.await.unwrap();
+    let socket = tokio::net::TcpStream::connect(address).await.unwrap();
+    let mut peer = tokio_rustls::TlsConnector::from(certificates.client)
+        .connect("localhost".try_into().unwrap(), socket)
+        .await
+        .unwrap();
+    rtmp::publish(&mut peer, "rsr_00000000000000000000000000000000").await;
+    rtmp::message(&mut peer, 8, 1, &[0xaf, 0, 0x11, 0x90]).await;
+    rtmp::message(&mut peer, 8, 1, &[0xaf, 1, 1, 2, 3]).await;
+    rtmp::stop(&mut peer).await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if state.registry.active_count() == 0 && !state.registry.status(11).is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let status = &state.registry.status(11)[0];
+    assert!(status.error.is_none());
+    assert_eq!(status.received_events, 2);
+    assert_eq!(
+        status.source_observation.as_ref().unwrap()["mode"],
+        "ingest_test"
+    );
+    assert_eq!(status.outputs.as_ref().unwrap()["publishing"], false);
+    assert_eq!(
+        state
+            .store
+            .query("SELECT count(*) FROM relay.destinations", &[])
+            .await
+            .unwrap()[0]
+            .get::<_, i64>(0),
+        0
+    );
+    stop.send(()).unwrap();
+    task.await.unwrap().unwrap();
+    database.stop().await;
 }
 
 fn request(method: &str, uri: &str, body: impl Into<Body>) -> Request<Body> {
@@ -729,6 +838,8 @@ async fn executable_smoke(database: &Database) {
         .unwrap();
     identity.as_file().seek(SeekFrom::Start(0)).unwrap();
     let certificates = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+    let public_ca = database.directory.join("public-test-ca.pem");
+    std::fs::write(&public_ca, certificates.cert.pem()).unwrap();
     let reply = serde_json::json!({"secrets":[
         {"secretKey":"RS_RELAY_API_SECRET","secretValue":"synthetic-api"},
         {"secretKey":"RS_RELAY_ADMIN_SECRET","secretValue":"synthetic-admin"},
@@ -754,20 +865,28 @@ async fn executable_smoke(database: &Database) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let provider = tokio::spawn(async { axum::serve(listener, app).await.unwrap() });
-    let config = include_str!("../../../config/uplink-beispiel.toml")
-        .replace("127.0.0.1:8892", "127.0.0.1:0")
-        .replace("127.0.0.1:8893", "127.0.0.1:0")
-        .replace("http://127.0.0.1:8080", &format!("http://{address}"))
-        .replace(
-            "credential_fd = 5",
-            &format!("credential_fd = {}", identity.as_raw_fd()),
-        )
-        .replace("/opt/uplink/media/ffmpeg", "/usr/bin/ffmpeg")
-        .replace("/opt/uplink/media/ffprobe", "/usr/bin/ffprobe")
-        .replace(
-            "/run/user/1000/uplink-media",
-            database.directory.join("media").to_str().unwrap(),
-        );
+    let config = format!(
+        "loopback_test_ca = {:?}\n{}",
+        public_ca,
+        include_str!("../../../config/uplink-beispiel.toml")
+    )
+    .replace("127.0.0.1:8892", "127.0.0.1:0")
+    .replace("127.0.0.1:8893", "127.0.0.1:0")
+    .replace(
+        "rtmps://deutsche-deadlock-community.de:443/live",
+        "rtmps://localhost/live",
+    )
+    .replace("http://127.0.0.1:8080", &format!("http://{address}"))
+    .replace(
+        "credential_fd = 5",
+        &format!("credential_fd = {}", identity.as_raw_fd()),
+    )
+    .replace("/opt/uplink/media/ffmpeg", "/usr/bin/ffmpeg")
+    .replace("/opt/uplink/media/ffprobe", "/usr/bin/ffprobe")
+    .replace(
+        "/run/user/1000/uplink-media",
+        database.directory.join("media").to_str().unwrap(),
+    );
     let config_path = database.directory.join("service.toml");
     std::fs::write(&config_path, config).unwrap();
     let binary = std::env::current_exe()
@@ -847,6 +966,7 @@ async fn controlplane_preserves_credentials_and_rejects_unauthorized_changes() {
     };
     store.query("INSERT INTO relay.users(streamer_id,enabled,ingest_key_enc,ingest_key_hash) VALUES(11,true,$1,$2),(12,false,NULL,NULL)",&[&key,&hash]).await.unwrap();
     let state = Arc::new(ServiceState {
+        tls: None,
         config: Config::parse(include_str!("../../../config/uplink-beispiel.toml")).unwrap(),
         store: store.clone(),
         secrets: Arc::new(ServiceSecrets {
@@ -941,6 +1061,7 @@ async fn controlplane_preserves_credentials_and_rejects_unauthorized_changes() {
     runtime_config.api_bind = "127.0.0.1:0".parse().unwrap();
     runtime_config.ingest_bind = "127.0.0.1:0".parse().unwrap();
     let runtime_state = Arc::new(ServiceState {
+        tls: None,
         config: runtime_config,
         store: store.clone(),
         secrets: state.secrets.clone(),
