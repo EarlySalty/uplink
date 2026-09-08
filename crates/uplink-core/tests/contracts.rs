@@ -229,6 +229,51 @@ fn unknown_input_stays_pending_and_keeps_wish() {
 }
 
 #[test]
+fn unavailable_target_audio_is_rejected_without_source() {
+    for role in [AudioRole::Live, AudioRole::Vod] {
+        let mut scenario = input(vec![request("one")]);
+        scenario.source = None;
+        if role == AudioRole::Live {
+            scenario.outputs[0].capabilities.audio.clear();
+        } else {
+            let mut unsupported_audio = audio();
+            unsupported_audio.sample_rate = 44100;
+            scenario.outputs[0].vod_audio = Some(AudioRequest {
+                role,
+                profile: unsupported_audio,
+            });
+        }
+        let result = plan(&scenario).unwrap();
+        assert_eq!(result.outputs[0].status, OutputStatus::Rejected);
+        assert_eq!(
+            result.outputs[0].reasons,
+            vec![Rejection::TargetAudioUnsupported(role)]
+        );
+        assert_eq!(result.outputs[0].live_audio, None);
+        assert_eq!(result.outputs[0].vod_audio, None);
+        assert!(result.encode_groups.is_empty());
+    }
+}
+
+#[test]
+fn unavailable_layout_is_rejected_without_source() {
+    let mut scenario = input(vec![request("one")]);
+    scenario.source = None;
+    scenario.outputs[0].layout = Some(LayoutRevision {
+        id: 77,
+        revision: 1,
+    });
+    let result = plan(&scenario).unwrap();
+    assert_eq!(result.outputs[0].status, OutputStatus::Rejected);
+    assert_eq!(
+        result.outputs[0].reasons,
+        vec![Rejection::LayoutWorkerUnavailable]
+    );
+    assert_eq!(result.outputs[0].video, None);
+    assert!(result.encode_groups.is_empty());
+}
+
+#[test]
 fn unsupported_target_is_rejected_without_lowering_quality() {
     let mut scenario = input(vec![request("one")]);
     scenario.outputs[0].capabilities.video.clear();

@@ -80,6 +80,43 @@ fn rejected_output_is_visible_and_returns_nonzero() {
     );
 }
 
+fn without_source() -> String {
+    let start = SAMPLE.find("[source]").unwrap();
+    let end = SAMPLE.find("[worker]").unwrap();
+    format!("{}{}", &SAMPLE[..start], &SAMPLE[end..])
+}
+
+#[test]
+fn unavailable_target_audio_without_source_returns_rejection() {
+    let text = without_source().replacen(
+        "allowed_audio_profiles = [\"aac_stereo\"]",
+        "allowed_audio_profiles = []",
+        1,
+    );
+    let output = ConfigFile::new(&text).run();
+    assert_eq!(output.status.code(), Some(3));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("twitch_test: abgelehnt"));
+    assert!(stdout.contains("Ziel unterstützt das gewünschte Live-Audioformat"));
+    assert!(stdout.contains("Ziel unterstützt das gewünschte VOD-Audioformat"));
+    assert!(stdout.contains("kick_test: Eingang ausstehend"));
+}
+
+#[test]
+fn unavailable_layout_without_source_returns_rejection() {
+    let text = without_source().replacen(
+        "id = \"twitch_test\"",
+        "id = \"twitch_test\"\nlayout = { id = 77, revision = 1 }",
+        1,
+    );
+    let output = ConfigFile::new(&text).run();
+    assert_eq!(output.status.code(), Some(3));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("twitch_test: abgelehnt"));
+    assert!(stdout.contains("Für die gewünschte Layoutrevision fehlt"));
+    assert!(stdout.contains("kick_test: Eingang ausstehend"));
+}
+
 #[test]
 fn unknown_profile_reference_and_oversized_config_fail() {
     let output = ConfigFile::new(&SAMPLE.replacen(

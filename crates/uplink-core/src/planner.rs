@@ -164,13 +164,9 @@ fn validate(input: &PlanInput) -> Result<(), Error> {
 fn audio_plan(
     source: &Source,
     request: &AudioRequest,
-    output: &OutputRequest,
     worker: &WorkerCapabilities,
     reasons: &mut Vec<Rejection>,
 ) -> Option<AudioPlan> {
-    if !output.capabilities.audio.contains(&request.profile) {
-        reasons.push(Rejection::TargetAudioUnsupported(request.role));
-    }
     let Some(track) = source.audio.iter().find(|track| track.role == request.role) else {
         reasons.push(Rejection::MissingAudio(request.role));
         return None;
@@ -217,6 +213,20 @@ pub fn plan(input: &PlanInput) -> Result<Plan, Error> {
         if !request.capabilities.video.contains(&request.video) {
             output.reasons.push(Rejection::TargetVideoUnsupported);
         }
+        for audio in std::iter::once(&request.live_audio).chain(request.vod_audio.as_ref()) {
+            if !request.capabilities.audio.contains(&audio.profile) {
+                output
+                    .reasons
+                    .push(Rejection::TargetAudioUnsupported(audio.role));
+            }
+        }
+        if request
+            .layout
+            .as_ref()
+            .is_some_and(|layout| !input.worker.compositable_layouts.contains(layout))
+        {
+            output.reasons.push(Rejection::LayoutWorkerUnavailable);
+        }
         if let Some(source) = &input.source {
             if request.video.fps > source.video.fps {
                 output.reasons.push(Rejection::FrameDuplicationNotApproved);
@@ -245,23 +255,14 @@ pub fn plan(input: &PlanInput) -> Result<Plan, Error> {
             {
                 output.reasons.push(Rejection::VideoDecoderUnavailable);
             }
-            if request
-                .layout
-                .as_ref()
-                .is_some_and(|layout| !input.worker.compositable_layouts.contains(layout))
-            {
-                output.reasons.push(Rejection::LayoutWorkerUnavailable);
-            }
             output.live_audio = audio_plan(
                 source,
                 &request.live_audio,
-                request,
                 &input.worker,
                 &mut output.reasons,
             );
             if let Some(audio) = &request.vod_audio {
-                output.vod_audio =
-                    audio_plan(source, audio, request, &input.worker, &mut output.reasons);
+                output.vod_audio = audio_plan(source, audio, &input.worker, &mut output.reasons);
             }
             if output.reasons.is_empty() {
                 output.status = OutputStatus::Planned;
