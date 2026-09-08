@@ -24,7 +24,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y postgresql-16 ffmpeg
-          cargo test -p uplink-service --test database --locked -j2 -- --ignored
+          cargo test -p uplink-service --test database --locked -j2 -- --ignored --test-threads=1
       - name: Release-Build
         run: cargo build --workspace --release --locked -j2
       - name: Lokaler RTMPS-Eingang im Releaseprofil
