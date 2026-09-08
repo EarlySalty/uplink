@@ -1,0 +1,122 @@
+# Sicherheitsreview: lokaler RTMPS-Eingang
+
+Stand: 8. September 2026. Unabhängige Prüfung des Arbeitsstands auf
+`feat/rtmps-ingest` gegen `02567c2d865825e374c7c5ead78e84f200307608`, einschließlich
+des korrigierten Metadata-Tracklimits und der Codec-/Headerzuordnung.
+
+**Ergebnis:** Kein weiterer konkreter Sicherheitsblocker im geprüften
+Loopback-Baustein. Der Stand kann für diesen Entwicklungsumfang übernommen
+werden. Dies ist keine Freigabe für öffentlichen Ingest, produktive
+Kontoverbindungen, OBS oder Plattformausgänge.
+
+## Prüfbereich und Quellstand
+
+Geprüft wurden `crates/uplink-ingest`, die tatsächlich verwendeten
+Parser-/Serverpfade in `third_party/scuffle-rtmp` und `third_party/scuffle-amf`,
+deren Manifeste/Lockfiles sowie Root-Manifest, Root-Lockfile und Rust-CI.
+Die fachliche Protokoll-/Medienprüfung erfolgt zusätzlich im gekoppelten
+[Rust-Review](review-rtmps.md). Andere Dienste und vorhandene Zugangsdaten wurden
+nicht untersucht oder geändert.
+
+SHA-256 über die sortierten Pfade und SHA-256-Werte aller Rust-Dateien und
+Manifeste/Lockfiles dieses Bereichs einschließlich Root-Cargo/CI:
+
+`09e8ca09ec521f9a3d29421d4783fc5c41a9a0200ff34cb33b38676afc215cb4`
+
+Reproduktion aus der Repositorywurzel; Buildverzeichnisse bleiben ausgeschlossen:
+
+```sh
+rg --files crates/uplink-ingest third_party/scuffle-rtmp third_party/scuffle-amf \
+  -g '*.rs' -g Cargo.toml -g Cargo.lock -g '!**/target/**' \
+  | awk 'BEGIN { print "Cargo.toml"; print "Cargo.lock"; print ".github/workflows/rust.yml" } { print }' \
+  | sort | xargs sha256sum | sha256sum
+```
+
+## Wesentliche Befunde
+
+- **Zugang:** `IngestServer::bind_loopback` bindet fest an `127.0.0.1`; die
+  Peer-Adresse wird zusätzlich geprüft (`server.rs:202`, `server.rs:236`). Ein
+  Slot wird vor TLS-Arbeit und Taskstart reserviert. Der Publish-Callback muss
+  eine gültige, nicht leere Nutzer-/Sessionidentität liefern. Sowohl der
+  RTMP-Server als auch der Ingest-Handler prüfen die autorisierte Stream-ID vor
+  Medienübergabe. Ein weiterer Publish derselben Verbindung wird abgelehnt.
+  Frische Instanzkennung und nicht überlaufender Verbindungszähler trennen
+  Generationen. Der vorhandene produktive Broker ist ausdrücklich noch nicht
+  angeschlossen; die feste Identität im Beispiel ist synthetisch.
+- **Ressourcen vor Allokation:** Chunknachrichten werden nach ihrem Header vor
+  Payloadübernahme gegen Byte-, CSID-, Partialanzahl- und Partialgesamtbudget
+  geprüft (`chunk/reader.rs:204`). Kontrollierte Read-/Write-Puffer begrenzen
+  Transportansammlungen. Native AMF- und Serde-Pfade verwenden dieselben
+  Byte-, String-, Eintrags-, Werte- und Containertiefengrenzen. Strikte
+  Arraylängen werden vor Größenhinweisen und Reservierungen validiert;
+  ECMA-Hinweise lösen keine Vorreservierung aus. Fehlende Terminatoren,
+  ausbleibender Serde-Fortschritt und unvollständiger Containerverbrauch führen
+  zu Fehlern. Die Eingangs-App verwendet begrenzte Nachrichten statt eines
+  unendlich fortgesetzten AMF-Decoders.
+- **Fristen und Queue:** Eine gemeinsame absolute Startfrist umfasst TLS,
+  RTMP und Autorisierung. Zusätzlich gelten begrenzte Read-, Write-/Flush-
+  und Callbackfristen; Kontrollnachrichten verlängern die Medien-Idlefrist
+  nicht. Regelmäßiges Yield macht Fristen auch bei bereits gepufferten
+  Nachrichten beobachtbar. Medien werden erst nach Byte-/Eventreservierung
+  kompakt kopiert (`server.rs:428`). Gehaltene Events behalten diese Budgets
+  sowie den Session-Slot bis zu ihrem Drop. Der Metadata-Fix verbraucht jetzt
+  ebenfalls das Trackbudget; ein Metadata-Paket erbt keine fremde Codec-Revision.
+- **Secretredaktion:** `MediaEvent` besitzt keine Debugdarstellung der
+  Nutzdaten. Berichte enthalten Zustände und Zähler, keine App-/Publishnamen,
+  Zugangswerte oder Payloads. `CommandError` redigiert AMF-Inhalte in Display
+  und Debug; der Ingest wandelt Parserfehler in feste Zustände um. Standardhooks
+  protokollieren keine fremden Befehlswerte. Rohe Fehlerquellen können intern
+  weiter AMF-Inhalte tragen und dürfen von zukünftigen Aufrufern nicht
+  ungefiltert protokolliert werden. Im jetzigen Ingest existiert dieser
+  Ausgabepfad nicht.
+- **TLS-Probe und Fremdprozess:** Der private Testschlüssel verbleibt im
+  Prozessspeicher. Nur das öffentliche, neu generierte Zertifikat wird unter
+  zufälligem Namen mit `create_new` temporär angelegt und anschließend entfernt.
+  FFmpeg erhält strukturierte Argumente, feste Fixtures und eine feste
+  lokale Testadresse; keine Shell und keine echten Zugangsdaten. Ausgaben
+  sind auf 64 KiB begrenzt, Versuche und Versionsabfrage haben Fristen.
+  Erfolgs- und Fehlerpfade sammeln den Kindprozess ein; Drop beendet ihn
+  zusätzlich. Die gemessene FFmpeg-Lücke bei numerischen URL-Hosts wird durch
+  den ausdrücklich dokumentierten `localhost`-Testweg ausgeschlossen, nicht
+  als bewiesene allgemeine FFmpeg-Hostnameprüfung dargestellt.
+- **Abhängigkeiten und CI:** Beide lokalen Ableitungen haben Herkunft,
+  Originalarchiv-Prüfsumme und Lizenznachweise. Root und RTMP verwenden den
+  lokalen AMF-Patch. Die CI hat nur `contents: read`, keine Secretübergabe,
+  keine Deploymentrechte und kein `pull_request_target`. Prüfungen nutzen
+  Lockfiles. Kein neuer ENV-Config- oder Secretdateipfad wurde übernommen.
+
+## Eigenständig ausgeführte Prüfungen
+
+| Prüfung | Ergebnis |
+| --- | --- |
+| `cargo +1.97.1 test -p uplink-ingest --test transport --locked -j2` | 15 bestanden, 0 fehlgeschlagen, einschließlich Metadata-Fix, TLS, Autorisierung, Fristen und gehaltenen Eventbudgets |
+| `cargo +1.97.1 test --manifest-path third_party/scuffle-rtmp/Cargo.toml --locked --target-dir target -j2 uplink_` | 23 bestandene gezielte Parser-/Serverregressionen |
+| `cargo +1.97.1 test --manifest-path third_party/scuffle-amf/Cargo.toml --locked --target-dir target --features serde --test decode_limits -j2` | 21 bestandene native/Serde-Grenztests |
+| `cargo audit --file Cargo.lock` | Exit 0, 131 Abhängigkeiten |
+| `cargo audit --file third_party/scuffle-rtmp/Cargo.lock` | Exit 0, 97 Abhängigkeiten |
+| `cargo audit --file third_party/scuffle-amf/Cargo.lock` | Exit 0, 31 Abhängigkeiten |
+| Redigierte Gitleaks-Verzeichnisscans nur über `crates/uplink-ingest` und `third_party` | Exit 0, keine Treffer |
+| Gezielte Dateinamenprüfung ohne Buildverzeichnisse | Keine ENV-/PEM-/Key-/P12-/PFX-Dateien im neuen Quellbereich |
+| `git diff --check` | Exit 0 |
+
+Die drei Advisory-Prüfungen aktualisierten die RustSec-Datenbank und luden
+jeweils 1242 Meldungen. Das beweist keine allgemeine Fehlerfreiheit der
+unveröffentlichten Parserpatches. Die Testaufrufe erfolgten über den expliziten
+Rustup-Pfad `/home/nathanael/.cargo/bin/cargo`; das im Tool-PATH zuerst gefundene
+ältere Cargo konnte Resolver 3 nicht verarbeiten.
+
+Die echte FFmpeg-8-Positivprobe und CA-/SAN-Negativprobe wurden vom zuständigen
+Autor nach dem Metadata-Fix erneut ausgeführt und im
+[RTMPS-Nachweis](rtmps-nachweis.md) dokumentiert. Sie wurden in diesem
+Sicherheitsreview nicht erneut gestartet. Breite Debug-/Releaseprüfungen und
+der abschließende Gate-Lauf werden zentral gebündelt.
+
+## Aussagegrenzen
+
+Die Parserprüfung betrifft die oben beschriebene aufrufende Ingest-Kette mit
+ihren Limits. Sie ist weder eine Fuzzkampagne noch eine pauschale Freigabe
+aller öffentlich aufrufbaren Hilfsfunktionen der Vendor-Crates. TLS-/Allocator-
+Overhead und Spitzen-RSS wurden nicht als Kapazitätsnachweis gemessen.
+Öffentlicher Betrieb, echte Secretbeschaffung, Autorisierungswiderruf,
+Brokerintegration und Plattformberechtigungen benötigen ihren eigenen
+Implementierungs- und Abnahmenachweis.

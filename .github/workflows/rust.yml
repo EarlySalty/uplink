@@ -17,11 +17,22 @@ jobs:
       - name: Formatierung
         run: cargo fmt --all -- --check
       - name: Clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -j2 -- -D warnings
       - name: Tests
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked -j2
       - name: Release-Build
-        run: cargo build --workspace --release --locked
+        run: cargo build --workspace --release --locked -j2
+      - name: Lokaler RTMPS-Eingang im Releaseprofil
+        run: |
+          cargo test -p uplink-ingest --release --locked -j2
+          cargo test -p uplink-ingest --example rtmps_probe --locked -j2
+          cargo test -p uplink-ingest --example rtmps_probe --release --locked -j2
+      - name: Begrenzte RTMP- und AMF-Parser
+        run: |
+          cargo test --manifest-path third_party/scuffle-rtmp/Cargo.toml --locked --target-dir target -j2
+          cargo test --manifest-path third_party/scuffle-rtmp/Cargo.toml --release --locked --target-dir target -j2
+          cargo test --manifest-path third_party/scuffle-amf/Cargo.toml --features serde --locked --target-dir target -j2
+          cargo test --manifest-path third_party/scuffle-amf/Cargo.toml --features serde --release --locked --target-dir target -j2
       - name: Lokales Planszenario
         run: cargo run --release --locked -p uplink-cli -- plan --config config/plan-beispiel.toml
       - name: Isolierter E-FLV-Interoperabilitätsnachweis

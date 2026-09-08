@@ -8,6 +8,7 @@ Uplink wird in einem neuen Repository vollständig neu implementiert. Der bisher
 - [ADR 0001](docs/adr/0001-neues-repository-und-rust-neubau.md): neues Repository und Rust-Neuimplementierung.
 - [Architektur und nächste Arbeit](docs/architektur.md): Zuständigkeiten, Invarianten und Baufolge für den vollen Vier-Plattform-Umfang.
 - [Abnahmematrix](docs/abnahme.md): lokale Vertragstests getrennt von echten Medien- und Plattformnachweisen.
+- [Lokaler RTMPS-Nachweis](docs/rtmps-nachweis.md): ausführbarer Rust-Eingang, FFmpeg-8-Paketerhalt, TLS-Negativfälle und genaue Grenzen.
 - [Aufgabenakte](.tasks/2026-09-08-uplink-neubau/CONTRACT.md): autorisierter Auftrag und Nachweise dieser Arbeitsrunde.
 
 ## Integrationsgrenzen
@@ -15,6 +16,8 @@ Uplink wird in einem neuen Repository vollständig neu implementiert. Der bisher
 OAuth und Plattformtokens bleiben im vorhandenen autoritativen System. Der Twitch-Bot stellt bereits `/twitch/api/v2/internal/platform-token` bereit. Dessen konkrete Rechte, Refresh-Verhalten und Vertrag müssen bei der Anbindung geprüft werden; ein bestehender Endpunkt ist noch kein Integrationsnachweis für diesen Neubau. Zugänge und OBS-URLs müssen Neustarts überstehen. Live-Identitäten werden nach Plattform-ID geprüft, nie nach Anzeigenamen.
 
 Normale Konfiguration liegt in Dateien, Secrets in Infisical. Keine ENV-basierte Konfiguration. Keine neue Tokenkopie für Chat, Medien oder VOD. Die Entscheidung für dieses Uplink-Repository entscheidet ausdrücklich nicht über ein VOD-Repository, Speicherprodukt, Aufzeichnungsquelle oder Aufbewahrungsfrist.
+
+`uplink-ingest` bindet bislang ausschließlich Loopback und nimmt TLS-Konfiguration sowie Autorisierung als Schnittstellen entgegen. Frische Verbindungsgenerationen und begrenzte Track-/Eventzustände entstehen im Server; Wiremetadaten sind kein vollständiges Planner-Profil. Die vorhandene FFmpeg-Probe ist mit `rtmps://localhost` geprüft: beim getesteten FFmpeg-Build validiert eine numerische URL den Zertifikathost nicht zuverlässig. Öffentliche Brokeranbindung, OBS und Plattformausgänge bleiben eigene Abnahmen.
 
 ## Betrieb und Qualität
 

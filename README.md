@@ -12,6 +12,8 @@ Eine begrenzte FIFO nimmt komprimierte Pakete je Nutzer, Sessiongeneration und S
 
 `uplink-cli` liest ausschließlich eine explizit angegebene lokale TOML-Datei und zeigt den daraus abgeleiteten Szenarioplan. Sie öffnet keine Ports, verbindet keine Konten und startet keine Streams.
 
+`uplink-ingest` nimmt lokal echte RTMPS-Verbindungen über Rustls und begrenztes Scuffle-RTMP an. Der [FFmpeg-8-Nachweis](docs/rtmps-nachweis.md) erhält AV1 beziehungsweise H.264 mit zwei AAC-Spuren, komprimierten Nutzdaten und Zeitstempeln. Autorisierung und TLS-Konfiguration werden injiziert; die API bindet ausschließlich Loopback. Das ist noch kein öffentlicher OBS-Eingang oder Plattformausgang.
+
 ## Lokal ausführen
 
 Benötigt wird die in `rust-toolchain.toml` festgelegte Rustup-Toolchain 1.97.1 mit Clippy und Rustfmt. `Cargo.lock` ist versioniert.
@@ -32,10 +34,12 @@ Exitcodes: `0` vollständig geplant, `2` ungültiger Aufruf oder Konfiguration, 
 
 Die Planung ist kein ausführbarer Mediengraph. Die angegebenen Fähigkeiten müssen künftig aus reproduzierbaren Proben und autorisierten Plattformadaptern stammen. Profile/Level werden bisher syntaktisch geprüft; zulässige Codec-Kombinationen, Skalierung/Farbkonvertierung und Crop-Detailqualität benötigen einen Mediennachweis. Die modellierten Codecs, HDR-Werte und Audioformate sind keine Produktfreigabe.
 
-E-RTMP/RTMPS-Ingest, TLS, Medienparser und Encoder, echte Plattformausgänge für Twitch/Kick/YouTube/TikTok, Twitch Enhanced Broadcasting mit korrekten Audiorollen, Hochkant-Rendering, Layouteditor, Delay, Wartebild, Wiederverbindung, Live-Monitoring und Lastnachweise sind noch offen. Ebenso offen sind Konten-/Chat-/Dock-Anbindung sowie VOD-Quelle, Speicher, Uploadworker und Migration/Cutover. Bestehende Browseroberflächen dürfen nach Prüfung weiterverwendet werden; das bedeutet keine Übernahme des alten Rust-Medienkerns.
+Öffentliche Ingest-/Brokeranbindung, Standard-OBS, vollständige Codecvalidierung und Encoder, echte Plattformausgänge für Twitch/Kick/YouTube/TikTok, Twitch Enhanced Broadcasting mit korrekten Audiorollen, Hochkant-Rendering, Layouteditor, Delay, Wartebild, Plattform-Reconnect, Live-Monitoring und Lastnachweise sind noch offen. Ebenso offen sind Konten-/Chat-/Dock-Anbindung sowie VOD-Quelle, Speicher, Uploadworker und Migration/Cutover. Bestehende Browseroberflächen dürfen nach Prüfung weiterverwendet werden; das bedeutet keine Übernahme des alten Rust-Medienkerns.
 
 Die offenen Produktentscheidungen F1–F6 werden durch die aktuelle Modellierung nicht festgelegt. Insbesondere folgt aus einem abgelehnten Startplan bei fehlendem VOD-Ton keine Abschaltregel für bereits laufende Streams. Es gibt noch keinen neuen Dienst, der produktiv gestartet oder anstelle des bestehenden Relays eingesetzt werden könnte.
 
 ## Tests
 
 Die Vertragstests decken unter anderem Video-Sharing trotz verschiedener Audiomischungen, vollständige Copy-Prüfung, fehlende VOD-Spur, getrennte Decoder-/Layoutfähigkeiten, Sessionisolation, GOP-/Layoutabweichungen, unbekannte Eingänge, Kapazitätsgrenzen und Pufferfehler ab. CLI-Tests führen das echte Binary mit gültigen, abgelehnten, unbekannten und übergroßen Eingaben aus. Das ist ein lokaler Softwaretest; alle Live-Abnahmen aus dem Produktvertrag bleiben auszuweisen.
+
+Ingesttests prüfen zusätzlich echte lokale TLS-/RTMP-Verbindungen, Autorisierungsabweisung, neue Verbindungsgenerationen, Metadaten-/Trackgrenzen, begrenzte Consumer und getrennte Endgründe. Der externe [FFmpeg-Aufruf](docs/rtmps-nachweis.md#externer-ffmpeg-nachweis) benötigt ausdrücklich FFmpeg 8; seine TLS-Hostnameprüfung ist nur für die gemessene DNS-URL belegt.

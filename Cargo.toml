@@ -1,5 +1,6 @@
 [workspace]
-members = ["crates/uplink-core", "crates/uplink-cli"]
+members = ["crates/uplink-core", "crates/uplink-cli", "crates/uplink-ingest"]
+exclude = ["third_party/scuffle-rtmp", "third_party/scuffle-amf"]
 resolver = "3"
 
 [workspace.package]
@@ -13,9 +14,11 @@ serde = { version = "1.0.229", features = ["derive"] }
 toml = { version = "1.1.5", default-features = false, features = ["parse", "serde", "std"] }
 uplink-core = { path = "crates/uplink-core" }
 
+[patch.crates-io]
+scuffle-amf0 = { path = "third_party/scuffle-amf" }
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 
 [workspace.lints.clippy]
 all = "warn"
-

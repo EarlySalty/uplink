@@ -1,0 +1,616 @@
+use crate::{EventKind, MediaError, MediaKind, WireCodec, WireTrack, media::inspect};
+use bytes::Bytes;
+pub use scuffle_rtmp::session::server::ServerSessionLimits;
+use scuffle_rtmp::session::server::{
+    ServerSession, ServerSessionError, SessionData, SessionHandler,
+};
+use std::{
+    collections::HashMap,
+    future::Future,
+    net::{Ipv4Addr, SocketAddr},
+    num::NonZeroU64,
+    ops::Range,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
+use tokio::{
+    net::{TcpListener, TcpStream},
+    sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch},
+    task::JoinHandle,
+    time::{Instant, sleep_until, timeout_at},
+};
+use tokio_rustls::{TlsAcceptor, rustls::ServerConfig};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AuthorizedSession {
+    tenant: NonZeroU64,
+    session: NonZeroU64,
+}
+impl AuthorizedSession {
+    pub fn new(tenant: u64, session: u64) -> Result<Self, IngestError> {
+        Ok(Self {
+            tenant: NonZeroU64::new(tenant).ok_or(IngestError::InvalidIdentity)?,
+            session: NonZeroU64::new(session).ok_or(IngestError::InvalidIdentity)?,
+        })
+    }
+}
+
+/// Der vorhandene Broker kann hier angebunden werden. Kein Token wird gehalten,
+/// keine eigene Identität oder Berechtigung aus einem Namen abgeleitet.
+pub trait Authorizer: Send + Sync + 'static {
+    fn authorize(
+        &self,
+        app: &str,
+        stream: &str,
+    ) -> impl Future<Output = Result<AuthorizedSession, ()>> + Send;
+}
+
+/// Frische Serverinstanz (128 Bit Zufall) plus nicht wiederverwendbarer Zähler.
+/// Die Autorisierung liefert diese Generation ausdrücklich nicht selbst.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ConnectionGeneration {
+    instance: [u8; 16],
+    counter: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TrackIdentity {
+    pub session: AuthorizedSession,
+    pub generation: ConnectionGeneration,
+    pub track: WireTrack,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IngestError {
+    InvalidLimits,
+    InvalidIdentity,
+    RandomUnavailable,
+    BindFailed,
+    AcceptFailed,
+    Capacity,
+    GenerationExhausted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndReason {
+    PeerClosed,
+    ExplicitStop,
+    TlsRejected,
+    StartTimeout,
+    MediaTimeout,
+    ProtocolTimeout,
+    AuthorizationRejected,
+    ProtocolRejected,
+    MediaRejected(MediaError),
+    Backpressure,
+    ConsumerClosed,
+    TaskFailed,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionReport {
+    pub reason: EndReason,
+    pub generation: ConnectionGeneration,
+    pub received_events: u64,
+    pub received_bytes: u64,
+    pub max_queued_bytes: usize,
+    pub track_count: usize,
+    pub ignored_amf_messages: u64,
+}
+
+/// Ausschließlich empfangene Wire-Metadaten, kein vollständiges Planner-Profil.
+/// Die Rohbytes enthalten keine geprüfte Auflösung/FPS oder Live-/VOD-Rolle.
+pub struct MediaEvent {
+    pub identity: TrackIdentity,
+    pub event_kind: EventKind,
+    pub codec: WireCodec,
+    pub dts_ms: u32,
+    pub pts_ms: i64,
+    pub configuration_revision: u64,
+    body: Box<[u8]>,
+    payload: Range<usize>,
+    _budget: OwnedSemaphorePermit,
+    _event_budget: OwnedSemaphorePermit,
+    _slot: Arc<OwnedSemaphorePermit>,
+}
+impl MediaEvent {
+    pub fn payload(&self) -> &[u8] {
+        &self.body[self.payload.clone()]
+    }
+    pub fn wire_body(&self) -> &[u8] {
+        &self.body
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct IngestLimits {
+    pub max_connections: usize,
+    pub max_event_bytes: usize,
+    pub max_header_bytes: usize,
+    pub max_tracks: usize,
+    pub max_queued_events: usize,
+    pub max_queued_bytes: usize,
+    /// Absolute gemeinsame Frist ab TCP-Annahme bis TLS + RTMP + Autorisierung.
+    pub start_timeout: Duration,
+    /// Ausbleibende Medien, auch wenn Kontrollnachrichten weiter eintreffen.
+    pub media_idle_timeout: Duration,
+    pub rtmp: ServerSessionLimits,
+}
+impl IngestLimits {
+    /// Technische Grenzen der lokalen Teststrecke. Kein Produktpreset.
+    pub fn local_probe() -> Self {
+        let mut rtmp = ServerSessionLimits::default();
+        rtmp.chunk.max_message_bytes = 65536;
+        rtmp.chunk.max_command_bytes = 16384;
+        rtmp.chunk.max_chunk_streams = 16;
+        rtmp.chunk.max_partial_messages = 4;
+        rtmp.chunk.max_partial_bytes = 4 * 65536;
+        rtmp.amf.max_input_bytes = 16384;
+        Self {
+            max_connections: 4,
+            max_event_bytes: 65536,
+            max_header_bytes: 4096,
+            max_tracks: 8,
+            max_queued_events: 512,
+            max_queued_bytes: 1024 * 1024,
+            start_timeout: Duration::from_secs(10),
+            media_idle_timeout: Duration::from_secs(5),
+            rtmp,
+        }
+    }
+    fn validate(&self) -> Result<(), IngestError> {
+        self.rtmp
+            .validate()
+            .map_err(|_| IngestError::InvalidLimits)?;
+        if self.max_connections == 0
+            || self.max_connections > Semaphore::MAX_PERMITS
+            || self.max_event_bytes == 0
+            || self.max_event_bytes > self.max_queued_bytes
+            || self.max_queued_bytes > u32::MAX as usize
+            || self.max_queued_bytes > Semaphore::MAX_PERMITS
+            || self.max_header_bytes == 0
+            || self.max_header_bytes > self.max_event_bytes
+            || self.max_tracks == 0
+            || self.max_queued_events == 0
+            || self.max_queued_events > Semaphore::MAX_PERMITS
+            || self.start_timeout.is_zero()
+            || self.media_idle_timeout.is_zero()
+            || self.start_timeout > Duration::from_secs(86_400)
+            || self.media_idle_timeout > Duration::from_secs(86_400)
+            || self.rtmp.max_publishing_streams != 1
+        {
+            return Err(IngestError::InvalidLimits);
+        }
+        Ok(())
+    }
+}
+
+pub struct IngestServer<A: Authorizer> {
+    listener: TcpListener,
+    tls: Arc<ServerConfig>,
+    authorizer: Arc<A>,
+    limits: IngestLimits,
+    slots: Arc<Semaphore>,
+    instance: [u8; 16],
+    next: AtomicU64,
+}
+impl<A: Authorizer> IngestServer<A> {
+    /// Eine öffentliche Adresse kann mit dieser API absichtlich nicht gewählt werden.
+    pub async fn bind_loopback(
+        port: u16,
+        tls: Arc<ServerConfig>,
+        authorizer: Arc<A>,
+        limits: IngestLimits,
+    ) -> Result<Self, IngestError> {
+        limits.validate()?;
+        let mut instance = [0; 16];
+        getrandom::fill(&mut instance).map_err(|_| IngestError::RandomUnavailable)?;
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port))
+            .await
+            .map_err(|_| IngestError::BindFailed)?;
+        Ok(Self {
+            listener,
+            tls,
+            authorizer,
+            slots: Arc::new(Semaphore::new(limits.max_connections)),
+            limits,
+            instance,
+            next: AtomicU64::new(1),
+        })
+    }
+    pub fn local_addr(&self) -> Result<SocketAddr, IngestError> {
+        self.listener
+            .local_addr()
+            .map_err(|_| IngestError::BindFailed)
+    }
+    pub async fn accept(&self) -> Result<RunningConnection, IngestError> {
+        let (socket, peer) = self
+            .listener
+            .accept()
+            .await
+            .map_err(|_| IngestError::AcceptFailed)?;
+        let start_deadline = Instant::now() + self.limits.start_timeout;
+        if !peer.ip().is_loopback() {
+            return Err(IngestError::AcceptFailed);
+        }
+        let slot = Arc::new(
+            self.slots
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| IngestError::Capacity)?,
+        );
+        let counter = self
+            .next
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_add(1))
+            .map_err(|_| IngestError::GenerationExhausted)?;
+        let generation = ConnectionGeneration {
+            instance: self.instance,
+            counter,
+        };
+        let (sender, receiver) = mpsc::channel(self.limits.max_queued_events);
+        let report = Arc::new(Mutex::new(SessionReport {
+            reason: EndReason::ProtocolRejected,
+            generation,
+            received_events: 0,
+            received_bytes: 0,
+            max_queued_bytes: 0,
+            track_count: 0,
+            ignored_amf_messages: 0,
+        }));
+        let task = tokio::spawn(run_connection(
+            socket,
+            self.tls.clone(),
+            self.authorizer.clone(),
+            self.limits.clone(),
+            sender,
+            report.clone(),
+            Admission {
+                slot: slot.clone(),
+                start_deadline,
+            },
+        ));
+        Ok(RunningConnection {
+            receiver,
+            task: Some(task),
+            report,
+            _slot: slot,
+        })
+    }
+}
+
+pub struct RunningConnection {
+    receiver: mpsc::Receiver<MediaEvent>,
+    task: Option<JoinHandle<SessionReport>>,
+    report: Arc<Mutex<SessionReport>>,
+    _slot: Arc<OwnedSemaphorePermit>,
+}
+impl RunningConnection {
+    pub async fn next(&mut self) -> Option<MediaEvent> {
+        self.receiver.recv().await
+    }
+    pub async fn finish(mut self) -> SessionReport {
+        // Verbraucher darf finish auch ohne vollständiges Leeren aufrufen.
+        // Das Ende seiner Abnahme beendet dann den Producer sichtbar.
+        self.receiver.close();
+        match self.task.take().expect("owned task").await {
+            Ok(report) => report,
+            Err(_) => {
+                let mut report = self
+                    .report
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                report.reason = EndReason::TaskFailed;
+                report
+            }
+        }
+    }
+}
+impl Drop for RunningConnection {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TrackState {
+    codec: WireCodec,
+    revision: u64,
+    last_dts: Option<u32>,
+    ended: bool,
+}
+struct Handler<A> {
+    authorizer: Arc<A>,
+    session: Option<(u32, AuthorizedSession)>,
+    generation: ConnectionGeneration,
+    tracks: HashMap<WireTrack, TrackState>,
+    limits: IngestLimits,
+    sender: mpsc::Sender<MediaEvent>,
+    budget: Arc<Semaphore>,
+    status: watch::Sender<Activity>,
+    report: Arc<Mutex<SessionReport>>,
+    event_budget: Arc<Semaphore>,
+    slot: Arc<OwnedSemaphorePermit>,
+}
+#[derive(Clone, Copy)]
+struct Activity {
+    published: bool,
+    last_media: Instant,
+}
+impl<A: Authorizer> Handler<A> {
+    fn reject(&mut self, reason: EndReason) -> ServerSessionError {
+        self.report.lock().unwrap_or_else(|e| e.into_inner()).reason = reason;
+        ServerSessionError::HandlerRejected
+    }
+    fn media(
+        &mut self,
+        stream_id: u32,
+        kind: MediaKind,
+        timestamp: u32,
+        data: Bytes,
+    ) -> Result<(), ServerSessionError> {
+        let Some((authorized_stream, session)) = self.session else {
+            return Err(self.reject(EndReason::AuthorizationRejected));
+        };
+        if authorized_stream != stream_id {
+            return Err(self.reject(EndReason::AuthorizationRejected));
+        }
+        if data.len() > self.limits.max_event_bytes {
+            return Err(self.reject(EndReason::Backpressure));
+        }
+        let parsed = inspect(kind, &data, timestamp, self.limits.max_header_bytes)
+            .map_err(|error| self.reject(EndReason::MediaRejected(error)))?;
+        let mut track = self.tracks.get(&parsed.track).copied();
+        if track.is_none()
+            && matches!(
+                parsed.event_kind,
+                EventKind::SequenceHeader | EventKind::Metadata
+            )
+            && self.tracks.len() >= self.limits.max_tracks
+        {
+            return Err(self.reject(EndReason::MediaRejected(MediaError::TrackLimit)));
+        }
+        if parsed.event_kind == EventKind::SequenceHeader {
+            let revision = track
+                .map_or(0, |track| track.revision)
+                .checked_add(1)
+                .ok_or_else(|| {
+                    self.reject(EndReason::MediaRejected(MediaError::RevisionExhausted))
+                })?;
+            track = Some(TrackState {
+                codec: parsed.codec,
+                revision,
+                last_dts: None,
+                ended: false,
+            });
+        } else {
+            if parsed.event_kind == EventKind::Metadata && track.is_none() {
+                // Metadata already addresses a track and consumes its budget.
+                // Revision zero explicitly means no SequenceHeader received.
+                track = Some(TrackState {
+                    codec: parsed.codec,
+                    revision: 0,
+                    last_dts: None,
+                    ended: false,
+                });
+            }
+            let Some(state) = track.as_mut() else {
+                return Err(self.reject(EndReason::MediaRejected(MediaError::FrameBeforeHeader)));
+            };
+            if state.ended {
+                return Err(self.reject(EndReason::MediaRejected(MediaError::FrameBeforeHeader)));
+            }
+            if state.codec != parsed.codec {
+                return Err(self.reject(EndReason::MediaRejected(
+                    MediaError::CodecChangedWithoutHeader,
+                )));
+            }
+            if parsed.event_kind != EventKind::Metadata {
+                if state.revision == 0 {
+                    return Err(
+                        self.reject(EndReason::MediaRejected(MediaError::FrameBeforeHeader))
+                    );
+                }
+                if state.last_dts.is_some_and(|last| timestamp < last) {
+                    return Err(
+                        self.reject(EndReason::MediaRejected(MediaError::TimestampRegression))
+                    );
+                }
+                state.last_dts = Some(timestamp);
+                state.ended = parsed.event_kind == EventKind::SequenceEnd;
+            }
+        }
+        let permit = self
+            .budget
+            .clone()
+            .try_acquire_many_owned(data.len() as u32)
+            .map_err(|_| self.reject(EndReason::Backpressure))?;
+        let event_permit = self
+            .event_budget
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| self.reject(EndReason::Backpressure))?;
+        let size = data.len();
+        let event = MediaEvent {
+            identity: TrackIdentity {
+                session,
+                generation: self.generation,
+                track: parsed.track,
+            },
+            event_kind: parsed.event_kind,
+            codec: parsed.codec,
+            dts_ms: timestamp,
+            pts_ms: parsed.pts_ms,
+            configuration_revision: track.map_or(0, |track| track.revision),
+            body: data.as_ref().into(),
+            payload: parsed.payload,
+            _budget: permit,
+            _event_budget: event_permit,
+            _slot: self.slot.clone(),
+        };
+        self.sender.try_send(event).map_err(|error| {
+            self.reject(match error {
+                mpsc::error::TrySendError::Closed(_) => EndReason::ConsumerClosed,
+                mpsc::error::TrySendError::Full(_) => EndReason::Backpressure,
+            })
+        })?;
+        if let Some(track) = track {
+            self.tracks.insert(parsed.track, track);
+        }
+        let mut report = self.report.lock().unwrap_or_else(|e| e.into_inner());
+        report.received_events += 1;
+        report.received_bytes += size as u64;
+        report.track_count = self.tracks.len();
+        report.max_queued_bytes = report
+            .max_queued_bytes
+            .max(self.limits.max_queued_bytes - self.budget.available_permits());
+        self.status.send_replace(Activity {
+            published: true,
+            last_media: Instant::now(),
+        });
+        Ok(())
+    }
+}
+impl<A: Authorizer> SessionHandler for Handler<A> {
+    async fn on_publish(
+        &mut self,
+        stream_id: u32,
+        app: &str,
+        stream: &str,
+    ) -> Result<(), ServerSessionError> {
+        if self.session.is_some() {
+            return Err(self.reject(EndReason::AuthorizationRejected));
+        }
+        let session = self
+            .authorizer
+            .authorize(app, stream)
+            .await
+            .map_err(|()| self.reject(EndReason::AuthorizationRejected))?;
+        self.session = Some((stream_id, session));
+        self.status.send_replace(Activity {
+            published: true,
+            last_media: Instant::now(),
+        });
+        Ok(())
+    }
+    async fn on_unpublish(&mut self, stream_id: u32) -> Result<(), ServerSessionError> {
+        if self.session.is_none_or(|(id, _)| id != stream_id) {
+            return Err(self.reject(EndReason::AuthorizationRejected));
+        }
+        // Explizites Ende ist keine Freigabe für einen zweiten Publish derselben Verbindung.
+        Err(self.reject(EndReason::ExplicitStop))
+    }
+    async fn on_data(
+        &mut self,
+        stream_id: u32,
+        data: SessionData,
+    ) -> Result<(), ServerSessionError> {
+        match data {
+            SessionData::Audio { timestamp, data } => {
+                self.media(stream_id, MediaKind::Audio, timestamp, data)
+            }
+            SessionData::Video { timestamp, data } => {
+                self.media(stream_id, MediaKind::Video, timestamp, data)
+            }
+            SessionData::Amf0 { .. } => {
+                self.report
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .ignored_amf_messages += 1;
+                Ok(())
+            }
+        }
+    }
+    async fn on_unknown_message(
+        &mut self,
+        _: u32,
+        _: scuffle_rtmp::messages::UnknownMessage,
+    ) -> Result<(), ServerSessionError> {
+        Ok(())
+    }
+    async fn on_unknown_command(
+        &mut self,
+        _: u32,
+        _: scuffle_rtmp::command_messages::UnknownCommand<'_>,
+    ) -> Result<(), ServerSessionError> {
+        Ok(())
+    }
+}
+
+struct Admission {
+    slot: Arc<OwnedSemaphorePermit>,
+    start_deadline: Instant,
+}
+
+async fn run_connection<A: Authorizer>(
+    socket: TcpStream,
+    tls: Arc<ServerConfig>,
+    authorizer: Arc<A>,
+    limits: IngestLimits,
+    sender: mpsc::Sender<MediaEvent>,
+    report: Arc<Mutex<SessionReport>>,
+    admission: Admission,
+) -> SessionReport {
+    let deadline = admission.start_deadline;
+    let reason = match timeout_at(deadline, TlsAcceptor::from(tls).accept(socket)).await {
+        Err(_) => EndReason::StartTimeout,
+        Ok(Err(_)) => EndReason::TlsRejected,
+        Ok(Ok(socket)) => {
+            let (status, mut activity) = watch::channel(Activity {
+                published: false,
+                last_media: Instant::now(),
+            });
+            let generation = report.lock().unwrap_or_else(|e| e.into_inner()).generation;
+            let handler = Handler {
+                authorizer,
+                session: None,
+                generation,
+                tracks: HashMap::new(),
+                budget: Arc::new(Semaphore::new(limits.max_queued_bytes)),
+                sender,
+                status,
+                event_budget: Arc::new(Semaphore::new(limits.max_queued_events)),
+                slot: admission.slot,
+                report: report.clone(),
+                limits: limits.clone(),
+            };
+            match ServerSession::new(socket, handler).with_limits(limits.rtmp) {
+                Err(_) => EndReason::ProtocolRejected,
+                Ok(session) => {
+                    let future = session.run();
+                    tokio::pin!(future);
+                    loop {
+                        let current = *activity.borrow_and_update();
+                        let expiry = if current.published {
+                            current.last_media + limits.media_idle_timeout
+                        } else {
+                            deadline
+                        };
+                        tokio::select! {
+                            result = &mut future => {
+                                let saved = report.lock().unwrap_or_else(|e| e.into_inner()).reason;
+                                break match result {
+                                    Ok(_) => EndReason::PeerClosed,
+                                    Err(_) if saved != EndReason::ProtocolRejected => saved,
+                                    Err(scuffle_rtmp::error::RtmpError::Session(ServerSessionError::Timeout(_))) => EndReason::ProtocolTimeout,
+                                    Err(error) if error.is_client_closed() => EndReason::PeerClosed,
+                                    Err(_) => EndReason::ProtocolRejected,
+                                };
+                            }
+                            _ = sleep_until(expiry) => { break if current.published { EndReason::MediaTimeout } else { EndReason::StartTimeout }; }
+                            changed = activity.changed() => { if changed.is_err() { continue; } }
+                        }
+                    }
+                }
+            }
+        }
+    };
+    let mut final_report = report.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    final_report.reason = reason;
+    final_report
+}

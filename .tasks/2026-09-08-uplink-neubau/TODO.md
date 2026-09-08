@@ -28,11 +28,19 @@ Stand: 8. September 2026, nach Merge von PR #1 und PR #2 auf `main` (`001724fdac
 - [x] 13 Debug-/13 Release-Tests, Formatierung, Clippy, separates Cargo Audit und Gitleaks prüfen; nativen Rust-Review und Gate-ALLOW mit dokumentierter Aussagegrenze erhalten.
 - [x] Kleine künstliche Fixtures behalten und temporäre Medien löschen; H.264-Abhängigkeitsfehler und Begrenzung des Testadapters dokumentieren.
 - [x] [PR #2](https://github.com/EarlySalty/uplink/pull/2) mergen: `main` auf `001724fdacded263f16681ba0aec8e5f348de601`, Dateibaum identisch zu `32653ca0a74d3c6a886d0f1a9b700268953153d2` bestätigt.
-- [x] Erfolgreiche [Main-CI](https://github.com/EarlySalty/uplink/actions/runs/34221066802) nachweisen und beide Featurebranches lokal/remote löschen; nur `main` und ein Hauptworktree bleiben.
+- [x] Erfolgreiche [Main-CI](https://github.com/EarlySalty/uplink/actions/runs/34221066802) nachweisen und beide Featurebranches lokal/remote löschen; danach blieben zunächst nur `main` und ein Hauptworktree.
+
+## Lokaler RTMPS-Baustein
+
+- [x] Ausführbaren Rust-Eingang mit injizierter TLS-/Autorisierungskonfiguration, frischen Generationen und begrenzten Track-/Eventzuständen bauen.
+- [x] 22 Ingesttests und drei Beispieltests sowie echte FFmpeg-8-AV1-/H.264-plus-zwei-AAC-Übertragung prüfen; TLS-CA-/Hostname-Negativfälle und numerische URL-Grenze dokumentieren.
+- [x] Metadata-Tracklimit und fremde Codec-Revision mit roten Regressionstests beheben und unabhängig nachprüfen; [Nachweis](../../docs/rtmps-nachweis.md).
+- [x] Separaten [Sicherheitsreview](../../docs/review-security-rtmps.md) mit 59 gezielten Tests, drei Audits und Gitleaks abschließen.
+- [ ] Regulären Gate, GitHub-CI und Merge dieses Bausteins abschließen und tatsächlichen Stand nachtragen.
 
 ## Vollständiger Produktumfang
 
-- [ ] E-RTMP-/RTMPS-Eingang, Standard-OBS und getrenntes Audio technisch beweisen (A-01/A-02).
+- [ ] Lokal nachgewiesenen E-RTMP-/RTMPS-Eingang mit öffentlichem Broker und Standard-OBS verbinden; echte Live-/VOD-Rollen und freigegebene Profile beweisen (A-01/A-02).
 - [ ] Medienengine anhand der benötigten Kombination auswählen und integrieren.
 - [ ] Tatsächliche vier Plattformausgänge inklusive Kontorechten, Enhanced Broadcasting und vereinbartem Dual Format bauen (A-03/A-04).
 - [ ] Gemeinsame Encodes, unterschiedliche Audioauswahl und isolierte langsame Ziele im Betrieb messen (A-06).
