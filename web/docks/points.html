@@ -262,7 +262,7 @@ body.mehrere .karte .marke { display: block; }
   var ohneStatus = 0;
   var OHNE_STATUS_MAX = 3;
   var statusGesehen = false;
-  var gesehen = {};
+  var gesehen = Object.create(null);
   var gesehenReihe = [];
   var MAX_ZEILEN = 200;
   var sock = null;
@@ -270,7 +270,7 @@ body.mehrere .karte .marke { display: block; }
   var letzterStand = [];
   /* Belohnungen, die Twitch uns nicht verwalten laesst. Einmal abgelehnt,
      danach steht der Hinweis auf jeder weiteren Karte derselben Belohnung. */
-  var fremdeBelohnungen = {};
+  var fremdeBelohnungen = Object.create(null);
 
   function basis() { return location.pathname.replace(/\/dock\/[a-z-]+\/?$/, ""); }
   function wsUrl() {
@@ -301,6 +301,8 @@ body.mehrere .karte .marke { display: block; }
   /* Erledigte Karten bleiben nicht stehen: erst nach rechts raus, dann faellt
      die Luecke zu, damit die Liste darunter nicht springt. */
   function ausblenden(karte) {
+    if (karte.classList.contains("raus")) return;
+    karte.querySelectorAll("button").forEach(function (knopf) { knopf.disabled = true; });
     karte.classList.add("raus");
     setTimeout(function () {
       karte.style.height = karte.offsetHeight + "px";
@@ -324,6 +326,8 @@ body.mehrere .karte .marke { display: block; }
   }
 
   function setzen(e, karte, status, zustand, knoepfe) {
+    if (!karte.parentNode || karte.classList.contains("raus") || karte.getAttribute("data-laeuft") === "true") return;
+    karte.setAttribute("data-laeuft", "true");
     knoepfe.forEach(function (k) { k.disabled = true; });
     zustand.className = "zustand";
     zustand.textContent = status === "erfuellt" ? "wird erfüllt" : "wird abgelehnt";
@@ -334,8 +338,13 @@ body.mehrere .karte .marke { display: block; }
     }).then(function (r) {
       return r.json().then(function (j) { return { status: r.status, json: j }; }, function () { return { status: r.status, json: {} }; });
     }).then(function (a) {
+      // Ein externes Abschlussereignis ist verbindlich, auch wenn die Antwort
+      // auf unseren früheren Klick erst danach eintrifft.
+      if (!karte.parentNode || karte.classList.contains("raus")) return;
       if (a.status === 200 && a.json.ok) {
         melden((status === "erfuellt" ? "Erfüllt: " : "Abgelehnt: ") + (e.reward_title || "Belohnung"), status !== "erfuellt");
+        var bekannt = gesehen[einloesungKey(e)];
+        if (bekannt) bekannt.status = status === "erfuellt" ? "fulfilled" : "canceled";
         ausblenden(karte);
         return;
       }
@@ -348,10 +357,13 @@ body.mehrere .karte .marke { display: block; }
       }
       zustand.className = "zustand fehler";
       zustand.textContent = hinweis;
+      karte.removeAttribute("data-laeuft");
       knoepfe.forEach(function (k) { k.disabled = false; });
     }).catch(function () {
+      if (!karte.parentNode || karte.classList.contains("raus")) return;
       zustand.className = "zustand fehler";
       zustand.textContent = "keine Verbindung";
+      karte.removeAttribute("data-laeuft");
       knoepfe.forEach(function (k) { k.disabled = false; });
     });
   }
@@ -427,25 +439,61 @@ body.mehrere .karte .marke { display: block; }
     return div;
   }
 
+  function einloesungKey(e) {
+    // Die Ereignis-ID kann pro Status wechseln. Die Einlösung selbst bleibt
+    // über Plattform, Kanal und ihre fachliche ID dieselbe.
+    return JSON.stringify([e.platform || "", e.channel_id || "", e.redemption_id || ""]);
+  }
+
   function anhaengen(rahmen) {
     if (!rahmen || !rahmen.ereignis || rahmen.ereignis.typ !== "points") return;
     var e = rahmen.ereignis;
     if (typeof rahmen.id === "number" && rahmen.id > letzteId) letzteId = rahmen.id;
-    /* Erledigte gehoeren nicht in die Warteschlange. */
-    if ((e.status || "unfulfilled") !== "unfulfilled") return;
-    var key = e.dedupe_key || ((e.platform || "") + ":" + (e.redemption_id || ""));
-    if (gesehen[key]) return;
-    gesehen[key] = true;
-    gesehenReihe.push(key);
-    if (gesehenReihe.length > 2000) delete gesehen[gesehenReihe.shift()];
+    var status = e.status || "unfulfilled";
+    if (["unfulfilled", "fulfilled", "canceled", "cancelled"].indexOf(status) < 0) return;
+    var key = einloesungKey(e);
+    var vorher = gesehen[key];
+    // Ein verspäteter Nachlauf darf erledigte Einlösungen nicht wieder öffnen.
+    if (vorher && vorher.status !== "unfulfilled") return;
+    var inhalt = JSON.stringify(e);
+    if (vorher && vorher.inhalt === inhalt) return;
+    if (!vorher) {
+      gesehenReihe.push(key);
+      if (gesehenReihe.length > 2000) delete gesehen[gesehenReihe.shift()];
+    }
+    if (status !== "unfulfilled") {
+      gesehen[key] = { status: status, inhalt: inhalt };
+      if (vorher && vorher.karte && vorher.karte.parentNode === liste) ausblenden(vorher.karte);
+      return;
+    }
+    if (vorher && vorher.karte && vorher.karte.getAttribute("data-laeuft") === "true") return;
+    var karte = karteBauen(e);
+    gesehen[key] = { status: status, inhalt: inhalt, karte: karte };
+    if (vorher) {
+      if (vorher.karte && vorher.karte.parentNode === liste) liste.replaceChild(karte, vorher.karte);
+      return;
+    }
     if (leer) { leer.remove(); leer = null; }
     /* Wer nach unten gescrollt hat, liest gerade etwas. Neue Karten oben
        duerfen ihm den Text nicht unter dem Blick wegschieben. */
     var obenVorher = liste.scrollTop;
     var hoeheVorher = liste.scrollHeight;
-    liste.insertBefore(karteBauen(e), liste.firstChild);
+    liste.insertBefore(karte, liste.firstChild);
     while (liste.children.length > MAX_ZEILEN) liste.removeChild(liste.lastChild);
     if (obenVorher > 0) liste.scrollTop = obenVorher + (liste.scrollHeight - hoeheVorher);
+  }
+
+  function plattformHinweis(p) {
+    if (p.hinweis) return p.hinweis;
+    var texte = {
+      disconnected: "Nicht verbunden",
+      needs_reauth: "Bitte im Dashboard neu verbinden",
+      unavailable: "Verbindung ist nicht erreichbar",
+      connecting: "Verbindung wird aufgebaut",
+      connected: "Chat verbunden",
+      unsupported: "Chat ist noch nicht verfügbar"
+    };
+    return texte[p.zustand] || (p.verbunden ? "Chat verbunden" : "Chat nicht verbunden");
   }
 
   function pilleBauen(p) {
@@ -456,13 +504,14 @@ body.mehrere .karte .marke { display: block; }
     var punkt = document.createElement("span");
     punkt.className = "punkt";
     span.appendChild(punkt);
-    span.title = p.verbunden ? "Stream läuft" : (p.hinweis || "Stream läuft gerade nicht");
+    span.title = plattformHinweis(p);
+    if (!p.verbunden) span.appendChild(document.createTextNode(" · " + span.title));
     return span;
   }
 
   function statusAnzeigen(stand) {
     if (stand) letzterStand = stand;
-    var sichtbar = letzterStand.filter(function (p) { return p.eingerichtet || p.verbunden; });
+    var sichtbar = letzterStand.filter(function (p) { return p.eingerichtet || p.verbunden || p.hinweis || (p.zustand && p.zustand !== "disconnected"); });
     if (!stand) {
       sichtbar = sichtbar.map(function (p) {
         return { platform: p.platform, eingerichtet: true, verbunden: false, hinweis: "Verbindung zu Uplink kommt gerade zurück", fehlende_scopes: p.fehlende_scopes };

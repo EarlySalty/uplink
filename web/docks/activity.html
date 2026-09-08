@@ -287,7 +287,7 @@ body.mehrere .eintrag .marke { display: block; }
   var ohneStatus = 0;
   var OHNE_STATUS_MAX = 3;
   var statusGesehen = false;
-  var gesehen = {};
+  var gesehen = Object.create(null);
   var gesehenReihe = [];
   var MAX_ZEILEN = 200;
   /* Beim Oeffnen nur der Nachlauf der letzten Viertelstunde: was laenger her
@@ -547,14 +547,23 @@ body.mehrere .eintrag .marke { display: block; }
     var alter = Date.now() - new Date(e.occurred_at).getTime();
     if (isNaN(alter)) alter = 0;
     if (Date.now() < nachlaufBis && alter > NACHLAUF_MS) return;
-    var key = e.dedupe_key || ((e.platform || "") + ":" + (e.channel_id || "") + ":" + e.art + ":" + e.occurred_at);
-    if (gesehen[key]) return;
-    gesehen[key] = true;
-    gesehenReihe.push(key);
-    if (gesehenReihe.length > 2000) delete gesehen[gesehenReihe.shift()];
+    var key = JSON.stringify([e.platform || "", e.channel_id || "", e.dedupe_key || [e.art, e.occurred_at]]);
+    var vorher = gesehen[key];
+    var inhalt = JSON.stringify(e);
+    if (vorher && vorher.inhalt === inhalt) return;
     var eintrag = eintragBauen(e, alter <= FRISCH_MS);
     if (!eintrag) return;
+    gesehen[key] = { inhalt: inhalt, eintrag: eintrag };
+    if (!vorher) {
+      gesehenReihe.push(key);
+      if (gesehenReihe.length > 2000) delete gesehen[gesehenReihe.shift()];
+    }
     if (filterAktiv !== "alle" && eintrag.getAttribute("data-gruppe") !== filterAktiv) eintrag.style.display = "none";
+    if (vorher) {
+      if (vorher.eintrag && vorher.eintrag.parentNode === liste) liste.replaceChild(eintrag, vorher.eintrag);
+      leerPruefen();
+      return;
+    }
     if (leer) { leer.remove(); leer = null; leertext = null; }
     /* Wer nach unten gescrollt hat, liest gerade etwas. Neue Zeilen oben
        duerfen ihm den Text nicht unter dem Blick wegschieben. */
@@ -573,6 +582,19 @@ body.mehrere .eintrag .marke { display: block; }
     "channel:read:redemptions": "Kanalpunkte"
   };
 
+  function plattformHinweis(p) {
+    if (p.hinweis) return p.hinweis;
+    var texte = {
+      disconnected: "Nicht verbunden",
+      needs_reauth: "Bitte im Dashboard neu verbinden",
+      unavailable: "Verbindung ist nicht erreichbar",
+      connecting: "Verbindung wird aufgebaut",
+      connected: "Chat verbunden",
+      unsupported: "Chat ist noch nicht verfügbar"
+    };
+    return texte[p.zustand] || (p.verbunden ? "Chat verbunden" : "Chat nicht verbunden");
+  }
+
   function pilleBauen(p) {
     var span = document.createElement("span");
     span.className = "pille" + (p.verbunden ? " live" : "");
@@ -581,13 +603,14 @@ body.mehrere .eintrag .marke { display: block; }
     var punkt = document.createElement("span");
     punkt.className = "punkt";
     span.appendChild(punkt);
-    span.title = p.verbunden ? "Stream läuft" : (p.hinweis || "Stream läuft gerade nicht");
+    span.title = plattformHinweis(p);
+    if (!p.verbunden) span.appendChild(document.createTextNode(" · " + span.title));
     return span;
   }
 
   function statusAnzeigen(stand) {
     if (stand) letzterStand = stand;
-    var sichtbar = letzterStand.filter(function (p) { return p.eingerichtet || p.verbunden; });
+    var sichtbar = letzterStand.filter(function (p) { return p.eingerichtet || p.verbunden || p.hinweis || (p.zustand && p.zustand !== "disconnected"); });
     if (!stand) {
       sichtbar = sichtbar.map(function (p) {
         return { platform: p.platform, eingerichtet: true, verbunden: false, hinweis: "Verbindung zu Uplink kommt gerade zurück", fehlende_scopes: p.fehlende_scopes };
