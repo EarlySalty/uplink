@@ -24,4 +24,9 @@ jobs:
         run: cargo build --workspace --release --locked
       - name: Lokales Planszenario
         run: cargo run --release --locked -p uplink-cli -- plan --config config/plan-beispiel.toml
-
+      - name: Isolierter E-FLV-Interoperabilitätsnachweis
+        run: |
+          cargo fmt --manifest-path experiments/scuffle-probe/Cargo.toml -- --check
+          cargo clippy --manifest-path experiments/scuffle-probe/Cargo.toml --all-targets --locked -- -D warnings
+          cargo test --manifest-path experiments/scuffle-probe/Cargo.toml --locked
+          cargo test --manifest-path experiments/scuffle-probe/Cargo.toml --release --locked

@@ -1,0 +1,74 @@
+{
+  "schema_version": 1,
+  "purpose": "Synthetischer Offline-Nachweis; keine Produktprofile oder Live-Freigabe",
+  "generated_on": "2026-09-08",
+  "generation_instructions": "../README.md#testdaten-neu-erzeugen",
+  "tools": [
+    {
+      "role": "source_ffmpeg",
+      "version": "6.1.1-3ubuntu5",
+      "sha256": "ed16af623947494a72e284b6eb8ff225f2da22b38b5d5069c2fd4b4ba3384e41"
+    },
+    {
+      "role": "mux_ffmpeg",
+      "version": "n8.1.2-50-g1a748fe2cd-20260831",
+      "sha256": "ad7a8c8e8fe4f50972f32f63705cfcc57f44cd3531f57aa8defe388372242f5e"
+    },
+    {
+      "role": "reference_ffprobe",
+      "version": "n8.1.2-50-g1a748fe2cd-20260831",
+      "sha256": "150bfd75016992a8d495a5f5c16cd93387a21c059f4309ed1e6342659aef48b3"
+    }
+  ],
+  "source": {
+    "duration_seconds": 2,
+    "video": "testsrc2 320x180 25 fps",
+    "audio": [
+      "sine 440 Hz, mono 48000 Hz, AAC 64 kbit/s",
+      "sine 880 Hz, mono 48000 Hz, AAC 64 kbit/s"
+    ],
+    "timestamp_unit": "1/1000 second"
+  },
+  "fixture_specific_mapping": [
+    {
+      "ffprobe_index": 0,
+      "media_kind": "video",
+      "flv_track_id": 0,
+      "packets": 50
+    },
+    {
+      "ffprobe_index": 1,
+      "media_kind": "audio",
+      "flv_track_id": 0,
+      "packets": 95
+    },
+    {
+      "ffprobe_index": 2,
+      "media_kind": "audio",
+      "flv_track_id": 1,
+      "packets": 95
+    }
+  ],
+  "files": [
+    {
+      "path": "av1.flv",
+      "bytes": 63632,
+      "sha256": "d8525e4c5eb6c64e44ec6903a806a195c6d1871d6d11d337d0331839cb82bf5a"
+    },
+    {
+      "path": "h264.flv",
+      "bytes": 145516,
+      "sha256": "d45a6245e7836a51098491098df1cb46e557f2de0c464318a2749ecf043a8b4b"
+    },
+    {
+      "path": "av1.ffprobe.json",
+      "bytes": 56966,
+      "sha256": "3971105e08b73546edee1a0f419dc2a7d0b7ed95475e773c9489212ce4abaae0"
+    },
+    {
+      "path": "h264.ffprobe.json",
+      "bytes": 57055,
+      "sha256": "2df70041f8865a3a67266472dc93706826fff85b1293f8787d0b988675892543"
+    }
+  ]
+}
