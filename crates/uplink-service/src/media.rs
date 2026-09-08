@@ -56,6 +56,9 @@ impl SessionProcessor for Coordinator {
         first: MediaEvent,
         events: tokio::sync::mpsc::Receiver<MediaEvent>,
     ) -> Result<(), &'static str> {
+        if self.state.config.test_ingest.is_some() {
+            return crate::test_ingest::receive(first, events).await;
+        }
         let reservation = first
             .authorization_retention()
             .and_then(|value| value.downcast::<crate::registry::Reservation>().ok())

@@ -113,10 +113,15 @@ async fn infisical_reads_only_supplied_memory_fd_and_never_follows_redirects() {
     let mut config = Config::parse(include_str!("../../../config/uplink-beispiel.toml")).unwrap();
     config.infisical.credential_fd = memory.as_raw_fd() as u32;
     config.infisical.base_url = format!("http://{address}");
-    let secrets = fetch(&config).await.unwrap();
+    let reader = uplink_service::secrets::SecretReader::new(&config)
+        .await
+        .unwrap();
+    let secrets = reader.fetch().await.unwrap();
     assert!(secrets.api.matches(b"synthetic-api"));
     assert!(secrets.encryption.matches(&[7; 32]));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(reader.fetch().await.unwrap().encryption.matches(&[7; 32]));
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
     server.abort();
     let _ = server.await;
     let target_count = Arc::new(AtomicUsize::new(0));

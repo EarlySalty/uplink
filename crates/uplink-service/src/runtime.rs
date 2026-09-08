@@ -36,6 +36,9 @@ impl Authorizer for ServiceAuthorizer {
             .authenticate_ingest(stream)
             .await
             .map_err(|_| ())?;
+        if !self.state.config.permits_tenant(tenant) {
+            return Err(());
+        }
         let reservation = Arc::new(self.state.registry.reserve(tenant).map_err(|_| ())?);
         let session = AuthorizedSession::new(tenant, reservation.id()).map_err(|_| ())?;
         self.reservations
