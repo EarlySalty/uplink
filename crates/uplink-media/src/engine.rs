@@ -354,7 +354,7 @@ async fn run(
                 let output_status = status.clone();
                 readers.push(tokio::spawn(async move {
                     let stream = accept_worker(&listener, pid, limits.startup_timeout).await?;
-                    let mut reader = FlvReader::new(stream, limits.max_tag_bytes);
+                    let mut reader = FlvReader::worker_output(stream, &limits);
                     while let Some(tag) = reader.next().await? {
                         distribute(Arc::new(tag), Some(index), &output_sinks, &limits);
                         update_status(&output_sinks, &output_status);

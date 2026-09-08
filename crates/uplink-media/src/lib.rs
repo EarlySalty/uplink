@@ -128,8 +128,9 @@ pub struct MediaLimits {
     pub worker_threads: usize,
 }
 impl MediaLimits {
-    /// Eingang und FFmpeg behalten ihre Grenze. Nur die Drahtumschrift erhält
-    /// Platz für den OneTrack-Header; die Queue zählt weiterhin reale Bytes.
+    /// Eingang und neu codiertes Video behalten ihre Grenze. Die Drahtumschrift
+    /// erhält Platz für OneTrack; kopiertes AAC behält ihn auch hinter FFmpeg.
+    /// Die Queue zählt weiterhin reale Bytes.
     pub(crate) fn routing_limits(&self) -> Self {
         let mut routed = self.clone();
         routed.max_tag_bytes = self.max_tag_bytes.saturating_add(5).min(0xff_ffff);
