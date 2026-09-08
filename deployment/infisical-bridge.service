@@ -1,0 +1,44 @@
+[Unit]
+Description=Geschützter lokaler Infisical-Zugang für Uplink
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=exec
+User=root
+Group=root
+ExecStart=/opt/uplink/current/bin/uplink-infisical-bridge --config /etc/uplink/infisical-bridge.toml
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=5
+RuntimeDirectory=uplink-infisical
+RuntimeDirectoryMode=0711
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=net
+LockPersonality=yes
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_PTRACE
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET
+IPAddressDeny=any
+IPAddressAllow=localhost
+MemoryMax=96M
+TasksMax=64
+LimitCORE=0
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

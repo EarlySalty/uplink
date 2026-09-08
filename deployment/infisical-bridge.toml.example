@@ -1,0 +1,5 @@
+# Root gehört diese normale Konfiguration, keine Gruppen-/Fremdschreibrechte.
+socket_path = "/run/uplink-infisical/api.sock"
+container_name = "infisical-backend"
+# TLS-Provider, regulärer Uplink, ausschließlich neuer Dashboard-Uplink-FD9-Pfad.
+allowed_client_uids = [0, 1000, 991]

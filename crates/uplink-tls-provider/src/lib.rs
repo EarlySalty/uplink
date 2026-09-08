@@ -31,6 +31,7 @@ pub enum Error {
     Certificate,
     KeyMismatch,
     Transport,
+    Peer,
     Rejected(u16),
     Response,
     Verification,
@@ -38,6 +39,12 @@ pub enum Error {
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Self::Rejected(status) = self {
+            return write!(
+                f,
+                "Infisical hat den TLS-Abgleich mit HTTP {status} abgewiesen."
+            );
+        }
         f.write_str(match self {
             Self::Configuration => "TLS-Provider-Konfiguration ist ungültig.",
             Self::File => "Eine konfigurierte Quelldatei ist nicht lesbar.",
@@ -50,6 +57,7 @@ impl fmt::Display for Error {
             }
             Self::KeyMismatch => "Zertifikat und privater Schlüssel passen nicht zusammen.",
             Self::Transport => "Infisical ist nicht rechtzeitig erreichbar.",
+            Self::Peer => "Infisical-Unixsocket ist nicht als geschützte Gegenstelle bestätigt.",
             Self::Rejected(_) => "Infisical hat den TLS-Abgleich abgewiesen.",
             Self::Response => "Infisical-Antwort ist ungültig oder zu groß.",
             Self::Verification => "Das zurückgelesene TLS-Paar bestätigt den Abgleich nicht.",
@@ -83,7 +91,7 @@ pub struct Config {
     pub project_id: String,
     pub environment: String,
     pub secret_path: String,
-    pub infisical_port: u16,
+    pub infisical_socket: PathBuf,
 }
 impl Config {
     fn validate(&self) -> Result<()> {
@@ -95,7 +103,7 @@ impl Config {
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
             || self.hostname.parse::<std::net::IpAddr>().is_ok()
-            || self.infisical_port == 0
+            || !self.infisical_socket.is_absolute()
             || self.project_id.len() != 36
             || self.project_id.bytes().enumerate().any(|(i, b)| {
                 if [8, 13, 18, 23].contains(&i) {
@@ -291,13 +299,15 @@ struct Vault {
 }
 impl Vault {
     fn new(config: &Config, token: &Secret) -> Result<Self> {
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
+        let client = uplink_infisical_transport::client_builder(&config.infisical_socket, 0)
+            .map_err(|_| Error::Peer)?
             .connect_timeout(Duration::from_secs(3))
             .timeout(Duration::from_secs(5))
             .build()
             .map_err(|_| Error::Transport)?;
+        Self::with_client(config, token, client)
+    }
+    fn with_client(config: &Config, token: &Secret, client: reqwest::Client) -> Result<Self> {
         let mut authorization = Zeroizing::new(b"Bearer ".to_vec());
         authorization.extend_from_slice(&token.0);
         let mut authorization = reqwest::header::HeaderValue::from_bytes(&authorization)
@@ -306,7 +316,7 @@ impl Vault {
         Ok(Self {
             client,
             authorization,
-            base: format!("http://127.0.0.1:{}", config.infisical_port),
+            base: uplink_infisical_transport::BASE_URL.into(),
             project: config.project_id.clone(),
             environment: config.environment.clone(),
             path: config.secret_path.clone(),
