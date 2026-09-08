@@ -71,7 +71,7 @@ impl Store {
         // kein CLI-, HTTP-, Config- oder Datenbanktext wird als SQL eingesetzt.
         let guarded = format!("DO $uplink_migration$ BEGIN
             IF EXISTS(SELECT 1 FROM relay.uplink_schema_migrations WHERE name='{name}' AND checksum<>'{checksum}') THEN
-                RAISE EXCEPTION 'Uplink-Migrationsprüfsumme stimmt nicht';
+                RAISE EXCEPTION 'Uplink-Migrationsprüfsumme stimmt nicht' USING ERRCODE = 'UL001';
             END IF;
             IF NOT EXISTS(SELECT 1 FROM relay.uplink_schema_migrations WHERE name='{name}') THEN
                 {sql}
@@ -168,7 +168,12 @@ impl Store {
                 tokio::pin!(query);
                 match timeout_at(deadline, &mut query).await {
                     Ok(Ok(rows)) => rows,
-                    Ok(Err(_)) => {
+                    Ok(Err(error)) => {
+                        // Eigener SQLSTATE des versionierten Migrationsguards;
+                        // niemals Servertexte oder SQL-Details weiterreichen.
+                        if error.code().is_some_and(|code| code.code() == "UL001") {
+                            return Err("Uplink-Migrationsprüfsumme stimmt nicht. Release und Migrationsledger prüfen; Start abgebrochen.");
+                        }
                         return Err("Datenbankanfrage fehlgeschlagen oder Frist überschritten.");
                     }
                     Err(_) => {

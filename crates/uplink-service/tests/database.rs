@@ -200,11 +200,24 @@ async fn release_migrations_are_repeatable_and_keep_existing_audio_choice() {
             .is_err()
     );
     state.store.query("UPDATE relay.uplink_schema_migrations SET checksum='changed' WHERE name='20260908_twitch_audio_mode'", &[]).await.unwrap();
-    assert!(
-        uplink_service::migrations::apply(&state.store)
-            .await
-            .is_err(),
+    assert_eq!(
+        uplink_service::migrations::apply(&state.store).await,
+        Err(
+            "Uplink-Migrationsprüfsumme stimmt nicht. Release und Migrationsledger prüfen; Start abgebrochen."
+        ),
         "Geänderte Migration bleibt fatal"
+    );
+    assert_eq!(
+        state
+            .store
+            .query(
+                "DO $$ BEGIN RAISE EXCEPTION 'Uplink-Migrationsprüfsumme stimmt nicht'; END $$",
+                &[]
+            )
+            .await
+            .err(),
+        Some("Datenbankanfrage fehlgeschlagen oder Frist überschritten."),
+        "Ein generischer Datenbankfehler darf nicht anhand seines Texts zum Migrationsfehler werden"
     );
     database.stop().await;
 }
@@ -1019,6 +1032,36 @@ async fn cancelled_http_request_cannot_commit_a_late_rotation() {
     assert_eq!(after, before);
     drop(locker);
     driver.await.unwrap();
+    database.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "Benötigt isolierte PostgreSQL-16-Testinstanz."]
+async fn destination_status_applies_runtime_host_and_transport_policy() {
+    let (database, state) = fixture().await;
+    state.store.query("INSERT INTO relay.destinations(streamer_id,platform,rtmp_url,stream_key_enc,enabled) VALUES(11,'twitch','rtmps://publish.invalid/app',$1,true),(11,'kick','rtmp://live-video.net/app',$1,true),(11,'youtube','rtmps://a.rtmps.youtube.com/live2',$1,true),(11,'unknown','rtmps://publish.invalid/app',$1,true)", &[&vec![0_u8]]).await.unwrap();
+    let response = router(state.clone())
+        .oneshot(request(
+            "GET",
+            "/v1/me/destinations?streamer_id=11",
+            Body::empty(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 16384).await.unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["destinations"].as_array().unwrap().len(), 4);
+    for output in value["destinations"].as_array().unwrap() {
+        let platform = output["platform"].as_str().unwrap();
+        let blocked = platform != "youtube";
+        assert_eq!(output["blocked"], blocked, "{platform}");
+        if blocked {
+            assert_eq!(output["rtmp_url"], "");
+            assert_eq!(output["output_state"], "failed");
+            assert!(output["error"].is_string());
+        }
+    }
     database.stop().await;
 }
 

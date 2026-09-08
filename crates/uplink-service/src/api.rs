@@ -536,8 +536,16 @@ async fn destinations(
             )
         };
         let endpoint = zeroize::Zeroizing::new(row.try_get::<_, String>(1).map_err(|_| invalid())?);
-        let blocked = crate::destinations::public_endpoint(&endpoint).is_err();
         let platform = row.try_get::<_, String>(0).map_err(|_| invalid())?;
+        let endpoint_error = state
+            .config
+            .platforms
+            .iter()
+            .find(|policy| policy.name == platform)
+            .ok_or("Für das Ziel fehlt die geprüfte Plattformkonfiguration.")
+            .and_then(|policy| crate::destinations::runtime_endpoint(&platform, &endpoint, policy))
+            .err();
+        let blocked = endpoint_error.is_some();
         let (output_state, reason) = output_status(sessions.first(), &platform, blocked);
         let active_profile =
             crate::media_status::active_profile(sessions.first(), &platform, output_state);
@@ -562,7 +570,7 @@ async fn destinations(
         };
         let active_audio =
             crate::media_status::active_audio_mode(sessions.first(), &platform, output_state);
-        outputs.push(json!({"platform":platform,"connection_generation":row.try_get::<_,i64>(7).map_err(|_|invalid())?,"rtmp_url":if blocked {""} else {endpoint.as_str()},"enabled":row.try_get::<_,bool>(2).map_err(|_|invalid())?,"blocked":blocked,"error":if blocked {Some("Gespeicherte Zieladresse ist gesperrt; Serveradresse und Zugang müssen getrennt eingerichtet werden.")} else {None},"requested":{"width":row.try_get::<_,Option<i32>>(3).map_err(|_|invalid())?,"height":row.try_get::<_,Option<i32>>(4).map_err(|_|invalid())?,"fps":row.try_get::<_,Option<i32>>(5).map_err(|_|invalid())?,"bitrate_kbps":row.try_get::<_,Option<i32>>(6).map_err(|_|invalid())?},"active_profile":active_profile,"twitch_audio_mode":requested_audio,"effective_audio_mode":effective_audio,"active_audio_mode":active_audio,"output_state":output_state,"reason":reason,"publication_confirmed":false}));
+        outputs.push(json!({"platform":platform,"connection_generation":row.try_get::<_,i64>(7).map_err(|_|invalid())?,"rtmp_url":if blocked {""} else {endpoint.as_str()},"enabled":row.try_get::<_,bool>(2).map_err(|_|invalid())?,"blocked":blocked,"error":endpoint_error,"requested":{"width":row.try_get::<_,Option<i32>>(3).map_err(|_|invalid())?,"height":row.try_get::<_,Option<i32>>(4).map_err(|_|invalid())?,"fps":row.try_get::<_,Option<i32>>(5).map_err(|_|invalid())?,"bitrate_kbps":row.try_get::<_,Option<i32>>(6).map_err(|_|invalid())?},"active_profile":active_profile,"twitch_audio_mode":requested_audio,"effective_audio_mode":effective_audio,"active_audio_mode":active_audio,"output_state":output_state,"reason":reason,"publication_confirmed":false}));
     }
     Ok(Json(json!({"destinations": outputs})))
 }
