@@ -131,6 +131,11 @@ impl MediaEngine {
         let initial = MediaStatus {
             encode_groups: graph.profiles.len(),
             video_decoders: usize::from(!graph.profiles.is_empty()),
+            graph: routes
+                .iter()
+                .zip(&graph.routes)
+                .map(|(route, routing)| graph.describe_route(routing, &route.target.id))
+                .collect(),
             outputs: routes
                 .iter()
                 .zip(&graph.routes)

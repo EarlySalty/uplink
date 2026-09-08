@@ -4,6 +4,7 @@ pub mod config;
 pub mod crypto;
 pub mod destinations;
 pub mod media;
+mod media_status;
 pub mod registry;
 pub mod runtime;
 pub mod secrets;

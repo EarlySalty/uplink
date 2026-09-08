@@ -37,6 +37,50 @@ pub(crate) struct Graph {
 }
 
 impl Graph {
+    pub(crate) fn describe_route(&self, route: &Routing, id: &str) -> crate::OutputGraph {
+        crate::OutputGraph {
+            id: id.to_owned(),
+            profile_origin: "running_graph",
+            video: route
+                .video
+                .iter()
+                .map(|(group, wire)| crate::VideoProcessing {
+                    wire_track: *wire,
+                    mode: if group.is_some() { "encode" } else { "copy" },
+                    encode_group: *group,
+                    profile: group.and_then(|group| self.profiles.get(group)).map(|p| {
+                        crate::ProcessingProfile {
+                            width: p.video.width,
+                            height: p.video.height,
+                            fps_numerator: p.video.fps.numerator(),
+                            fps_denominator: p.video.fps.denominator(),
+                            codec: match p.video.codec {
+                                Codec::H264 => "h264",
+                                Codec::Av1 => "av1",
+                                Codec::Hevc => "hevc",
+                            },
+                            target_bitrate_kbps: p.video.rate.target_kbps,
+                            keyframe_interval_frames: p.video.gop.keyframe_interval_frames,
+                        }
+                    }),
+                })
+                .collect(),
+            audio: route
+                .audio
+                .iter()
+                .filter_map(|(index, destination)| {
+                    self.input_audio
+                        .iter()
+                        .find(|(_, value)| *value == index)
+                        .map(|(wire, _)| crate::AudioProcessing {
+                            source_wire_track: wire.wire_id,
+                            destination_wire_track: *destination,
+                        })
+                })
+                .collect(),
+        }
+    }
+
     pub(crate) fn build(spec: &SessionSpec) -> Result<Self> {
         let source = spec.input.source.as_ref().ok_or(MediaError::MissingTrack)?;
         let plan = uplink_core::plan(&spec.input).map_err(|_| MediaError::InvalidPlan)?;
@@ -981,5 +1025,35 @@ mod tests {
             graph.routes[2].failure,
             Some(MediaError::UnsupportedProfile)
         );
+    }
+
+    #[test]
+    fn processing_description_excludes_rejected_profiles_and_keeps_audio_wire_roles() {
+        let graph = Graph::observed(
+            &source(),
+            &[
+                output("missing-vod", 0, Some(12)),
+                output("healthy", 1, Some(0)),
+            ],
+        )
+        .unwrap();
+        let rejected = graph.describe_route(&graph.routes[0], "missing-vod");
+        assert!(rejected.video.is_empty());
+        let healthy = graph.describe_route(&graph.routes[1], "healthy");
+        assert_eq!(healthy.video.len(), 1);
+        assert_eq!(healthy.video[0].mode, "encode");
+        let profile = healthy.video[0].profile.as_ref().unwrap();
+        assert_eq!(profile.width, graph.profiles[0].video.width);
+        assert_eq!(
+            profile.target_bitrate_kbps,
+            graph.profiles[0].video.rate.target_kbps
+        );
+        assert_eq!(healthy.audio[0].source_wire_track, 1);
+        assert_eq!(healthy.audio[0].destination_wire_track, 0);
+        assert_eq!(healthy.audio[1].source_wire_track, 0);
+        assert_eq!(healthy.audio[1].destination_wire_track, 1);
+        let encoded = serde_json::to_value(healthy).unwrap();
+        assert_eq!(encoded["profile_origin"], "running_graph");
+        assert!(encoded.get("measured_bitrate_kbps").is_none());
     }
 }

@@ -304,6 +304,42 @@ pub struct MediaStatus {
     pub encode_groups: usize,
     pub video_decoders: usize,
     pub outputs: Vec<OutputStatus>,
+    /// Tatsächlich angelegter Mediengraph. Keine gemessene Bitrate und keine
+    /// Plattformbestätigung; aktive Verwendung ergibt sich aus OutputStatus.
+    pub graph: Vec<OutputGraph>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OutputGraph {
+    pub id: String,
+    pub profile_origin: &'static str,
+    pub video: Vec<VideoProcessing>,
+    pub audio: Vec<AudioProcessing>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct VideoProcessing {
+    pub wire_track: u8,
+    pub mode: &'static str,
+    pub encode_group: Option<usize>,
+    pub profile: Option<ProcessingProfile>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProcessingProfile {
+    pub width: u32,
+    pub height: u32,
+    pub fps_numerator: u32,
+    pub fps_denominator: u32,
+    pub codec: &'static str,
+    pub target_bitrate_kbps: u32,
+    pub keyframe_interval_frames: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AudioProcessing {
+    pub source_wire_track: u8,
+    pub destination_wire_track: u8,
 }
 
 #[derive(Debug, Serialize)]

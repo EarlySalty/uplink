@@ -1,0 +1,69 @@
+# Normale Konfiguration für den kontrollierten Wechsel derselben rs-relay.service.
+# Diese Datei enthält keine Zugangsdaten. Die Aktivierung erfolgt mit dem Release.
+api_bind = "127.0.0.1:8891"
+ingest_bind = "0.0.0.0:1935"
+public_ingest_url = "rtmps://deutsche-deadlock-community.de:1935/live"
+dock_base_url = "https://deutsche-deadlock-community.de/uplink"
+max_sessions = 4
+max_sessions_per_tenant = 1
+database_max_queries = 4
+request_timeout_seconds = 10
+tls_reload_seconds = 60
+
+[infisical]
+base_url = "http://127.0.0.1:8080"
+project_id = "2f5df3ca-12e5-4ae1-abf2-ca7fbd841705"
+environment = "prod"
+secret_path = "/"
+credential_fd = 5
+
+[chat]
+bot_base_url = "http://127.0.0.1:8769"
+allowed_origins = ["https://deutsche-deadlock-community.de"]
+max_users = 128
+max_sockets_per_user = 8
+idle_timeout_seconds = 120
+
+[tls]
+source = "infisical"
+certificate_secret = "UPLINK_TLS_CERTIFICATE"
+private_key_secret = "UPLINK_TLS_PRIVATE_KEY"
+
+[media]
+ffmpeg = "/opt/uplink/media/ffmpeg8-c733b4b2/ffmpeg"
+ffprobe = "/opt/uplink/media/ffmpeg8-c733b4b2/ffprobe"
+work_directory = "/run/user/1000/uplink-media"
+max_event_bytes = 2097152
+max_queued_bytes = 16777216
+max_queued_events = 512
+max_tracks = 8
+live_audio_track = 0
+vod_audio_track = 1
+
+[[platforms]]
+name = "twitch"
+allowed_hosts = ["live.twitch.tv", "ingest.global-contribute.live-video.net"]
+allow_unencrypted = false
+video_codec = "h264"
+use_vod_audio = true
+
+[[platforms]]
+name = "youtube"
+allowed_hosts = ["a.rtmps.youtube.com", "b.rtmps.youtube.com"]
+allow_unencrypted = false
+video_codec = "h264"
+use_vod_audio = false
+
+[[platforms]]
+name = "kick"
+allowed_hosts = ["fa723fc1b171.global-contribute.live-video.net"]
+allow_unencrypted = false
+video_codec = "h264"
+use_vod_audio = false
+
+[[platforms]]
+name = "tiktok"
+allowed_hosts = ["push-rtmp-f5-tt04.tiktokcdn-eu.com"]
+allow_unencrypted = false
+video_codec = "h264"
+use_vod_audio = false

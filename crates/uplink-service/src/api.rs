@@ -495,7 +495,9 @@ async fn destinations(
         let blocked = crate::destinations::public_endpoint(&endpoint).is_err();
         let platform = row.try_get::<_, String>(0).map_err(|_| invalid())?;
         let (output_state, reason) = output_status(sessions.first(), &platform, blocked);
-        outputs.push(json!({"platform":platform,"rtmp_url":if blocked {""} else {endpoint.as_str()},"enabled":row.try_get::<_,bool>(2).map_err(|_|invalid())?,"blocked":blocked,"error":if blocked {Some("Gespeicherte Zieladresse ist gesperrt; Serveradresse und Zugang müssen getrennt eingerichtet werden.")} else {None},"requested":{"width":row.try_get::<_,Option<i32>>(3).map_err(|_|invalid())?,"height":row.try_get::<_,Option<i32>>(4).map_err(|_|invalid())?,"fps":row.try_get::<_,Option<i32>>(5).map_err(|_|invalid())?,"bitrate_kbps":row.try_get::<_,Option<i32>>(6).map_err(|_|invalid())?},"active_profile":null,"output_state":output_state,"reason":reason,"publication_confirmed":false}));
+        let active_profile =
+            crate::media_status::active_profile(sessions.first(), &platform, output_state);
+        outputs.push(json!({"platform":platform,"rtmp_url":if blocked {""} else {endpoint.as_str()},"enabled":row.try_get::<_,bool>(2).map_err(|_|invalid())?,"blocked":blocked,"error":if blocked {Some("Gespeicherte Zieladresse ist gesperrt; Serveradresse und Zugang müssen getrennt eingerichtet werden.")} else {None},"requested":{"width":row.try_get::<_,Option<i32>>(3).map_err(|_|invalid())?,"height":row.try_get::<_,Option<i32>>(4).map_err(|_|invalid())?,"fps":row.try_get::<_,Option<i32>>(5).map_err(|_|invalid())?,"bitrate_kbps":row.try_get::<_,Option<i32>>(6).map_err(|_|invalid())?},"active_profile":active_profile,"output_state":output_state,"reason":reason,"publication_confirmed":false}));
     }
     Ok(Json(json!({"destinations": outputs})))
 }
@@ -525,13 +527,25 @@ fn output_status(
     match output.map(|o| &o["state"]) {
         Some(value) if value.get("failed").is_some() => (
             "failed",
-            Some("Ausgang wurde abgewiesen oder unterbrochen."),
+            Some(crate::media_status::failure_reason(&value["failed"])),
         ),
         Some(value) if value == "ended" || value == "local_end_unconfirmed" => (
             "finished",
             Some("Lokaler Versand beendet; Plattformannahme ist nicht bestätigt."),
         ),
-        Some(value) if value == "publishing" && session.active => ("sending", None),
+        Some(value) if value == "publishing" && session.active => {
+            if output
+                .and_then(|o| o["received_events"].as_u64())
+                .is_some_and(|events| events > 0)
+            {
+                ("sending", None)
+            } else {
+                (
+                    "starting",
+                    Some("Zielverbindung bestätigt; Medienversand wird erwartet."),
+                )
+            }
+        }
         Some(value) if value == "starting" && session.active => ("starting", None),
         _ if session.error.is_some() => ("failed", session.error),
         _ if !session.active => (

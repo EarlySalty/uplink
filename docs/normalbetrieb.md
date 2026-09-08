@@ -1,0 +1,21 @@
+# Normaler Streamingbetrieb
+
+Der vorbereitete normale Anschluss verwendet dieselbe User-Unit `rs-relay.service`, API `127.0.0.1:8891` und ausschließlich `rtmps://deutsche-deadlock-community.de:1935/live`. OBS erhält Server und vorhandenen privaten Schlüssel getrennt aus dem bestehenden Dashboard. Keine zusätzliche Testunit oder Nutzer-Testadresse. Es wurde noch nicht umgeschaltet.
+
+`deployment/uplink.toml` enthält die bestehende Infisical-Projektidentität und FD 5, TLS-Namen, private Laufzeitablage und unabhängige FFmpeg-/FFprobe-Pfade unter `/opt/uplink/media/ffmpeg8-c733b4b2/`. Die vier HTML-Docks sind mittels `include_str!` im Dienstbinary eingebunden; es gibt keine Laufzeit-Assetabhängigkeit zum alten Repository. Der Dashboardprozess verwendet seine eigene Credential aus `/run/credentials/deadlock-twitch-dashboard-rust.service/infisical-token`, FD 9 und `/etc/deadlock-twitch/uplink.json`; die gewöhnliche Vorlage liegt im Bot-Repo unter `rust/deployment/uplink.json.example`.
+
+Die Ausgangshosts wurden am 8. September ausschließlich als `scheme/host/port` aus dem autorisierten Bestand gelesen. Sie werden exakt freigegeben. Nur der alte Twitch-Default `rtmp://live.twitch.tv/app` wird auf den [offiziellen sicheren Default](https://ingest.twitch.tv/ingests) `rtmps://ingest.global-contribute.live-video.net:443/app` abgebildet. Der gespeicherte Wert und der vollständige Schlüssel bleiben unverändert. Fremde/regionale/manuelle URLs werden nicht umgeschrieben. Ein TLS-Handshake mit vertrauenswürdigem Zertifikat ist kein Publikationsnachweis.
+
+`prepare-release.sh /absolutes/uplink-service /neues/paket` prüft die normale Konfiguration, die beiden bekannten Medienbinary-SHA256-Werte und die erforderliche Fence-Migration. Es kopiert Binary, Launcher, gewöhnliche Konfiguration, Unitoverride und additive Migrationen in ein neues Paket mit Prüfsummen. Es aktiviert nichts. Das Paket verlangt den integrierten Fencing-Stand; ein Branch ohne dessen Migration scheitert ausdrücklich. Vor Umschalten: Relay-Fence-Migration `20260908_destination_fences.sql` und Bot-Migrationen für Uplink-Intent sowie `20260908220000_uplink_target_generations.sql` anwenden. Beim Rückfall bleiben Sequenz und Tombstones erhalten; ein alter Relay ohne Fence-Prüfung darf nur mit gesperrten Ziel-Schreibrouten laufen.
+
+Die normale API liefert den tatsächlich beobachteten Eingang getrennt vom laufenden Encoderprofil. `active_profile.profile_origin=running_graph` bedeutet: Maße, Bildrate, Codec und **Zielbitrate** aus dem verwendeten Encodergraph. Es ist keine unabhängig gemessene Ausgangsbitrate. Vor Medienversand, bei Fehler und nach Ende bleibt `active_profile=null`; mehrspurige Programme bleiben im vollständigen `session.outputs.graph` sichtbar. `publication_confirmed` bleibt ohne Plattformnachweis false.
+
+Lokaler gekoppelter Nachweis:
+
+```sh
+cargo test -j2 -p uplink-service --test normalbetrieb normal_coordinator -- --ignored --nocapture
+```
+
+Er benötigt PostgreSQL 16 und genau die unabhängig installierten FFmpeg-8-Binaries. Er startet denselben Coordinator und dieselben HTTP-/RTMPS-Routen auf isoliertem Loopback mit eigener öffentlicher Test-CA, privaten Testschlüsseln nur im RAM und synthetischer PostgreSQL-Datenbank. Ein fehlkonfiguriertes Ziel steht neben einem gesunden Ausgang: H.264 320×180/25 → H.264 256×144/25, 50 Videoframes, je 95 AAC-Pakete für Live und VOD. Beide Audio-Payloads und Zeitstempel werden exakt gegen das versionierte Referenzmanifest geprüft. API: erkannte Quelle, laufender Graph, separate Zielfehler, keine behauptete Veröffentlichung, ausdrückliches Streamende und anschließend kein aktives Profil. Der frühere sofortige Coordinator-Abbruch wurde damit rot reproduziert; nach der Zielisolation grün. Der PostgreSQL-CI-Job benötigt weiterhin nur seine bisherigen Hostwerkzeuge; die zusätzliche FFmpeg-8-Probe ist ein eigener expliziter Lauf, kein still übersprungener CI-Erfolg.
+
+GoLive-/1440p-Freigabe, persistente logische Wiederverbindung, Wartebild, Delay und gespeicherte Layoutsteuerung bleiben offen. Der aktuelle normale Coordinator verwendet die vorhandene echte Einvideo-Verarbeitung mit expliziter AAC-Zuordnung. Diese erste normale Strecke ist kein Vierplattform-Live- oder Kapazitätsnachweis.
