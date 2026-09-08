@@ -133,9 +133,12 @@ impl MediaEngine {
             video_decoders: usize::from(!graph.profiles.is_empty()),
             outputs: routes
                 .iter()
-                .map(|route| OutputStatus {
+                .zip(&graph.routes)
+                .map(|(route, routing)| OutputStatus {
                     id: route.target.id.clone(),
-                    state: OutputState::Starting,
+                    state: routing
+                        .failure
+                        .map_or(OutputState::Starting, OutputState::Failed),
                     received_bytes: 0,
                     received_events: 0,
                 })
@@ -175,14 +178,29 @@ fn update_status(sinks: &Sinks, status: &watch::Sender<MediaStatus>) {
 
 fn distribute(tag: Arc<FlvTag>, group: Option<usize>, sinks: &Sinks, limits: &MediaLimits) {
     let mut sinks = sinks.lock().unwrap_or_else(|error| error.into_inner());
-    for sink in sinks
-        .iter_mut()
-        .filter(|sink| sink.routing.group == group && sink.failure.is_none())
-    {
+    for sink in sinks.iter_mut().filter(|sink| sink.failure.is_none()) {
         let Some(pusher) = sink.pusher.as_ref() else {
             continue;
         };
-        let result = if tag.kind() == 8 {
+        let result = if tag.kind() == 9 {
+            let mut result = Ok(());
+            for (_, destination) in sink
+                .routing
+                .video
+                .iter()
+                .filter(|(source, _)| *source == group)
+            {
+                result = tag
+                    .with_video_track(*destination, limits.max_tag_bytes)
+                    .and_then(|tag| pusher.try_send(Arc::new(tag)));
+                if result.is_err() {
+                    break;
+                }
+            }
+            result
+        } else if sink.routing.group != group {
+            continue;
+        } else if tag.kind() == 8 {
             tag.audio_track().and_then(|track| {
                 for (source, destination) in &sink.routing.audio {
                     if Some(*source) == track {
@@ -254,17 +272,17 @@ async fn run(
         if error.is_some() {
             break;
         }
-        let started = RunningPusher::spawn(route.target, config.limits.clone());
+        let started = match routing.failure {
+            Some(reason) => Err(reason),
+            None => RunningPusher::spawn(route.target, config.limits.clone()),
+        };
         match started {
             Ok(pusher) => sinks
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .push(Sink {
                     pusher: Some(pusher),
-                    routing: Routing {
-                        group: routing.group,
-                        audio: routing.audio.clone(),
-                    },
+                    routing: routing.clone(),
                     failure: None,
                 }),
             Err(reason) => {
@@ -273,10 +291,7 @@ async fn run(
                     .unwrap_or_else(|error| error.into_inner())
                     .push(Sink {
                         pusher: None,
-                        routing: Routing {
-                            group: routing.group,
-                            audio: routing.audio.clone(),
-                        },
+                        routing: routing.clone(),
                         failure: Some(reason),
                     });
                 if reason == MediaError::Cancelled {

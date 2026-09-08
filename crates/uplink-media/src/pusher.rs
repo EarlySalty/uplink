@@ -124,7 +124,7 @@ impl RunningPusher {
             match self.status.borrow().state {
                 OutputState::Publishing => return Ok(()),
                 OutputState::Failed(error) => return Err(error),
-                OutputState::Ended => return Err(MediaError::Cancelled),
+                OutputState::LocalEndUnconfirmed => return Err(MediaError::Cancelled),
                 OutputState::Starting => {}
             }
             self.status
@@ -334,6 +334,8 @@ struct Client {
     peer_window: Option<(u32, u8)>,
     outgoing_chunk_size: usize,
     write_timeout: Duration,
+    end_observation: Duration,
+    ending: bool,
     control_epoch: Instant,
     control_count: usize,
 }
@@ -343,6 +345,7 @@ enum Response {
     Connected,
     Created(u32),
     Published,
+    Unpublished,
 }
 impl Client {
     async fn connect(target: &PublishTarget, limits: &MediaLimits) -> Result<Self> {
@@ -422,6 +425,10 @@ impl Client {
             peer_window: None,
             outgoing_chunk_size: 128,
             write_timeout: limits.write_timeout,
+            end_observation: Duration::from_millis(250)
+                .min(limits.shutdown_timeout / 4)
+                .min(limits.write_timeout),
+            ending: false,
             control_epoch: Instant::now(),
             control_count: 0,
         })
@@ -544,19 +551,89 @@ impl Client {
                 }
             }
         }
+        // Die Queue kann im selben Poll enden, in dem die Gegenstelle noch
+        // eine Abweisung sendet. Vor dem Stop auch verzögerte Kontrollen lesen.
+        // Diese begrenzte Beobachtung ist ausdrücklich keine Empfangsbarriere.
+        self.observe_end_controls(&mut stop).await?;
+        self.ending = true;
         self.command(
             "deleteStream",
-            4.0,
+            0.0,
             0,
             &[Amf0Value::Null, Amf0Value::Number(self.stream_id as f64)],
         )
         .await?;
-        timeout(self.write_timeout, self.socket.shutdown())
-            .await
-            .map_err(|_| MediaError::Io)?
-            .map_err(|_| MediaError::Io)?;
-        updates.send_modify(|status| status.state = OutputState::Ended);
+        let peer_closed = self.observe_end_controls(&mut stop).await?;
+        if !peer_closed {
+            timeout(self.write_timeout, self.socket.shutdown())
+                .await
+                .map_err(|_| MediaError::Io)?
+                .map_err(|_| MediaError::Io)?;
+        }
+        if *stop.borrow() {
+            return Err(MediaError::Cancelled);
+        }
+        updates.send_modify(|status| status.state = OutputState::LocalEndUnconfirmed);
         Ok(())
+    }
+    /// deleteStream hat laut RTMP 7.2.2.3 keine Serverantwort. Weder ein EOF,
+    /// Unpublish.Success noch das Ausbleiben weiterer Daten bestätigt Medien
+    /// oder Veröffentlichung. Explizite Fehler bleiben trotzdem terminal.
+    /// Nach unserem Stop ist ein Transportende mehrdeutig; davor ist es ein
+    /// unerwarteter Verbindungsabbruch. Deadline gilt je Phase, nie je Nachricht.
+    async fn observe_end_controls(&mut self, stop: &mut watch::Receiver<bool>) -> Result<bool> {
+        let deadline = Instant::now() + self.end_observation;
+        let mut scratch = [0; 16 * 1024];
+        loop {
+            if *stop.borrow() {
+                return Err(MediaError::Cancelled);
+            }
+            // Parserzustand bleibt über jeden read und beide Phasen erhalten.
+            // handle()/write_all() werden nicht durch einen read-Timer verworfen.
+            while let Some(chunk) = self
+                .parser
+                .read_chunk(&mut self.input)
+                .map_err(|_| MediaError::ProtocolRejected)?
+            {
+                self.handle(chunk).await?;
+            }
+            self.ack_if_due().await?;
+            let read = tokio::select! {
+                biased;
+                _ = stop.changed() => return Err(MediaError::Cancelled),
+                result = timeout_at(deadline, self.socket.read(&mut scratch)) => result,
+            };
+            match read {
+                Err(_) => return Ok(false),
+                Ok(Ok(0)) => {
+                    return if self.ending {
+                        Ok(true)
+                    } else {
+                        Err(MediaError::Io)
+                    };
+                }
+                // TLS-Peers schließen teils ohne close_notify. Erst nach unserem
+                // deleteStream ist das nur ein unbestätigtes Ende, kein Erfolg.
+                Ok(Err(error))
+                    if self.ending && error.kind() == std::io::ErrorKind::UnexpectedEof =>
+                {
+                    return Ok(true);
+                }
+                Ok(Err(_)) => return Err(MediaError::Io),
+                Ok(Ok(count)) => self.accept_read(&scratch[..count])?,
+            }
+            if Instant::now() >= deadline {
+                // Ein bereits gelesener Fehler muss vor Fristende wirksam werden.
+                while let Some(chunk) = self
+                    .parser
+                    .read_chunk(&mut self.input)
+                    .map_err(|_| MediaError::ProtocolRejected)?
+                {
+                    self.handle(chunk).await?;
+                }
+                return Ok(false);
+            }
+        }
     }
     fn accept_read(&mut self, data: &[u8]) -> Result<()> {
         if data.is_empty() {
@@ -674,6 +751,7 @@ impl Client {
                         if event == 1
                             && read_u32(&body[2..])? == self.stream_id
                             && self.stream_id != 0
+                            && !self.ending
                         {
                             return Err(MediaError::Io);
                         }
@@ -710,7 +788,11 @@ impl Client {
                 )
                 .decode_all()
                 .map_err(|_| MediaError::ProtocolRejected)?;
-                return response(&values);
+                let response = response(&values)?;
+                if response == Response::Unpublished && !self.ending {
+                    return Err(MediaError::PublishRejected);
+                }
+                return Ok(response);
             }
             // Publishing has no inbound media/aggregate/Abort semantics. Fail
             // closed instead of accumulating unsupported state or raw payloads.
@@ -890,12 +972,15 @@ fn response(values: &[Amf0Value<'_>]) -> Result<Response> {
                 }
                 return Ok(Response::Published);
             }
-            Some(
-                "NetStream.Publish.BadName"
-                | "NetStream.Publish.Denied"
-                | "NetStream.Failed"
-                | "NetStream.Unpublish.Success",
-            ) => return Err(MediaError::PublishRejected),
+            Some("NetStream.Publish.BadName" | "NetStream.Publish.Denied" | "NetStream.Failed") => {
+                return Err(MediaError::PublishRejected);
+            }
+            Some("NetStream.Unpublish.Success") => {
+                if info.and_then(|v| property(v, "level")) != Some("status") {
+                    return Err(MediaError::ProtocolRejected);
+                }
+                return Ok(Response::Unpublished);
+            }
             _ => (),
         }
     }
@@ -925,6 +1010,81 @@ async fn handshake(socket: &mut Box<dyn Socket>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        pin::Pin,
+        task::{Context, Poll},
+    };
+    use tokio::io::ReadBuf;
+
+    /// deleteStream wird vollständig geschrieben, während im selben Poll die
+    /// Antwort lesbar wird. Kein Scheduling-Zufall und keine echte Gegenstelle.
+    struct CompletionSocket {
+        reply: Bytes,
+        wrote: bool,
+    }
+    impl AsyncRead for CompletionSocket {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if !self.wrote || self.reply.is_empty() {
+                return Poll::Pending;
+            }
+            let n = buf.remaining().min(self.reply.len());
+            buf.put_slice(&self.reply.split_to(n));
+            Poll::Ready(Ok(()))
+        }
+    }
+    impl AsyncWrite for CompletionSocket {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.wrote = true;
+            Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+    #[tokio::test]
+    async fn ready_remote_error_wins_over_completed_delete_write() {
+        let (mut client, _peer) = control_client();
+        let mut body = Vec::new();
+        let mut encoder = Amf0Encoder::new(&mut body);
+        encoder.encode_string("_error").unwrap();
+        encoder.encode_number(0.0).unwrap();
+        let mut reply = Vec::new();
+        ChunkWriter::default()
+            .write_chunk(
+                &mut reply,
+                Chunk::new(3, 0, MessageType(20), 1, Bytes::from(body)),
+            )
+            .unwrap();
+        client.socket = Box::new(CompletionSocket {
+            reply: reply.into(),
+            wrote: false,
+        });
+        let (sender, receiver) = queue::bounded(&MediaLimits::default()).unwrap();
+        drop(sender);
+        let (_cancel, stop) = watch::channel(false);
+        let (updates, _status) = watch::channel(OutputStatus {
+            id: "local-test".into(),
+            state: OutputState::Publishing,
+            received_events: 0,
+            received_bytes: 0,
+        });
+        assert_eq!(
+            client.run(receiver, stop, &updates).await,
+            Err(MediaError::PublishRejected)
+        );
+        assert_ne!(updates.borrow().state, OutputState::LocalEndUnconfirmed);
+    }
     fn control_client() -> (Client, tokio::io::DuplexStream) {
         let (socket, peer) = tokio::io::duplex(8192);
         (
@@ -942,6 +1102,8 @@ mod tests {
                 peer_window: None,
                 outgoing_chunk_size: 128,
                 write_timeout: Duration::from_secs(1),
+                end_observation: Duration::from_millis(20),
+                ending: false,
                 control_epoch: Instant::now(),
                 control_count: 0,
             },
