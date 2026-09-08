@@ -8,6 +8,9 @@ use uplink_vod::{recording::*, *};
 struct NoDatabase;
 #[async_trait]
 impl Database for NoDatabase {
+    async fn transaction(&self, _: &mut (dyn TransactionTask + Send)) -> Result<()> {
+        Err(Error::Database)
+    }
     async fn query(&self, _: &str, _: &[&(dyn ToSql + Sync)]) -> Result<Vec<Row>> {
         Err(Error::Database)
     }

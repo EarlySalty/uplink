@@ -6,11 +6,21 @@ use serde_json::Value;
 use std::sync::Arc;
 use tokio_postgres::{Row, Transaction, types::ToSql};
 
-pub const MIGRATION: &str = include_str!("../migrations/202609080001_vod.sql");
+pub const MIGRATION: &str = concat!(
+    include_str!("../migrations/202609080001_vod.sql"),
+    "\n",
+    include_str!("../migrations/202609080002_vod_consistency.sql")
+);
+#[async_trait]
+pub trait TransactionTask: Send {
+    async fn run(&mut self, tx: &Transaction<'_>) -> Result<()>;
+}
 /// Dienstadapter verwendet seine vorhandenen Verbindungen, Grenzen und Secrets.
 #[async_trait]
 pub trait Database: Send + Sync {
     async fn query(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<Vec<Row>>;
+    /// Vorhandene begrenzte Verbindung leihen; nur bei Ok committen, sonst rollback.
+    async fn transaction(&self, task: &mut (dyn TransactionTask + Send)) -> Result<()>;
 }
 #[derive(Clone)]
 pub struct Store {
@@ -26,6 +36,7 @@ pub struct JobStatus {
     pub video_id: Option<String>,
     pub last_error: Option<String>,
     pub processing_succeeded: bool,
+    pub publication_confirmed: bool,
 }
 pub(crate) struct Job {
     pub id: i64,
@@ -103,6 +114,9 @@ impl Store {
         binding: &TwitchBinding,
     ) -> Result<()> {
         binding.validate_identity()?;
+        tx.batch_execute("SET LOCAL lock_timeout='5s'; SET LOCAL statement_timeout='10s'")
+            .await
+            .map_err(|_| Error::Database)?;
         // Ein verlorener Mix oder eine andere Twitch-Session darf nicht durch einen
         // späteren Reconnect als durchgehend korrekt überschrieben werden.
         let changed=tx.execute("INSERT INTO relay.vod_twitch_bindings(session_id,streamer_id,binding) SELECT $1,$2,$3 FROM relay.sessions WHERE id=$1 AND streamer_id=$2 ON CONFLICT(session_id) DO UPDATE SET conflicted=relay.vod_twitch_bindings.conflicted OR relay.vod_twitch_bindings.binding->>'stream_id'<>excluded.binding->>'stream_id' OR relay.vod_twitch_bindings.binding->>'broadcaster_id'<>excluded.binding->>'broadcaster_id', binding=jsonb_set(relay.vod_twitch_bindings.binding,'{vod_audio_confirmed}',to_jsonb((relay.vod_twitch_bindings.binding->>'vod_audio_confirmed')::boolean AND (excluded.binding->>'vod_audio_confirmed')::boolean)) WHERE relay.vod_twitch_bindings.streamer_id=excluded.streamer_id",&[&session,&id(streamer)?,&json(binding)?]).await.map_err(|_|Error::Database)?;
@@ -119,19 +133,38 @@ impl Store {
         manifest: &Value,
         complete: bool,
     ) -> Result<()> {
+        self.register_source_object(
+            session,
+            streamer,
+            object,
+            manifest,
+            complete,
+            crate::Source::InputRecording,
+        )
+        .await
+    }
+    pub(crate) async fn register_source_object(
+        &self,
+        session: i64,
+        streamer: u64,
+        object: &str,
+        manifest: &Value,
+        complete: bool,
+        source: crate::Source,
+    ) -> Result<()> {
         validate_object_id(object)?;
-        let rows=self.db.query("INSERT INTO relay.vod_objects(id,session_id,streamer_id,manifest,complete) SELECT $1,$2,$3,$4,$5 FROM relay.sessions WHERE id=$2 AND streamer_id=$3 ON CONFLICT(id) DO UPDATE SET manifest=excluded.manifest,complete=excluded.complete WHERE relay.vod_objects.session_id=excluded.session_id AND relay.vod_objects.streamer_id=excluded.streamer_id AND relay.vod_objects.complete=false AND relay.vod_objects.state='available' RETURNING id",&[&object,&session,&id(streamer)?,&manifest,&complete]).await?;
+        let rows=self.db.query("INSERT INTO relay.vod_objects(id,session_id,streamer_id,manifest,complete,source) SELECT $1,$2,$3,$4,$5,$6 FROM relay.sessions WHERE id=$2 AND streamer_id=$3 ON CONFLICT(id) DO UPDATE SET manifest=excluded.manifest,complete=excluded.complete WHERE relay.vod_objects.session_id=excluded.session_id AND relay.vod_objects.streamer_id=excluded.streamer_id AND relay.vod_objects.source=excluded.source AND relay.vod_objects.complete=false AND relay.vod_objects.state='available' RETURNING id",&[&object,&session,&id(streamer)?,&manifest,&complete,&source.as_str()]).await?;
         if rows.len() != 1 {
             return Err(Error::Storage);
         }
         Ok(())
     }
     pub async fn statuses(&self, streamer: u64) -> Result<Vec<JobStatus>> {
-        self.db.query("SELECT id,session_id,state,confirmed_bytes,total_bytes,video_id,last_error,processing_succeeded FROM relay.vod_jobs WHERE streamer_id=$1 ORDER BY id DESC LIMIT 100",&[&id(streamer)?]).await?.into_iter().map(|r|Ok(JobStatus{id:r.try_get(0).map_err(|_|Error::Database)?,session_id:r.get(1),state:r.get(2),confirmed_bytes:r.get(3),total_bytes:r.get(4),video_id:r.get(5),last_error:r.get(6),processing_succeeded:r.get(7)})).collect()
+        self.db.query("SELECT id,session_id,state,confirmed_bytes,total_bytes,video_id,last_error,processing_succeeded,publication_confirmed FROM relay.vod_jobs WHERE streamer_id=$1 ORDER BY id DESC LIMIT 100",&[&id(streamer)?]).await?.into_iter().map(|r|Ok(JobStatus{id:r.try_get(0).map_err(|_|Error::Database)?,session_id:r.get(1),state:r.get(2),confirmed_bytes:r.get(3),total_bytes:r.get(4),video_id:r.get(5),last_error:r.get(6),processing_succeeded:r.get(7),publication_confirmed:r.get(8)})).collect()
     }
-    /// Autorisierte Wiederaufnahme benötigt keine neue Uploadsession. Ambiguous bleibt gesperrt.
+    /// Bekannte Sessions werden erneut abgeglichen. Unbekannter Start bleibt gesperrt.
     pub async fn retry(&self, streamer: u64, job: i64) -> Result<()> {
-        let rows=self.db.query("UPDATE relay.vod_jobs SET state=resume_state,resume_state=NULL,last_error=NULL,next_attempt_at=now() WHERE id=$1 AND streamer_id=$2 AND state='blocked' AND resume_state IS NOT NULL AND last_error <> 'ambiguous' AND lease_owner IS NULL RETURNING id",&[&job,&id(streamer)?]).await?;
+        let rows=self.db.query("UPDATE relay.vod_jobs SET state=resume_state,resume_state=NULL,last_error=NULL,next_attempt_at=now() WHERE id=$1 AND streamer_id=$2 AND state='blocked' AND NOT proof_blocked AND resume_state IS NOT NULL AND (last_error <> 'ambiguous' OR (resume_state='uploading' AND upload_session_enc IS NOT NULL) OR (resume_state='publishing' AND video_id IS NOT NULL)) AND lease_owner IS NULL RETURNING id",&[&job,&id(streamer)?]).await?;
         if rows.len() != 1 {
             return Err(Error::Invalid);
         }
@@ -167,11 +200,55 @@ impl Store {
     ) -> Result<Vec<Row>> {
         let mut args: Vec<&(dyn ToSql + Sync)> = vec![&job.id, &job.lease_owner];
         args.extend_from_slice(values);
-        let rows = self.db.query(sql, &args).await?;
+        let mut task = FencedQuery {
+            job,
+            sql,
+            args,
+            rows: None,
+        };
+        self.transact(&mut task).await?;
+        let rows = task.rows.ok_or(Error::Database)?;
         if rows.is_empty() {
             return Err(Error::LeaseLost);
         }
         Ok(rows)
+    }
+    pub(crate) async fn transact(&self, task: &mut (dyn TransactionTask + Send)) -> Result<()> {
+        let started = tokio::sync::Notify::new();
+        let mut notified = StartedTask {
+            inner: task,
+            started: &started,
+        };
+        let operation = self.db.transaction(&mut notified);
+        tokio::pin!(operation);
+        tokio::select! {
+            result=&mut operation=>return result,
+            _=started.notified()=>{},
+            _=tokio::time::sleep(std::time::Duration::from_secs(5))=>return Err(Error::Database),
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(55), operation)
+            .await
+            .map_err(|_| Error::Database)?
+    }
+    pub(crate) async fn guarded<'a, T: Send + 'a, F>(
+        &self,
+        job: &'a Job,
+        expected: &'a str,
+        operation: F,
+    ) -> Result<T>
+    where
+        F: FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<T>> + Send + 'a>>
+            + Send
+            + 'a,
+    {
+        let mut task = GuardedOperation {
+            job,
+            expected,
+            operation: Some(operation),
+            result: None,
+        };
+        self.transact(&mut task).await?;
+        task.result.ok_or(Error::Database)
     }
     pub(crate) async fn heartbeat(&self, job: &Job) -> Result<()> {
         self.fenced(job,"UPDATE relay.vod_jobs SET lease_until=now()+interval '120 seconds' WHERE id=$1 AND lease_owner=$2 AND lease_until>now() RETURNING id",&[]).await?;
@@ -220,6 +297,90 @@ impl Store {
     ) -> Result<()> {
         let sealed = cipher.seal(uri.expose().as_bytes(), &job.aad())?;
         self.fenced(job,"UPDATE relay.vod_jobs SET state='uploading',upload_session_enc=$3,confirmed_bytes=0,last_error=NULL WHERE id=$1 AND lease_owner=$2 AND lease_until>now() AND state='starting' RETURNING id",&[&sealed]).await?;
+        Ok(())
+    }
+}
+struct StartedTask<'a> {
+    inner: &'a mut (dyn TransactionTask + Send),
+    started: &'a tokio::sync::Notify,
+}
+#[async_trait]
+impl TransactionTask for StartedTask<'_> {
+    async fn run(&mut self, tx: &Transaction<'_>) -> Result<()> {
+        self.started.notify_one();
+        self.inner.run(tx).await
+    }
+}
+pub(crate) async fn lock_session(tx: &Transaction<'_>, session: i64, streamer: u64) -> Result<()> {
+    tx.batch_execute("SET LOCAL lock_timeout='5s'; SET LOCAL statement_timeout='10s'")
+        .await
+        .map_err(|_| Error::Database)?;
+    let rows = tx
+        .query(
+            "SELECT id FROM relay.sessions WHERE id=$1 AND streamer_id=$2 FOR UPDATE",
+            &[&session, &id(streamer)?],
+        )
+        .await
+        .map_err(|_| Error::Database)?;
+    if rows.len() != 1 {
+        return Err(Error::WrongChannel);
+    }
+    Ok(())
+}
+struct FencedQuery<'a> {
+    job: &'a Job,
+    sql: &'a str,
+    args: Vec<&'a (dyn ToSql + Sync)>,
+    rows: Option<Vec<Row>>,
+}
+#[async_trait]
+impl TransactionTask for FencedQuery<'_> {
+    async fn run(&mut self, tx: &Transaction<'_>) -> Result<()> {
+        lock_session(tx, self.job.session_id, self.job.streamer_id).await?;
+        self.rows = Some(
+            tx.query(self.sql, &self.args)
+                .await
+                .map_err(|_| Error::Database)?,
+        );
+        Ok(())
+    }
+}
+struct GuardedOperation<'a, F, T> {
+    job: &'a Job,
+    expected: &'a str,
+    operation: Option<F>,
+    result: Option<T>,
+}
+#[async_trait]
+impl<'a, F, T> TransactionTask for GuardedOperation<'a, F, T>
+where
+    T: Send + 'a,
+    F: FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<T>> + Send + 'a>>
+        + Send
+        + 'a,
+{
+    async fn run(&mut self, tx: &Transaction<'_>) -> Result<()> {
+        lock_session(tx, self.job.session_id, self.job.streamer_id).await?;
+        let rows=tx.query("SELECT proof_blocked FROM relay.vod_jobs WHERE id=$1 AND streamer_id=$2 AND state=$3 AND lease_owner=$4 AND lease_until>now()",&[&self.job.id,&id(self.job.streamer_id)?,&self.expected,&self.job.lease_owner]).await.map_err(|_|Error::Database)?;
+        if rows.len() != 1 || rows[0].get::<_, bool>(0) {
+            return Err(Error::LeaseLost);
+        }
+        if self.job.settings.source == crate::Source::TwitchVod {
+            let rows=tx.query("SELECT binding,conflicted FROM relay.vod_twitch_bindings WHERE session_id=$1 AND streamer_id=$2",&[&self.job.session_id,&id(self.job.streamer_id)?]).await.map_err(|_|Error::Database)?;
+            let row = rows.first().ok_or(Error::UnboundTwitch)?;
+            if row.get::<_, bool>(1) {
+                return Err(Error::UnboundTwitch);
+            }
+            let binding: TwitchBinding =
+                serde_json::from_value(row.get(0)).map_err(|_| Error::UnboundTwitch)?;
+            binding.validate()?;
+        }
+        let operation = self.operation.take().ok_or(Error::Invalid)?;
+        self.result = Some(
+            tokio::time::timeout(std::time::Duration::from_secs(45), operation())
+                .await
+                .map_err(|_| Error::Network)??,
+        );
         Ok(())
     }
 }

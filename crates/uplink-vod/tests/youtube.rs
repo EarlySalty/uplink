@@ -52,6 +52,57 @@ async fn force_ssl_startet_privaten_upload_und_validiert_kanal() {
     let session = yt.start(7, &settings(), 1024).await.unwrap();
     assert!(!format!("{session:?}").contains("upload_id"));
 }
+
+#[tokio::test]
+async fn oeffentliche_regel_startet_zunaechst_immer_privaten_upload() {
+    let server = MockServer::start().await;
+    let yt = api(&server).await;
+    let mut config = settings();
+    config.privacy = Privacy::Public;
+    config.publication_authorized = true;
+    Mock::given(method("POST"))
+        .and(wiremock::matchers::body_partial_json(
+            json!({"status":{"privacyStatus":"private"}}),
+        ))
+        .respond_with(ResponseTemplate::new(200).insert_header(
+            "Location",
+            format!(
+                "{}/upload/youtube/v3/videos?upload_id=protected",
+                server.uri()
+            ),
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    yt.start(7, &config, 16).await.unwrap();
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn verlorener_abschlussbody_bleibt_mit_bekannter_session_wiederaufnehmbar() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut header = vec![];
+        let mut byte = [0u8; 1];
+        while !header.ends_with(b"\r\n\r\n") && header.len() < 8192 {
+            socket.read_exact(&mut byte).await.unwrap();
+            header.push(byte[0]);
+        }
+        socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{").await.unwrap();
+    });
+    let yt = YouTube::for_test(Arc::new(Broker), &endpoint).unwrap();
+    let session = Secret::new(format!(
+        "{endpoint}/upload/youtube/v3/videos?upload_id=protected"
+    ));
+    assert_eq!(
+        yt.reconcile(7, "UC-owner", &session, 16).await,
+        Err(Error::Network)
+    );
+    server.await.unwrap();
+}
 #[tokio::test]
 async fn fortschritt_kommt_nur_aus_bestaetigtem_range() {
     let s = MockServer::start().await;

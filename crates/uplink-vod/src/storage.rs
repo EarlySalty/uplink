@@ -71,6 +71,10 @@ impl Storage {
                 if file.file_type().map_err(|_| Error::Storage)?.is_symlink() || !meta.is_file() {
                     return Err(Error::Storage);
                 }
+                if staging_name(&file.file_name().to_string_lossy()) {
+                    std::fs::remove_file(file.path()).map_err(|_| Error::Storage)?;
+                    continue;
+                }
                 bytes = bytes.checked_add(meta.len()).ok_or(Error::StorageFull)?;
             }
         }
@@ -172,15 +176,35 @@ impl Storage {
     }
     async fn retire_file(&self, id: &str, filename: &str) -> Result<()> {
         let old = self.path(id, filename)?;
-        if !old.exists() {
-            return Ok(());
-        }
-        let mut random = [0u8; 8];
-        getrandom::fill(&mut random).map_err(|_| Error::Storage)?;
-        let name = format!("{filename}-outdated-{}.part", hex::encode(random));
-        tokio::fs::rename(old, self.path(id, &name)?)
+        let meta = match tokio::fs::symlink_metadata(&old).await {
+            Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() => meta,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            _ => return Err(Error::Storage),
+        };
+        tokio::fs::remove_file(old)
             .await
-            .map_err(|_| Error::Storage)
+            .map_err(|_| Error::Storage)?;
+        self.release_bytes(meta.len());
+        Ok(())
+    }
+    fn release_bytes(&self, bytes: u64) {
+        let _ = self
+            .used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                Some(used.saturating_sub(bytes))
+            });
+    }
+    pub(crate) fn staging(&self, id: &str, name: &str, destination: &str) -> Result<Staging> {
+        if !staging_name(name) {
+            return Err(Error::Storage);
+        }
+        Ok(Staging {
+            storage: self.clone(),
+            path: self.path(id, name)?,
+            destination: self.path(id, destination)?,
+            bytes: 0,
+            committed: false,
+        })
     }
     pub async fn open(&self, id: &str, name: &str) -> Result<tokio::fs::File> {
         let path = self.path(id, name)?;
@@ -257,6 +281,53 @@ impl Storage {
     }
     pub(crate) fn contains(&self, id: &str, name: &str) -> bool {
         self.path(id, name).is_ok_and(|p| p.exists())
+    }
+}
+fn staging_name(name: &str) -> bool {
+    ["export.mp4-", "download.ts-"].into_iter().any(|prefix| {
+        let Some(suffix) = name
+            .strip_prefix(prefix)
+            .and_then(|name| name.strip_suffix(".part"))
+        else {
+            return false;
+        };
+        let hash = suffix.strip_prefix("outdated-").unwrap_or(suffix);
+        hash.len() == 16 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+    })
+}
+pub(crate) struct Staging {
+    storage: Storage,
+    path: PathBuf,
+    destination: PathBuf,
+    bytes: u64,
+    committed: bool,
+}
+impl Staging {
+    pub fn reserve(&mut self, bytes: u64) -> Result<()> {
+        self.storage.reserve(bytes)?.commit();
+        self.bytes += bytes;
+        Ok(())
+    }
+    pub fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+impl Drop for Staging {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => self.storage.release_bytes(self.bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // Cancellation kann nach bereits erfolgtem Rename eintreffen.
+                // Ein fertiges Objekt behält sein Budget und wird hier nie gelöscht.
+                if !self.destination.exists() {
+                    self.storage.release_bytes(self.bytes)
+                }
+            }
+            Err(_) => {} // Konservativ belegt; Wiederanlauf räumt eigene Teildateien auf.
+        }
     }
 }
 pub struct Reservation {

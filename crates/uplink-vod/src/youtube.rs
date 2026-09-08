@@ -219,12 +219,9 @@ impl YouTube {
         }
         self.verify_channel(streamer, &settings.youtube_channel_id)
             .await?;
-        let privacy = match settings.privacy {
-            Privacy::Private => "private",
-            Privacy::Unlisted => "unlisted",
-            Privacy::Public => "public",
-        };
-        let body=serde_json::to_vec(&json!({"snippet":{"title":settings.title,"description":settings.description},"status":{"privacyStatus":privacy}})).map_err(|_|Error::Invalid)?;
+        // Öffentliche Regeln werden erst nach Verarbeitung unter erneuter
+        // dauerhafter Freigabe angewendet, nie schon beim Uploadstart.
+        let body=serde_json::to_vec(&json!({"snippet":{"title":settings.title,"description":settings.description},"status":{"privacyStatus":"private"}})).map_err(|_|Error::Invalid)?;
         let mut url = self.endpoint("/upload/youtube/v3/videos")?;
         url.query_pairs_mut()
             .append_pair("uploadType", "resumable")
@@ -272,7 +269,13 @@ impl YouTube {
                 .ok_or(Error::Protocol)?;
             return Ok(UploadReply::Offset(offset));
         }
-        let body = Self::json(response).await.map_err(|_| Error::Ambiguous)?;
+        let body = Self::json(response).await.map_err(|error| {
+            if error == Error::Network {
+                Error::Network
+            } else {
+                Error::Ambiguous
+            }
+        })?;
         let id = body
             .get("id")
             .and_then(Value::as_str)
@@ -352,6 +355,122 @@ impl YouTube {
             return Err(Error::Network);
         }
         Ok(reply)
+    }
+    pub async fn publish(&self, streamer: u64, settings: &Settings, video_id: &str) -> Result<()> {
+        settings.validate()?;
+        if !settings.publication_authorized
+            || settings.privacy == Privacy::Private
+            || !valid_video_id(video_id)
+        {
+            return Err(Error::Invalid);
+        }
+        let grant = self
+            .grant(streamer, &settings.youtube_channel_id, false)
+            .await?;
+        if !grant.scopes.iter().any(|scope| {
+            matches!(
+                scope.as_str(),
+                "https://www.googleapis.com/auth/youtube"
+                    | "https://www.googleapis.com/auth/youtube.force-ssl"
+            )
+        }) {
+            return Err(Error::NeedsReauth);
+        }
+        let privacy = match settings.privacy {
+            Privacy::Public => "public",
+            Privacy::Unlisted => "unlisted",
+            Privacy::Private => return Err(Error::Invalid),
+        };
+        let mut url = self.endpoint("/youtube/v3/videos")?;
+        url.query_pairs_mut()
+            .append_pair("part", "snippet,status,processingDetails")
+            .append_pair("id", video_id);
+        let body = Self::json(
+            Self::check(
+                self.request(
+                    streamer,
+                    &settings.youtube_channel_id,
+                    Method::GET,
+                    url,
+                    &[],
+                    None,
+                )
+                .await?,
+            )
+            .await?,
+        )
+        .await?;
+        let items = body
+            .get("items")
+            .and_then(Value::as_array)
+            .filter(|items| items.len() == 1)
+            .ok_or(Error::Ambiguous)?;
+        let item = &items[0];
+        if item.get("id").and_then(Value::as_str) != Some(video_id)
+            || item.pointer("/snippet/channelId").and_then(Value::as_str)
+                != Some(&settings.youtube_channel_id)
+        {
+            return Err(Error::WrongChannel);
+        }
+        if item
+            .pointer("/processingDetails/processingStatus")
+            .and_then(Value::as_str)
+            != Some("succeeded")
+        {
+            return Err(Error::ProcessingFailed);
+        }
+        if item
+            .pointer("/status/privacyStatus")
+            .and_then(Value::as_str)
+            == Some(privacy)
+        {
+            return Ok(());
+        }
+        let current = item
+            .get("status")
+            .and_then(Value::as_object)
+            .ok_or(Error::Protocol)?;
+        let mut status = serde_json::Map::new();
+        for key in [
+            "embeddable",
+            "license",
+            "publicStatsViewable",
+            "selfDeclaredMadeForKids",
+            "containsSyntheticMedia",
+        ] {
+            if let Some(value) = current.get(key) {
+                status.insert(key.into(), value.clone());
+            }
+        }
+        status.insert("privacyStatus".into(), json!(privacy));
+        let mut url = self.endpoint("/youtube/v3/videos")?;
+        url.query_pairs_mut().append_pair("part", "status");
+        let payload = serde_json::to_vec(&json!({"id":video_id,"status":status}))
+            .map_err(|_| Error::Invalid)?;
+        let body = Self::json(
+            Self::check(
+                self.request(
+                    streamer,
+                    &settings.youtube_channel_id,
+                    Method::PUT,
+                    url,
+                    &[("Content-Type", "application/json".into())],
+                    Some(payload),
+                )
+                .await?,
+            )
+            .await?,
+        )
+        .await?;
+        if body.get("id").and_then(Value::as_str) != Some(video_id)
+            || body
+                .pointer("/status/privacyStatus")
+                .and_then(Value::as_str)
+                != Some(privacy)
+        {
+            return Err(Error::Network);
+        }
+        Ok(())
     }
     pub async fn processing(
         &self,

@@ -3,7 +3,7 @@ mod model;
 pub mod youtube;
 pub use model::*;
 pub mod store;
-pub use store::{Database, JobStatus, Store};
+pub use store::{Database, JobStatus, Store, TransactionTask};
 pub mod storage;
 pub use storage::{ExportFile, Storage};
 pub mod recording;

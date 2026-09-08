@@ -99,6 +99,14 @@ pub enum Source {
     InputRecording,
     TwitchVod,
 }
+impl Source {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::InputRecording => "input_recording",
+            Self::TwitchVod => "twitch_vod",
+        }
+    }
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EndReason {

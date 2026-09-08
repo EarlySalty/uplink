@@ -447,12 +447,13 @@ impl SourceProvider for NativeSources {
                     manifest["binding"] = serde_json::to_value(&request.twitch_binding)
                         .map_err(|_| Error::Invalid)?;
                     self.store
-                        .register_object(
+                        .register_source_object(
                             request.session_id,
                             request.streamer_id,
                             &object,
                             &manifest,
                             false,
+                            Source::TwitchVod,
                         )
                         .await?;
                     return Err(Error::SourcePending);
@@ -631,6 +632,7 @@ async fn capture(
     getrandom::fill(&mut random).map_err(|_| Error::Storage)?;
     let partial = format!("{}-{}.part", name, hex::encode(random));
     let path = storage.path(object, &partial)?;
+    let mut staging = storage.staging(object, &partial, name)?;
     let mut file = tokio::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -663,8 +665,7 @@ async fn capture(
             if total > max_bytes {
                 return Err(Error::StorageFull);
             }
-            let reservation = storage.reserve(len as u64)?;
-            reservation.commit();
+            staging.reserve(len as u64)?;
             file.write_all(&buffer[..len])
                 .await
                 .map_err(|_| Error::Storage)?;
@@ -704,6 +705,7 @@ async fn capture(
     tokio::fs::rename(path, storage.path(object, name)?)
         .await
         .map_err(|_| Error::Storage)?;
+    staging.commit();
     Ok(())
 }
 
@@ -727,6 +729,39 @@ fn observe_vod(manifest: &mut Value, vod_id: &str, duration: u64, now: i64, wait
 mod tests {
     use super::*;
     #[tokio::test]
+    async fn wiederholte_fehlgeschlagene_ausgaben_verbrauchen_kein_dauerhaftes_budget() {
+        let directory = tempfile::tempdir().unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let storage = Storage::new(directory.path().to_owned(), 16).unwrap();
+        let object = storage.create_object().unwrap();
+        for _ in 0..8 {
+            let mut command = tokio::process::Command::new("/bin/sh");
+            command.args(["-c", "printf 'failed'; exit 1"]);
+            assert_eq!(
+                capture(
+                    &storage,
+                    &object,
+                    "download.ts",
+                    command,
+                    None,
+                    16,
+                    Duration::from_secs(2)
+                )
+                .await,
+                Err(Error::Incomplete)
+            );
+            assert_eq!(storage.used_bytes(), 0);
+            assert!(!storage.contains(&object, "download.ts"));
+        }
+        assert_eq!(
+            std::fs::read_dir(storage.object_dir(&object).unwrap())
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+    #[tokio::test]
     async fn abbruch_beendet_den_echten_werkzeugprozess_und_reapt_ihn() {
         let directory = tempfile::tempdir().unwrap();
         use std::os::unix::fs::PermissionsExt;
@@ -741,7 +776,7 @@ mod tests {
             capture(
                 &task_storage,
                 &task_object,
-                "test.mp4",
+                "export.mp4",
                 command,
                 None,
                 4096,
@@ -775,7 +810,12 @@ mod tests {
         })
         .await
         .expect("Abgebrochenes Werkzeug muss beendet und abgeholt sein");
-        assert!(!storage.contains(&object, "test.mp4"));
+        assert!(!storage.contains(&object, "export.mp4"));
+        assert_eq!(
+            storage.used_bytes(),
+            0,
+            "Abgebrochene temporäre Ausgabe darf das Budget nicht dauerhaft belegen"
+        );
     }
     #[test]
     fn wiederholte_pruefung_startet_die_stabilitaetsfrist_nicht_neu() {
@@ -822,6 +862,9 @@ mod twitch_contract_tests {
     struct NoDb;
     #[async_trait]
     impl crate::Database for NoDb {
+        async fn transaction(&self, _: &mut (dyn crate::TransactionTask + Send)) -> Result<()> {
+            Err(Error::Database)
+        }
         async fn query(&self, _: &str, _: &[&(dyn ToSql + Sync)]) -> Result<Vec<Row>> {
             Err(Error::Database)
         }
