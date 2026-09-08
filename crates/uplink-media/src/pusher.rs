@@ -50,20 +50,22 @@ pub struct RunningPusher {
 impl RunningPusher {
     /// Kehrt erst nach bestätigtem NetStream.Publish.Start zurück.
     pub async fn start(target: PublishTarget, limits: MediaLimits) -> Result<Self> {
+        let mut pusher = Self::spawn(target, limits)?;
+        pusher.wait_published().await?;
+        Ok(pusher)
+    }
+    /// Die begrenzte Queue existiert vor DNS/TLS/RTMP. Kein fremder Handshake
+    /// darf den Medienkonsum oder den Start eines anderen Ziels aufhalten.
+    pub fn spawn(target: PublishTarget, limits: MediaLimits) -> Result<Self> {
         validate_limits(&limits)?;
+        endpoint(&target)?;
+        let runtime =
+            tokio::runtime::Handle::try_current().map_err(|_| MediaError::InvalidConfiguration)?;
         let (sender, receiver) = queue::bounded(&limits)?;
         let deadline = Instant::now() + limits.startup_timeout;
-        let mut client = timeout_at(deadline, Client::connect(&target, &limits))
-            .await
-            .map_err(|_| MediaError::StartTimeout)??;
-        timeout_at(deadline, client.publish(&target))
-            .await
-            .map_err(|_| MediaError::StartTimeout)??;
-        // Alle Secret-Bytes gehören danach nur noch dem Aufruferobjekt und werden
-        // mit target verworfen; keine Task benötigt den Publish-Key weiterhin.
         let status = OutputStatus {
             id: target.id.clone(),
-            state: OutputState::Publishing,
+            state: OutputState::Starting,
             received_bytes: 0,
             received_events: 0,
         };
@@ -71,8 +73,38 @@ impl RunningPusher {
         let (stop, stop_rx) = watch::channel(false);
         let shutdown_timeout = limits.shutdown_timeout;
         let max_tag_bytes = limits.max_tag_bytes;
-        let task = tokio::spawn(async move {
-            let result = client.run(receiver, stop_rx, &updates).await;
+        let task = runtime.spawn(async move {
+            let mut startup_stop = stop_rx.clone();
+            let connected = {
+                let startup = async {
+                    let mut client = timeout_at(deadline, Client::connect(&target, &limits))
+                        .await
+                        .map_err(|_| MediaError::StartTimeout)??;
+                    timeout_at(deadline, client.publish(&target))
+                        .await
+                        .map_err(|_| MediaError::StartTimeout)??;
+                    Ok::<_, MediaError>(client)
+                };
+                if *stop_rx.borrow() {
+                    Err(MediaError::Cancelled)
+                } else {
+                    tokio::select! {
+                        biased;
+                        _=startup_stop.changed()=>Err(MediaError::Cancelled),
+                        result=startup=>result,
+                    }
+                }
+            };
+            // Der Publish-Zugang wird auch nach einem fehlgeschlagenen oder
+            // abgebrochenen Start verworfen und nicht von der Medienphase gehalten.
+            drop(target);
+            let result = match connected {
+                Ok(mut client) => {
+                    updates.send_modify(|status| status.state = OutputState::Publishing);
+                    client.run(receiver, stop_rx, &updates).await
+                }
+                Err(error) => Err(error),
+            };
             if let Err(error) = result {
                 updates.send_modify(|status| status.state = OutputState::Failed(error));
             }
@@ -86,6 +118,20 @@ impl RunningPusher {
             max_tag_bytes,
             shutdown_timeout,
         })
+    }
+    pub async fn wait_published(&mut self) -> Result<()> {
+        loop {
+            match self.status.borrow().state {
+                OutputState::Publishing => return Ok(()),
+                OutputState::Failed(error) => return Err(error),
+                OutputState::Ended => return Err(MediaError::Cancelled),
+                OutputState::Starting => {}
+            }
+            self.status
+                .changed()
+                .await
+                .map_err(|_| MediaError::Cancelled)?;
+        }
     }
     pub fn try_send(&self, tag: Arc<FlvTag>) -> Result<()> {
         if *self.stop.borrow() {
@@ -109,14 +155,34 @@ impl RunningPusher {
     pub fn cancel(&self) {
         self.stop.send_replace(true);
     }
+    pub(crate) fn cancellation(&self) -> watch::Sender<bool> {
+        self.stop.clone()
+    }
     /// Wartende Medien innerhalb der Abschlussfrist ausgeben, danach deleteStream.
     pub async fn finish(mut self) -> Result<OutputStatus> {
         self.sender.take();
         let task = self.task.as_mut().ok_or(MediaError::Cancelled)?;
-        let report = timeout(self.shutdown_timeout, task)
-            .await
-            .map_err(|_| MediaError::ProcessCleanupFailed)?
-            .map_err(|_| MediaError::ProcessCleanupFailed)?;
+        let report = match timeout(self.shutdown_timeout, task).await {
+            Ok(result) => result.map_err(|_| MediaError::ProcessCleanupFailed)?,
+            Err(_) => {
+                let reason = if self.status.borrow().state == OutputState::Starting {
+                    MediaError::StartTimeout
+                } else {
+                    MediaError::Io
+                };
+                self.cancel();
+                let task = self.task.as_mut().ok_or(MediaError::Cancelled)?;
+                task.abort();
+                let joined = timeout(self.shutdown_timeout, task)
+                    .await
+                    .map_err(|_| MediaError::ProcessCleanupFailed)?;
+                if joined.is_err_and(|error| !error.is_cancelled()) {
+                    return Err(MediaError::ProcessCleanupFailed);
+                }
+                self.task.take();
+                return Err(reason);
+            }
+        };
         self.task.take();
         report
     }
@@ -449,6 +515,9 @@ impl Client {
     ) -> Result<()> {
         let mut scratch = [0_u8; 16 * 1024];
         loop {
+            if *stop.borrow() {
+                return Err(MediaError::Cancelled);
+            }
             // Verarbeitete Kontrollnachrichten werden nie durch einen abgebrochenen
             // Lese-Future verloren; nur read() selbst liegt im select.
             while let Some(chunk) = self

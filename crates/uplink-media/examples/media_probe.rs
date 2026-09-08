@@ -16,7 +16,7 @@ use tokio::{
     process::Command,
     sync::{mpsc, oneshot},
     task::JoinHandle,
-    time::timeout,
+    time::{Instant, timeout},
 };
 use uplink_core::{Codec, FrameRate};
 use uplink_ingest::{
@@ -165,6 +165,12 @@ struct Capture {
     report: SessionReport,
 }
 async fn capture(server: Arc<IngestServer<ProbeAuth>>) -> ProbeResult<Capture> {
+    capture_notifying(server, None).await
+}
+async fn capture_notifying(
+    server: Arc<IngestServer<ProbeAuth>>,
+    mut first_frame: Option<oneshot::Sender<Instant>>,
+) -> ProbeResult<Capture> {
     let mut connection = server
         .accept()
         .await
@@ -173,6 +179,12 @@ async fn capture(server: Arc<IngestServer<ProbeAuth>>) -> ProbeResult<Capture> {
     let mut video_headers = Vec::new();
     let mut audio: BTreeMap<u8, Vec<Packet>> = BTreeMap::new();
     while let Some(event) = connection.next().await {
+        if event.identity.track.kind == MediaKind::Video
+            && event.event_kind == EventKind::Frame
+            && let Some(notice) = first_frame.take()
+        {
+            let _ = notice.send(Instant::now());
+        }
         if event.event_kind != EventKind::Frame
             && !(event.identity.track.kind == MediaKind::Video
                 && event.event_kind == EventKind::SequenceHeader)
@@ -240,6 +252,9 @@ struct ProbeReport {
     slow_receiver_isolated: bool,
     common_timestamp_offset_ms: i64,
     source_audio_ids: [u8; 2],
+    stalled_handshake_isolated: bool,
+    healthy_first_frame_ms: Option<u128>,
+    healthy_ended_ms: Option<u128>,
 }
 #[derive(Default)]
 struct InputTimes {
@@ -281,18 +296,70 @@ async fn run(
     source_name: &'static str,
     with_slow: bool,
     audio_ids: [u8; 2],
+    with_stalled: bool,
 ) -> ProbeResult<ProbeReport> {
     let directory = PrivateDirectory::create()?;
     let (source_server, source_target) = endpoint("source", 512).await?;
     let (left_server, left_target) = endpoint("left", 512).await?;
     let (right_server, right_target) = endpoint("right", 512).await?;
-    let left = Task::new(tokio::spawn(capture(left_server)));
+    let (first_frame, first_frame_rx) = oneshot::channel();
+    let left = Task::new(tokio::spawn(capture_notifying(
+        left_server,
+        Some(first_frame),
+    )));
     let right = Task::new(tokio::spawn(capture(right_server)));
     let mut outputs = vec![
         desired(left_target, audio_ids[0], Some(audio_ids[1]))?,
         desired(right_target, audio_ids[1], None)?,
     ];
     let mut slow = None;
+    let mut stalled = None;
+    if with_stalled {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .map_err(|_| "Handshake-Probeport fehlt")?;
+        let port = listener
+            .local_addr()
+            .map_err(|_| "Handshake-Probeadresse fehlt")?
+            .port();
+        outputs.insert(
+            0,
+            desired(
+                PublishTarget {
+                    id: "stalled-handshake".into(),
+                    endpoint: format!("rtmp://localhost:{port}/live"),
+                    playpath: PublishSecret::new(b"local-fixture".to_vec())
+                        .map_err(|_| "Probezugang ungültig")?,
+                    tls: None,
+                    allowed_hosts: vec!["localhost".into()],
+                    allow_loopback: true,
+                    allow_unencrypted: true,
+                },
+                audio_ids[0],
+                None,
+            )?,
+        );
+        stalled = Some(Task::new(tokio::spawn(async move {
+            let (mut socket, _) = listener
+                .accept()
+                .await
+                .map_err(|_| "Hängender Handshake wurde nicht verbunden")?;
+            let mut request = [0; 1537];
+            socket
+                .read_exact(&mut request)
+                .await
+                .map_err(|_| "RTMP-Handshakestart fehlt")?;
+            let mut byte = [0];
+            let count = socket
+                .read(&mut byte)
+                .await
+                .map_err(|_| "Handshake-Abschluss fehlgeschlagen")?;
+            if count != 0 {
+                return Err("Unerwartete Daten ohne bestätigten Handshake");
+            }
+            Ok::<_, &'static str>(())
+        })));
+    }
     let mut release_slow = None;
     if with_slow {
         let (server, target) = endpoint("slow", 1).await?;
@@ -406,6 +473,7 @@ async fn run(
         limits: MediaLimits::default(),
     })
     .map_err(|_| "Medienkonfiguration nicht akzeptiert")?;
+    let started_at = Instant::now();
     let running = engine
         .prepare_and_start(DesiredSessionSpec { first, outputs }, receive)
         .await
@@ -414,7 +482,57 @@ async fn run(
             "Quellprüfung oder Medienstart fehlgeschlagen"
         })?;
     eprintln!("Gemessene Quelle: {:?}", running.source_observation());
+    let healthy_first_frame_ms =
+        if with_stalled {
+            let received = timeout(Duration::from_secs(2), first_frame_rx)
+                .await
+                .map_err(|_| "Hängender Handshake blockiert den gesunden Medienfluss")?
+                .map_err(|_| "Gesunder Empfänger meldete kein Videobild")?;
+            if !running.status().outputs.iter().any(|output| {
+                output.id == "stalled-handshake" && output.state == OutputState::Starting
+            }) {
+                return Err(
+                    "Gesunder Medienfluss wurde nicht während des fremden Handshakes nachgewiesen",
+                );
+            }
+            Some(received.duration_since(started_at).as_millis())
+        } else {
+            None
+        };
+    let healthy_ended_ms = if with_stalled {
+        Some(
+            timeout(Duration::from_secs(2), async {
+                loop {
+                    let state = running.status();
+                    if ["left", "right"].iter().all(|id| {
+                        state
+                            .outputs
+                            .iter()
+                            .any(|output| output.id == *id && output.state == OutputState::Ended)
+                    }) {
+                        if !state.outputs.iter().any(|output| {
+                            output.id == "stalled-handshake"
+                                && output.state == OutputState::Starting
+                        }) {
+                            return Err(
+                                "Gesunde Ziele wurden erst nach dem fremden Handshake beendet",
+                            );
+                        }
+                        return Ok(Instant::now().duration_since(started_at).as_millis());
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .map_err(|_| "Fremder Handshake blockiert den Abschluss gesunder Ziele")??,
+        )
+    } else {
+        None
+    };
     let report = running.finish().await;
+    if let Some(stalled) = stalled {
+        stalled.finish().await??;
+    }
     source.finish().await??;
     let (input_report, input_times) = feed.finish().await?;
     if input_report.reason != EndReason::ExplicitStop {
@@ -488,6 +606,13 @@ async fn run(
     if with_slow && !isolated {
         return Err("Isolation des langsamen Empfängers wurde nicht bestätigt");
     }
+    let stalled_isolated = with_stalled
+        && report.status.outputs.iter().any(|output| {
+            output.id == "stalled-handshake" && matches!(output.state, OutputState::Failed(_))
+        });
+    if with_stalled && !stalled_isolated {
+        return Err("Hängender Handshake endete ohne sichtbaren Fehler");
+    }
     let result = ProbeReport {
         source: source_name,
         output: "H.264 256×144/25, 384 kbit/s, lokale TLS-Ziele",
@@ -500,6 +625,9 @@ async fn run(
         slow_receiver_isolated: isolated,
         common_timestamp_offset_ms: timestamp_offset,
         source_audio_ids: audio_ids,
+        stalled_handshake_isolated: stalled_isolated,
+        healthy_first_frame_ms,
+        healthy_ended_ms,
     };
     directory.remove()?;
     Ok(result)
@@ -807,30 +935,34 @@ async fn main() -> ExitCode {
         let (ffmpeg, ffprobe) = arguments()?;
         ffmpeg_listener(&ffmpeg).await?;
         let av1 = generate_av1(&ffmpeg).await?;
-        for (fixture, name, slow, audio_ids) in [
+        for (fixture, name, slow, audio_ids, stalled) in [
             (
                 Arc::from(H264),
                 "H.264 320×180/25 + AAC 440/880 Hz",
                 false,
                 [0, 1],
+                true,
             ),
             (
                 av1.clone(),
                 "AV1 BT.709 320×180/25 + AAC 440/880 Hz",
                 false,
                 [0, 1],
+                false,
             ),
             (
                 av1.clone(),
                 "AV1 BT.709 320×180/25 + AAC 440/880 Hz",
                 true,
                 [0, 1],
+                false,
             ),
             (
                 av1,
                 "AV1 BT.709 320×180/25 + AAC 440/880 Hz, vertauschte Header",
                 false,
                 [7, 12],
+                false,
             ),
         ] {
             let report = timeout(
@@ -842,6 +974,7 @@ async fn main() -> ExitCode {
                     name,
                     slow,
                     audio_ids,
+                    stalled,
                 ),
             )
             .await

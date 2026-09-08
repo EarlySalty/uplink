@@ -190,6 +190,172 @@ async fn native_rtmps_preserves_av1_h264_and_two_aac_tracks_exactly() {
 }
 
 #[tokio::test]
+async fn queued_short_stream_finishes_after_delayed_publish_without_losing_headers_or_audio() {
+    let (server, target, _) = test_target("localhost", true).await;
+    let (release, wait) = tokio::sync::oneshot::channel();
+    let capture = tokio::spawn(async move {
+        wait.await.unwrap();
+        let mut connection = server.accept().await.unwrap();
+        let mut received = Vec::new();
+        while let Some(event) = connection.next().await {
+            received.push((
+                event.identity.track.kind,
+                event.dts_ms,
+                event.wire_body().to_vec(),
+            ));
+        }
+        (received, connection.finish().await)
+    });
+    let pusher = RunningPusher::spawn(target, MediaLimits::default()).unwrap();
+    assert_eq!(pusher.status().state, OutputState::Starting);
+    let mut reader = FlvReader::new(
+        include_bytes!("../../../experiments/scuffle-probe/fixtures/h264.flv").as_slice(),
+        65536,
+    );
+    let mut expected = Vec::new();
+    while let Some(tag) = reader.next().await.unwrap() {
+        if tag.kind() != 18 {
+            expected.push((
+                if tag.kind() == 8 {
+                    MediaKind::Audio
+                } else {
+                    MediaKind::Video
+                },
+                tag.timestamp_ms(),
+                tag.body().to_vec(),
+            ));
+        }
+        pusher.try_send(Arc::new(tag)).unwrap();
+    }
+    assert_eq!(pusher.status().state, OutputState::Starting);
+    let finishing = tokio::spawn(pusher.finish());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !finishing.is_finished(),
+        "finish must retain queued media while publish is still pending"
+    );
+    release.send(()).unwrap();
+    let status = timeout(Duration::from_secs(2), finishing)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(status.state, OutputState::Ended);
+    let (received, report) = timeout(Duration::from_secs(2), capture)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(report.reason, EndReason::ExplicitStop);
+    assert_eq!(received, expected);
+}
+
+#[tokio::test]
+async fn connecting_target_queue_is_bounded_and_stop_releases_its_tcp_socket() {
+    use tokio::io::AsyncReadExt;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (connected, wait) = tokio::sync::oneshot::channel();
+    let peer = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0; 1537];
+        socket.read_exact(&mut request).await.unwrap();
+        connected.send(()).unwrap();
+        let mut byte = [0];
+        assert_eq!(socket.read(&mut byte).await.unwrap(), 0);
+    });
+    let mut target = target(&format!("rtmp://localhost:{port}/live"));
+    target.allow_loopback = true;
+    target.allow_unencrypted = true;
+    let limits = MediaLimits {
+        queue_events: 2,
+        startup_timeout: Duration::from_secs(20),
+        ..MediaLimits::default()
+    };
+    let pusher = RunningPusher::spawn(target, limits).unwrap();
+    timeout(Duration::from_secs(1), wait)
+        .await
+        .unwrap()
+        .unwrap();
+    let tag = Arc::new(FlvTag::new(8, 0, Arc::from(&b"\xaf\x00\x11\x90"[..]), 64).unwrap());
+    pusher.try_send(tag.clone()).unwrap();
+    pusher.try_send(tag.clone()).unwrap();
+    assert_eq!(pusher.try_send(tag), Err(MediaError::Backpressure));
+    assert_eq!(pusher.status().state, OutputState::Starting);
+    assert!(matches!(
+        timeout(Duration::from_secs(1), pusher.stop())
+            .await
+            .unwrap(),
+        Err(MediaError::Cancelled)
+    ));
+    timeout(Duration::from_secs(1), peer)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn immediate_stop_before_startup_poll_never_opens_a_connection() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut target = target(&format!(
+        "rtmp://localhost:{}/live",
+        listener.local_addr().unwrap().port()
+    ));
+    target.allow_loopback = true;
+    target.allow_unencrypted = true;
+    let pusher = RunningPusher::spawn(target, MediaLimits::default()).unwrap();
+    assert!(matches!(pusher.stop().await, Err(MediaError::Cancelled)));
+    assert!(
+        timeout(Duration::from_millis(50), listener.accept())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn finishing_a_stalled_start_reports_timeout_and_joins_transport_cleanup() {
+    use tokio::io::AsyncReadExt;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (connected, wait) = tokio::sync::oneshot::channel();
+    let peer = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0; 1537];
+        socket.read_exact(&mut request).await.unwrap();
+        connected.send(()).unwrap();
+        let mut byte = [0];
+        assert_eq!(socket.read(&mut byte).await.unwrap(), 0);
+    });
+    let mut target = target(&format!("rtmp://localhost:{port}/live"));
+    target.allow_loopback = true;
+    target.allow_unencrypted = true;
+    let limits = MediaLimits {
+        startup_timeout: Duration::from_secs(20),
+        shutdown_timeout: Duration::from_millis(100),
+        ..MediaLimits::default()
+    };
+    let pusher = RunningPusher::spawn(target, limits).unwrap();
+    pusher
+        .try_send(Arc::new(
+            FlvTag::new(8, 0, Arc::from(&b"\xaf\x00\x11\x90"[..]), 64).unwrap(),
+        ))
+        .unwrap();
+    timeout(Duration::from_secs(1), wait)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        timeout(Duration::from_secs(1), pusher.finish())
+            .await
+            .unwrap(),
+        Err(MediaError::StartTimeout)
+    ));
+    timeout(Duration::from_secs(1), peer)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
 async fn wrong_ca_and_real_wrong_san_fail_before_publish_authorization() {
     for wrong_ca in [false, true] {
         let (server, mut target, auth) = test_target(

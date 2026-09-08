@@ -14,7 +14,7 @@ use tokio::{
     io::AsyncWriteExt,
     process::{Child, ChildStdin, Command},
     sync::{mpsc, watch},
-    task::JoinHandle,
+    task::{JoinHandle, JoinSet},
     time::{Instant, timeout, timeout_at},
 };
 use uplink_ingest::{EventKind, MediaEvent};
@@ -254,10 +254,7 @@ async fn run(
         if error.is_some() {
             break;
         }
-        let started = tokio::select! {
-            value = RunningPusher::start(route.target, config.limits.clone()) => value,
-            _ = stopped.changed() => Err(MediaError::Cancelled),
-        };
+        let started = RunningPusher::spawn(route.target, config.limits.clone());
         match started {
             Ok(pusher) => sinks
                 .lock()
@@ -392,26 +389,54 @@ async fn run(
         let mut locked = sinks.lock().unwrap_or_else(|error| error.into_inner());
         std::mem::take(&mut *locked)
     };
+    let mut finishing = JoinSet::new();
+    let mut cancellations = Vec::new();
     for (index, mut sink) in owned_sinks.into_iter().enumerate() {
         let Some(pusher) = sink.pusher.take() else {
             continue;
         };
-        let final_state = if error.is_some() || sink.failure.is_some() {
-            pusher.stop().await
-        } else {
-            pusher.finish().await
-        };
-        status.send_modify(|current| {
-            if let Some(item) = current.outputs.get_mut(index) {
-                match final_state {
-                    Ok(ref final_state) => *item = final_state.clone(),
-                    Err(reason) => item.state = OutputState::Failed(reason),
+        cancellations.push(pusher.cancellation());
+        let updates = status.clone();
+        let failure = sink.failure.or(error);
+        finishing.spawn(async move {
+            let final_state = if failure.is_some() {
+                pusher.stop().await
+            } else {
+                pusher.finish().await
+            };
+            updates.send_modify(|current| {
+                if let Some(item) = current.outputs.get_mut(index) {
+                    match final_state {
+                        Ok(ref final_state) => *item = final_state.clone(),
+                        Err(reason) => item.state = OutputState::Failed(reason),
+                    }
+                    if let Some(reason) = failure {
+                        item.state = OutputState::Failed(reason);
+                    }
                 }
-                if let Some(reason) = sink.failure.or(error) {
-                    item.state = OutputState::Failed(reason);
-                }
-            }
+            });
         });
+    }
+    let mut listen_for_stop = true;
+    while !finishing.is_empty() {
+        tokio::select! {
+            biased;
+            _=stopped.changed(), if listen_for_stop=>{
+                listen_for_stop=false;
+                error.get_or_insert(MediaError::Cancelled);
+                for cancel in &cancellations {cancel.send_replace(true);}
+            },
+            result=finishing.join_next()=>{
+                if matches!(result,Some(Err(_))) {
+                    error.get_or_insert(MediaError::ProcessCleanupFailed);
+                    status.send_modify(|current| {
+                        for output in &mut current.outputs {
+                            if matches!(output.state,OutputState::Starting|OutputState::Publishing) {output.state=OutputState::Failed(MediaError::ProcessCleanupFailed);}
+                        }
+                    });
+                }
+            },
+        }
     }
     let final_status = status.borrow().clone();
     MediaReport {
