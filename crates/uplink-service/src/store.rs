@@ -53,6 +53,14 @@ impl Store {
         sql: &str,
         params: &[&(dyn ToSql + Sync)],
     ) -> Result<Vec<Row>, &'static str> {
+        self.query_with_retention(sql, params, None).await
+    }
+    pub(crate) async fn query_with_retention(
+        &self,
+        sql: &str,
+        params: &[&(dyn ToSql + Sync)],
+        retention: Option<Arc<dyn std::any::Any + Send + Sync>>,
+    ) -> Result<Vec<Row>, &'static str> {
         let slot = self
             .slots
             .clone()
@@ -81,6 +89,7 @@ impl Store {
         // Nach der begrenzten Nachlaufzeit schließt Drop die Verbindung hart.
         let driver = tokio::spawn(async move {
             let _slot = slot;
+            let _retention = retention;
             let _ = timeout_at(deadline + CLEANUP_GRACE, driver).await;
         });
         let result = async {

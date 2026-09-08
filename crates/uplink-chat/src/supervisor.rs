@@ -1,6 +1,10 @@
 use crate::adapter::ChatFehler;
 pub fn hinweis_fuer(e: &ChatFehler) -> String {
     match e {
+        ChatFehler::ZugangUnbestaetigt(p) => format!(
+            "{}: Chat-Zugang fehlt oder ist nicht bestätigt. Verbindung im Dashboard prüfen.",
+            p.anzeige()
+        ),
         ChatFehler::NichtUnterstuetzt(p) => {
             format!("{}: Chat-Zugang ist noch nicht freigegeben.", p.anzeige())
         }

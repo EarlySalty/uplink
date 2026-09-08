@@ -24,8 +24,6 @@ zeroize = "1"
 
 [dev-dependencies]
 wiremock = "0.6"
-rsa = { version = "0.9", features = ["sha2"] }
-rand = "0.8"
 tower = { version = "0.5", features = ["util"] }
 
 [lints]

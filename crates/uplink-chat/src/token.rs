@@ -34,6 +34,8 @@ pub type Zugang = Grant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum BrokerError {
+    #[error("Chat-Zugang ist nicht bestätigt")]
+    AccessUnconfirmed,
     #[error("Plattform ist nicht verbunden")]
     Disconnected,
     #[error("Anmeldung muss erneuert werden")]
@@ -68,6 +70,8 @@ pub trait PlatformBroker: Send + Sync {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum TokenFehler {
+    #[error("{0}: Chat-Zugang ist nicht bestätigt")]
+    ZugangUnbestaetigt(Platform),
     #[error("{0} ist nicht verbunden")]
     NichtVerbunden(Platform),
     #[error("{0}: Anmeldung muss erneuert werden")]
@@ -139,6 +143,7 @@ impl TokenQuelle {
             .grant(uid, p, refresh)
             .await
             .map_err(|e| match e {
+                BrokerError::AccessUnconfirmed => TokenFehler::ZugangUnbestaetigt(p),
                 BrokerError::Disconnected => TokenFehler::NichtVerbunden(p),
                 BrokerError::NeedsReauth => TokenFehler::NeuAnmeldungNoetig(p),
                 BrokerError::Unauthorized => TokenFehler::Abgelehnt,
@@ -200,6 +205,11 @@ impl TokenQuelle {
         }
     }
     pub fn forget(&self, id: i64) {
+        // Vorher gestartete Brokerantworten dürfen nach Identitätsentzug
+        // weder Cache noch Adapter wieder mit dem alten Grant versorgen.
+        for platform in Platform::ALL {
+            self.recheck(id, platform);
+        }
         self.cache
             .lock()
             .expect("Grants")
@@ -397,5 +407,48 @@ mod cache_regressions {
         source.invalidieren(7, Platform::Twitch);
         source.zugang(7, Platform::Twitch).await.unwrap();
         assert_eq!(broker.calls.load(Ordering::Acquire), 2);
+    }
+
+    #[tokio::test]
+    async fn forgotten_identity_cannot_restore_an_inflight_grant() {
+        struct Paused {
+            started: tokio::sync::Notify,
+            finish: tokio::sync::Notify,
+        }
+        impl PlatformBroker for Paused {
+            fn grant(
+                &self,
+                _: u64,
+                _: Platform,
+                _: bool,
+            ) -> BoxFuture<'_, Result<Grant, BrokerError>> {
+                Box::pin(async {
+                    self.started.notify_one();
+                    self.finish.notified().await;
+                    Ok(Grant {
+                        access_token: "synthetic".into(),
+                        expires_at: Utc::now() + chrono::Duration::hours(1),
+                        platform_user_id: "7".into(),
+                        platform_login: "unused".into(),
+                        scopes: vec![],
+                    })
+                })
+            }
+        }
+        let broker = Arc::new(Paused {
+            started: tokio::sync::Notify::new(),
+            finish: tokio::sync::Notify::new(),
+        });
+        let source = Arc::new(TokenQuelle::from_broker(broker.clone()));
+        let cloned = source.clone();
+        let request = tokio::spawn(async move { cloned.zugang(7, Platform::Twitch).await });
+        broker.started.notified().await;
+        source.forget(7);
+        broker.finish.notify_one();
+        assert!(
+            request.await.unwrap().is_err(),
+            "Dockentzug darf keinen vorher gestarteten Grant wieder aktivieren"
+        );
+        assert!(source.cache.lock().unwrap().is_empty());
     }
 }

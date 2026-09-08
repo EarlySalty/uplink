@@ -1,7 +1,8 @@
-# Technische Startkonfiguration. Kein Plattform- oder Kapazitätsnachweis.
+# Technische Vorlage, keine installierte öffentliche Adresse.
+# Bindung, DNS und Firewall vor dem regulären Wechsel gemeinsam prüfen.
 api_bind = "127.0.0.1:8892"
-ingest_bind = "127.0.0.1:8893"
-public_ingest_url = "rtmps://deutsche-deadlock-community.de:443/live"
+ingest_bind = "127.0.0.1:1935"
+public_ingest_url = "rtmps://ingest.example.invalid:1935/live"
 dock_base_url = "https://deutsche-deadlock-community.de/uplink"
 max_sessions = 4
 max_sessions_per_tenant = 1
@@ -16,6 +17,13 @@ secret_path = "/"
 # Vom vorhandenen autorisierten Startprozess geöffneter FD; keine neue Datei.
 credential_fd = 5
 
+[chat]
+bot_base_url = "http://127.0.0.1:8769"
+allowed_origins = ["https://deutsche-deadlock-community.de"]
+max_users = 128
+max_sockets_per_user = 8
+idle_timeout_seconds = 120
+
 [tls]
 # Nur Namen; Bereitstellung und Erneuerung müssen vor Start eingerichtet sein.
 source = "infisical"
@@ -23,8 +31,8 @@ certificate_secret = "UPLINK_TLS_CERTIFICATE"
 private_key_secret = "UPLINK_TLS_PRIVATE_KEY"
 
 [media]
-ffmpeg = "/opt/uplink/media/ffmpeg"
-ffprobe = "/opt/uplink/media/ffprobe"
+ffmpeg = "/opt/uplink/media/ffmpeg8-c733b4b2/ffmpeg"
+ffprobe = "/opt/uplink/media/ffmpeg8-c733b4b2/ffprobe"
 work_directory = "/run/user/1000/uplink-media"
 max_event_bytes = 2097152
 max_queued_bytes = 16777216

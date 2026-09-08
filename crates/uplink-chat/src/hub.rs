@@ -87,7 +87,7 @@ impl Drop for ChatHub {
     }
 }
 #[derive(Serialize)]
-pub(crate) struct Status {
+pub struct Status {
     pub platform: Platform,
     pub eingerichtet: bool,
     pub verbunden: bool,
@@ -96,6 +96,22 @@ pub(crate) struct Status {
     pub zustand: &'static str,
 }
 impl ChatHub {
+    /// Identität wurde vom Dienst bereits dauerhaft und mandantenbezogen geprüft.
+    pub fn status_for(self: &Arc<Self>, id: u64) -> Result<Vec<Status>, &'static str> {
+        let user = self.ensure(id)?;
+        Ok(self.status(&user))
+    }
+    pub fn user_ids(&self) -> Vec<u64> {
+        self.users.lock().expect("Nutzer").keys().copied().collect()
+    }
+    /// Nach persistenter Dockrotation oder Nutzersperre bestehende Adapter und
+    /// Websockets abbrechen; neue Zugriffe müssen die neue Identität prüfen.
+    pub fn invalidate(&self, id: u64) {
+        if let Some(user) = self.users.lock().expect("Nutzer").remove(&id) {
+            user.cancel.cancel();
+        }
+        self.source.forget(id as i64);
+    }
     pub fn new(
         config: ChatConfig,
         identity: Arc<dyn DockIdentity>,
@@ -341,6 +357,7 @@ impl ChatHub {
                 Status {
                     platform: p,
                     zustand: match &e {
+                        Some(ChatFehler::ZugangUnbestaetigt(_)) => "access_unconfirmed",
                         Some(ChatFehler::NichtVerbunden(_)) => "disconnected",
                         Some(ChatFehler::NeuAnmeldungNoetig(_)) => "needs_reauth",
                         Some(ChatFehler::NichtUnterstuetzt(_)) => "unsupported",

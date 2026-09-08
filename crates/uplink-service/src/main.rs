@@ -44,6 +44,11 @@ async fn run() -> Result<(), &'static str> {
         );
         return Ok(());
     }
+    if config.test_ingest.is_some()
+        && mode.as_deref() != Some(std::ffi::OsStr::new("--ingest-test"))
+    {
+        return Err("Ein reiner Testeingang darf nicht als regulärer Uplink-Dienst starten.");
+    }
     uplink_service::secrets::protect_configured_fds(&config)?;
     let reader = uplink_service::secrets::SecretReader::new(&config).await?;
     let secrets = Arc::new(reader.fetch().await?);
@@ -91,7 +96,29 @@ async fn run() -> Result<(), &'static str> {
     let reload_seconds = config.tls_reload_seconds;
     let store = Arc::new(Store::connect(&secrets.database, config.database_max_queries).await?);
     let registry = Registry::new(config.max_sessions, config.max_sessions_per_tenant)?;
+    let chat = config
+        .chat
+        .as_ref()
+        .map(|chat| {
+            let identities = Arc::new(uplink_service::chat::StoredDockIdentity(store.clone()));
+            let broker = Arc::new(uplink_service::chat::BotBroker::new(
+                &chat.bot_base_url,
+                uplink_service::crypto::Secret::new(secrets.bot_internal.expose().to_vec()),
+            )?);
+            uplink_chat::ChatHub::new(
+                uplink_chat::ChatConfig {
+                    allowed_origins: chat.allowed_origins.clone(),
+                    max_users: chat.max_users,
+                    max_sockets_per_user: chat.max_sockets_per_user,
+                    idle_timeout: std::time::Duration::from_secs(chat.idle_timeout_seconds),
+                },
+                identities,
+                broker,
+            )
+        })
+        .transpose()?;
     let state = Arc::new(ServiceState {
+        chat,
         config,
         store,
         secrets,

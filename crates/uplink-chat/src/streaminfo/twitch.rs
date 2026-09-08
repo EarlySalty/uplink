@@ -144,6 +144,12 @@ impl StreamInfoAdapter for TwitchStreamInfo {
             if body.is_empty() {
                 return Ok(());
             }
+            if !crate::twitch::scope_vorhanden(
+                &self.client.zugang().await?.scopes,
+                "channel:manage:broadcast",
+            ) {
+                return Err(ChatFehler::NeuAnmeldungNoetig(Platform::Twitch));
+            }
             let (status, koerper) = self
                 .client
                 .anfrage(
@@ -350,8 +356,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn titel_ohne_verwaltungsrecht_sendet_keinen_patch() {
+        let server = bot_und_helix_mit_scopes(1, &["user:read:chat"]).await;
+        Mock::given(method("PATCH"))
+            .and(path("/channels"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let patch = StreamInfoPatch {
+            title: Some("Neuer Titel".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            adapter(&server).await.setzen(&patch).await,
+            Err(ChatFehler::NeuAnmeldungNoetig(Platform::Twitch))
+        );
+    }
+
+    #[tokio::test]
     async fn stream_info_setzen_400_ist_lesbarer_fehler() {
-        let server = bot_und_helix_mit_scopes(1, &[]).await;
+        let server = bot_und_helix_mit_scopes(1, &["channel:manage:broadcast"]).await;
         Mock::given(method("PATCH"))
             .and(path("/channels"))
             .respond_with(ResponseTemplate::new(400).set_body_json(json!({

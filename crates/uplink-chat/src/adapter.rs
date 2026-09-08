@@ -17,6 +17,8 @@ use crate::nachricht::Ereignis;
 /// Was beim Verbinden oder Senden schiefgehen kann.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ChatFehler {
+    #[error("{0}: Chat-Zugang ist nicht bestätigt")]
+    ZugangUnbestaetigt(Platform),
     /// Fuer diese Plattform gibt es noch keinen Adapter.
     #[error("{0} hat noch keinen Chat-Adapter")]
     NichtUnterstuetzt(Platform),
@@ -56,6 +58,7 @@ impl ChatFehler {
         !matches!(
             self,
             Self::NichtUnterstuetzt(_)
+                | Self::ZugangUnbestaetigt(_)
                 | Self::NichtVerbunden(_)
                 | Self::NeuAnmeldungNoetig(_)
                 | Self::InternerZugang

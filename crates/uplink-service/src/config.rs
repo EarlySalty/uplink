@@ -5,6 +5,8 @@ use std::net::SocketAddr;
 #[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
+    pub chat: Option<ChatSettings>,
+    #[serde(default)]
     pub test_ingest: Option<TestIngestConfig>,
     #[serde(default = "tls_reload_default")]
     pub tls_reload_seconds: u64,
@@ -22,6 +24,15 @@ pub struct Config {
     pub tls: TlsConfig,
     pub media: MediaConfig,
     pub platforms: Vec<PlatformConfig>,
+}
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChatSettings {
+    pub bot_base_url: String,
+    pub allowed_origins: Vec<String>,
+    pub max_users: usize,
+    pub max_sockets_per_user: usize,
+    pub idle_timeout_seconds: u64,
 }
 fn tls_reload_default() -> u64 {
     60
@@ -87,6 +98,30 @@ impl Config {
             return Err("Konfigurationsdatei ist zu groß.");
         }
         let config: Self = toml::from_str(input).map_err(|_| "Konfiguration ist ungültig.")?;
+        if let Some(chat) = &config.chat {
+            let base =
+                reqwest::Url::parse(&chat.bot_base_url).map_err(|_| "Botadresse ist ungültig.")?;
+            if !matches!(base.scheme(), "http" | "https")
+                || !matches!(base.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"))
+                || base.path() != "/"
+                || base.query().is_some()
+                || base.fragment().is_some()
+                || !base.username().is_empty()
+                || base.password().is_some()
+                || !(1..=1024).contains(&chat.max_users)
+                || !(1..=32).contains(&chat.max_sockets_per_user)
+                || !(30..=3600).contains(&chat.idle_timeout_seconds)
+                || chat.allowed_origins.is_empty()
+                || chat.allowed_origins.len() > 8
+                || chat.allowed_origins.iter().any(|origin| {
+                    reqwest::Url::parse(origin).map_or(true, |url| {
+                        url.scheme() != "https" || url.origin().ascii_serialization() != *origin
+                    })
+                })
+            {
+                return Err("Chatkonfiguration verletzt Zugriffs- oder Ressourcengrenzen.");
+            }
+        }
         let public_ingest = reqwest::Url::parse(&config.public_ingest_url)
             .map_err(|_| "Öffentliche Eingangsadresse ist ungültig.")?;
         if public_ingest.scheme() != "rtmps"

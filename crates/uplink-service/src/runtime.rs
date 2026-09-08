@@ -45,6 +45,9 @@ impl Authorizer for ServiceAuthorizer {
             .lock()
             .map_err(|_| ())?
             .insert(session, reservation);
+        if let Some(hub) = &self.state.chat {
+            let _ = hub.set_active(tenant, true);
+        }
         Ok(session)
     }
     fn release(&self, session: AuthorizedSession) {
@@ -54,7 +57,11 @@ impl Authorizer for ServiceAuthorizer {
     }
     fn completed(&self, session: AuthorizedSession, report: &uplink_ingest::SessionReport) {
         if let Some(reservation) = self.reservation(session) {
+            reservation.generation(report.generation);
             reservation.ingest_ended(&report.reason);
+        }
+        if let Some(hub) = &self.state.chat {
+            let _ = hub.set_active(session.tenant_id(), false);
         }
     }
     fn retention(
@@ -119,19 +126,55 @@ pub async fn serve_with_ready<P: SessionProcessor>(
                 .map_err(|_| "Eingangsadresse ist nicht verfügbar.")?,
         ));
     }
+    let chat = state.chat.clone();
+    let chat_store = state.store.clone();
+    let app = router(state);
     let mut http = tokio::spawn(async move {
-        axum::serve(listener, router(state))
+        axum::serve(listener, app)
             .with_graceful_shutdown(async {
                 let _ = stopped.await;
             })
             .await
     });
     let mut tasks = JoinSet::new();
+    // Auch geöffnete Dashboards ohne Socket dürfen Chat nach einer Sperre
+    // nicht unbegrenzt weiterbetreiben. DBfehler schließen den Zugang sicher.
+    let chat_check = async {
+        let Some(hub) = &chat else {
+            std::future::pending::<()>().await;
+            return;
+        };
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(10));
+        loop {
+            tick.tick().await;
+            let ids = hub.user_ids();
+            if ids.is_empty() {
+                continue;
+            }
+            let ids: Vec<i64> = ids
+                .into_iter()
+                .filter_map(|id| i64::try_from(id).ok())
+                .collect();
+            let allowed=chat_store.query("SELECT streamer_id FROM relay.users WHERE streamer_id=ANY($1) AND enabled=true", &[&ids]).await;
+            let allowed: std::collections::HashSet<i64> = allowed
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|row| row.try_get(0).ok())
+                .collect();
+            for id in ids {
+                if !allowed.contains(&id) {
+                    hub.invalidate(id as u64);
+                }
+            }
+        }
+    };
+    tokio::pin!(chat_check);
     let (stop_media, media_stopped) = tokio::sync::watch::channel(false);
     tokio::pin!(shutdown);
     loop {
         tokio::select! {
             _ = &mut shutdown => break,
+            _ = &mut chat_check => break,
             connection = ingest.accept() => {
                 let Ok(mut connection) = connection else { continue; };
                 let processor = processor.clone();
@@ -143,6 +186,7 @@ pub async fn serve_with_ready<P: SessionProcessor>(
                     let first=tokio::select!{first=connection.next()=>first,_=media_stopped.changed()=>None};
                     let Some(first) = first else { let _=connection.finish().await; return; };
                     let Some(reservation) = first.authorization_retention().and_then(|value| value.downcast::<Reservation>().ok()) else { return; };
+                    reservation.generation(first.identity.generation);
                     reservation.record(first.wire_body().len());
                     let (sender, receiver) = mpsc::channel(256);
                     let processing = processor.process(first, receiver);
@@ -176,6 +220,9 @@ pub async fn serve_with_ready<P: SessionProcessor>(
         while tasks.join_next().await.is_some() {}
     }
     let _ = stop.send(());
+    if let Some(hub) = &chat {
+        hub.shutdown().await;
+    }
     match tokio::time::timeout(std::time::Duration::from_secs(5), &mut http).await {
         Ok(Ok(Ok(()))) if drained => Ok(()),
         _ => {

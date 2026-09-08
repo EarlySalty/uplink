@@ -11,20 +11,54 @@ fn isolated_ingest_scope_requires_one_positive_explicit_identity() {
 }
 
 #[test]
+fn normal_binary_refuses_input_only_configuration_before_secret_access() {
+    let example = include_str!("../../../config/uplink-beispiel.toml");
+    let mut bytes = [0; 8];
+    getrandom::fill(&mut bytes).unwrap();
+    let path =
+        std::env::temp_dir().join(format!("uplink-normal-start-{}.toml", hex::encode(bytes)));
+    std::fs::write(
+        &path,
+        format!("{example}\n[test_ingest]\nallowed_streamer_ids=[11]\n"),
+    )
+    .unwrap();
+    let binary = std::env::current_exe()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("uplink-service");
+    let output = std::process::Command::new(binary)
+        .arg("--config")
+        .arg(&path)
+        .output();
+    std::fs::remove_file(path).unwrap();
+    let output = output.unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap().trim(),
+        "Ein reiner Testeingang darf nicht als regulärer Uplink-Dienst starten."
+    );
+    assert!(output.stdout.is_empty());
+}
+
+#[test]
 fn public_ingest_never_accepts_private_test_roots_or_embedded_credentials() {
     let example = include_str!("../../../config/uplink-beispiel.toml");
     let local = format!("loopback_test_ca = \"/tmp/public-ca.pem\"\n{example}");
     assert!(Config::parse(&local).is_ok());
-    assert!(Config::parse(&local.replace("127.0.0.1:8893", "0.0.0.0:8893")).is_err());
+    let mut public: toml::Value = toml::from_str(&local).unwrap();
+    public["ingest_bind"] = toml::Value::String("0.0.0.0:1935".into());
+    assert!(Config::parse(&toml::to_string(&public).unwrap()).is_err());
     for bad in [
         "rtmps://synthetic:key@example.org/live",
         "rtmps://example.org/live?key=synthetic",
         "rtmps://example.org/live/synthetic",
     ] {
-        assert!(
-            Config::parse(&example.replace("rtmps://deutsche-deadlock-community.de:443/live", bad))
-                .is_err()
-        );
+        let mut config: toml::Value = toml::from_str(example).unwrap();
+        config["public_ingest_url"] = toml::Value::String(bad.into());
+        assert!(Config::parse(&toml::to_string(&config).unwrap()).is_err());
     }
 }
 
@@ -49,6 +83,22 @@ fn per_tenant_reservation_releases_on_drop_and_bounds_global_work() {
     drop(second);
     drop(replacement);
     assert_eq!(registry.active_count(), 0);
+}
+
+#[test]
+fn destination_change_excludes_admission_until_every_database_owner_releases_it() {
+    let registry = Registry::new(2, 1).unwrap();
+    let change = registry.begin_change(11).unwrap();
+    let database_owner = change.clone();
+    assert!(registry.reserve(11).is_err());
+    assert!(registry.reserve(12).is_ok());
+    drop(change);
+    assert!(registry.reserve(11).is_err());
+    drop(database_owner);
+    let active = registry.reserve(11).unwrap();
+    assert!(registry.begin_change(11).is_err());
+    drop(active);
+    assert!(registry.begin_change(11).is_ok());
 }
 
 #[test]

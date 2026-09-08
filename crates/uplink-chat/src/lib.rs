@@ -18,7 +18,7 @@ pub mod token;
 pub mod twitch;
 pub mod twitch_activity;
 pub mod youtube;
-pub use hub::{ChatConfig, ChatHub, DockIdentity, DockUser};
+pub use hub::{ChatConfig, ChatHub, DockIdentity, DockUser, Status as ChatStatus};
 pub use router::router;
 pub use token::{BrokerError, Grant, PlatformBroker};
 

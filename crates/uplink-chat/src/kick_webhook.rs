@@ -530,38 +530,90 @@ fn inhalt_zu_fragmenten(inhalt: &str) -> Vec<Fragment> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rsa::pkcs1v15::SigningKey;
-    use rsa::pkcs8::EncodePublicKey;
-    use rsa::signature::{SignatureEncoding, Signer};
-    use rsa::{RsaPrivateKey, RsaPublicKey};
+    use ring::signature::RsaKeyPair;
     use serde_json::json;
-    use sha2::Sha256;
+    use std::sync::Arc;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    fn schluesselpaar() -> (RsaPrivateKey, String) {
-        static PAAR: std::sync::OnceLock<(RsaPrivateKey, String)> = std::sync::OnceLock::new();
+    fn openssl(args: &[&str], input: &[u8]) -> Vec<u8> {
+        use std::io::{Read, Write};
+        use std::process::{Command, Stdio};
+        let mut child = Command::new("/usr/bin/openssl")
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("OpenSSL ist für künstliche RSA-Testschlüssel erforderlich");
+        child.stdin.take().unwrap().write_all(input).unwrap();
+        let until = std::time::Instant::now() + Duration::from_secs(15);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if std::time::Instant::now() >= until {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("RSA-Testschlüssel hat die Frist überschritten");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert!(
+            status.success(),
+            "Künstlicher RSA-Testschlüssel konnte nicht erzeugt werden"
+        );
+        let mut output = Vec::new();
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .take(16385)
+            .read_to_end(&mut output)
+            .unwrap();
+        assert!(output.len() <= 16384);
+        output
+    }
+    fn schluesselpaar() -> (Arc<RsaKeyPair>, String) {
+        static PAAR: std::sync::OnceLock<(Arc<RsaKeyPair>, String)> = std::sync::OnceLock::new();
         PAAR.get_or_init(|| {
-            let mut rng = rand::thread_rng();
-            let privat = RsaPrivateKey::new(&mut rng, 2048).expect("Testschluessel");
-            let pem = RsaPublicKey::from(&privat)
-                .to_public_key_pem(rsa::pkcs8::LineEnding::LF)
-                .expect("PEM");
-            (privat, pem)
+            let der = zeroize::Zeroizing::new(openssl(
+                &[
+                    "genpkey",
+                    "-algorithm",
+                    "RSA",
+                    "-pkeyopt",
+                    "rsa_keygen_bits:2048",
+                    "-outform",
+                    "DER",
+                ],
+                &[],
+            ));
+            let pem =
+                String::from_utf8(openssl(&["pkey", "-inform", "DER", "-pubout"], &der)).unwrap();
+            let privat = RsaKeyPair::from_der(&der).expect("Künstlicher RSA-Testschlüssel");
+            (Arc::new(privat), pem)
         })
         .clone()
     }
 
-    fn signieren(privat: &RsaPrivateKey, message_id: &str, timestamp: &str, body: &[u8]) -> String {
-        let signer = SigningKey::<Sha256>::new(privat.clone());
+    fn signieren(privat: &RsaKeyPair, message_id: &str, timestamp: &str, body: &[u8]) -> String {
         let mut nachricht = Vec::new();
         nachricht.extend_from_slice(message_id.as_bytes());
         nachricht.push(b'.');
         nachricht.extend_from_slice(timestamp.as_bytes());
         nachricht.push(b'.');
         nachricht.extend_from_slice(body);
-        let sig = signer.sign(&nachricht);
-        base64::engine::general_purpose::STANDARD.encode(sig.to_bytes())
+        let mut signature = vec![0; privat.public().modulus_len()];
+        privat
+            .sign(
+                &ring::signature::RSA_PKCS1_SHA256,
+                &ring::rand::SystemRandom::new(),
+                &nachricht,
+                &mut signature,
+            )
+            .unwrap();
+        base64::engine::general_purpose::STANDARD.encode(signature)
     }
 
     fn drehkreuz(server: &MockServer) -> KickDrehkreuz {

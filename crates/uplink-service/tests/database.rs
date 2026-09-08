@@ -141,6 +141,7 @@ async fn fixture() -> (Database, Arc<ServiceState>) {
     config.ingest_bind = "127.0.0.1:0".parse().unwrap();
     config.request_timeout_seconds = 1;
     let state = Arc::new(ServiceState {
+        chat: None,
         tls: None,
         config,
         store,
@@ -155,6 +156,369 @@ async fn fixture() -> (Database, Arc<ServiceState>) {
         registry: Registry::new(2, 1).unwrap(),
     });
     (database, state)
+}
+
+#[tokio::test]
+#[ignore = "Benötigt isolierte PostgreSQL-16-Testinstanz."]
+async fn dashboard_never_turns_saved_destination_into_active_output() {
+    let (database, state) = fixture().await;
+    state.store.query("INSERT INTO relay.destinations VALUES(11,'twitch','rtmps://live.twitch.tv/app',$1,true,1920,1080,60,6000)", &[&vec![0u8]]).await.unwrap();
+    let response = router(state.clone())
+        .oneshot(request("GET", "/v1/me?streamer_id=11", ""))
+        .await
+        .unwrap();
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
+    assert_eq!(body["public_ingest_url"], state.config.public_ingest_url);
+    assert_eq!(body["service_status"], "ready");
+    assert!(body["session"].is_null());
+    let response = router(state.clone())
+        .oneshot(request("GET", "/v1/me/destinations?streamer_id=11", ""))
+        .await
+        .unwrap();
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
+    let output = &body["destinations"][0];
+    assert_eq!(output["enabled"], true);
+    assert_eq!(output["requested"]["width"], 1920);
+    assert_eq!(output["output_state"], "unknown");
+    assert!(output["active_profile"].is_null());
+    assert_eq!(output["publication_confirmed"], false);
+    database.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "Benötigt isolierte PostgreSQL-16-Testinstanz."]
+async fn dock_rotation_persists_identity_and_preserves_ingest_key() {
+    let (database, state) = fixture().await;
+    state
+        .store
+        .query(
+            "ALTER TABLE relay.users ADD COLUMN dock_token_hash text",
+            &[],
+        )
+        .await
+        .unwrap();
+    let before: String = state
+        .store
+        .query(
+            "SELECT ingest_key_hash FROM relay.users WHERE streamer_id=11",
+            &[],
+        )
+        .await
+        .unwrap()[0]
+        .get(0);
+    let response = router(state.clone())
+        .oneshot(request("POST", "/v1/me/dock/rotate?streamer_id=11", ""))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let row = &state.store.query("SELECT dock_token_hash,dock_token_enc,ingest_key_hash FROM relay.users WHERE streamer_id=11", &[]).await.unwrap()[0];
+    let encrypted: Vec<u8> = row.get(1);
+    let token = state
+        .secrets
+        .encryption
+        .open(&encrypted, "dock_token:11")
+        .unwrap();
+    use sha2::Digest;
+    assert_eq!(
+        row.get::<_, String>(0),
+        hex::encode(sha2::Sha256::digest(token.expose()))
+    );
+    assert_eq!(row.get::<_, String>(2), before);
+    assert_eq!(token.expose().len(), 37);
+    database.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "Benötigt isolierte PostgreSQL-16-Testinstanz."]
+async fn admin_admission_is_atomic_preserves_keys_and_requires_distinct_auth() {
+    let (database, mut state) = fixture().await;
+    state.store.query("ALTER TABLE relay.waitlist ADD COLUMN requested_at timestamptz NOT NULL DEFAULT now(), ADD COLUMN note text",&[]).await.unwrap();
+    Arc::get_mut(&mut Arc::get_mut(&mut state).unwrap().secrets)
+        .unwrap()
+        .admin = Secret::new(b"synthetic-admin".to_vec());
+    state
+        .store
+        .query(
+            "INSERT INTO relay.waitlist(streamer_id) VALUES(11),(12)",
+            &[],
+        )
+        .await
+        .unwrap();
+    let old: String = state
+        .store
+        .query(
+            "SELECT ingest_key_hash FROM relay.users WHERE streamer_id=11",
+            &[],
+        )
+        .await
+        .unwrap()[0]
+        .get(0);
+    let app = router(state.clone());
+    assert_eq!(
+        app.clone()
+            .oneshot(request("GET", "/v1/admin/waitlist", ""))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let mut listing = request("GET", "/v1/admin/waitlist", "");
+    listing
+        .headers_mut()
+        .insert("X-Relay-Auth", "synthetic-admin".parse().unwrap());
+    let response = app.clone().oneshot(listing).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let listing: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 16384).await.unwrap()).unwrap();
+    assert_eq!(listing["entries"].as_array().unwrap().len(), 2);
+    state
+        .store
+        .query("INSERT INTO relay.waitlist(streamer_id) VALUES(13)", &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        app.clone()
+            .oneshot(request("DELETE", "/v1/admin/waitlist/13", ""))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let mut reject = request("DELETE", "/v1/admin/waitlist/13", "");
+    reject
+        .headers_mut()
+        .insert("X-Relay-Auth", "synthetic-admin".parse().unwrap());
+    assert_eq!(
+        app.clone().oneshot(reject).await.unwrap().status(),
+        StatusCode::OK
+    );
+    for id in [11, 12] {
+        let mut req = request(
+            "POST",
+            "/v1/admin/users",
+            format!("{{\"streamer_id\":{id}}}"),
+        );
+        req.headers_mut()
+            .insert("X-Relay-Auth", "synthetic-admin".parse().unwrap());
+        assert_eq!(
+            app.clone().oneshot(req).await.unwrap().status(),
+            StatusCode::OK
+        );
+    }
+    let count: i64 = state
+        .store
+        .query("SELECT count(*) FROM relay.waitlist", &[])
+        .await
+        .unwrap()[0]
+        .get(0);
+    assert_eq!(count, 0);
+    assert_eq!(
+        state
+            .store
+            .query(
+                "SELECT ingest_key_hash FROM relay.users WHERE streamer_id=11",
+                &[]
+            )
+            .await
+            .unwrap()[0]
+            .get::<_, String>(0),
+        old
+    );
+    let rows=state.store.query("SELECT ingest_key_hash,ingest_key_enc FROM relay.users WHERE streamer_id=12 AND enabled=true",&[]).await.unwrap();
+    let key = state
+        .secrets
+        .encryption
+        .open(&rows[0].get::<_, Vec<u8>>(1), "ingest_key:12")
+        .unwrap();
+    use sha2::Digest;
+    assert_eq!(
+        rows[0].get::<_, String>(0),
+        hex::encode(sha2::Sha256::digest(key.expose()))
+    );
+    database.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "Benötigt isolierte PostgreSQL-16-Testinstanz."]
+async fn profile_disconnect_waits_for_source_end_and_reconnect_setting_stays_a_wish() {
+    let (database, state) = fixture().await;
+    state.store.query("INSERT INTO relay.destinations VALUES(11,'twitch','rtmps://live.twitch.tv/app',$1,true,1920,1080,60,6000)",&[&vec![0u8]]).await.unwrap();
+    let app = router(state.clone());
+    let active = state.registry.reserve(11).unwrap();
+    assert_eq!(
+        app.clone()
+            .oneshot(request(
+                "DELETE",
+                "/v1/me/destinations/twitch?streamer_id=11",
+                ""
+            ))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CONFLICT
+    );
+    drop(active);
+    assert_eq!(
+        app.clone()
+            .oneshot(request(
+                "DELETE",
+                "/v1/me/destinations/twitch?streamer_id=11",
+                ""
+            ))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    let response = app
+        .oneshot(request(
+            "PUT",
+            "/v1/me/reconnect-wait?streamer_id=11",
+            r#"{"reconnect_wait_s":123}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
+    assert_eq!(body["reconnect_wait_s"], 123);
+    assert_eq!(body["applied"], false);
+    database.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "Benötigt isolierte PostgreSQL-16-Testinstanz und lokale HTTP-/Websocket-Verbindungen."]
+async fn stored_docks_survive_hub_restart_and_rotation_revokes_open_socket() {
+    use futures::{StreamExt, future::BoxFuture};
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use uplink_chat::{BrokerError, ChatConfig, ChatHub, Grant, Platform, PlatformBroker};
+    struct Disconnected;
+    impl PlatformBroker for Disconnected {
+        fn grant(&self, _: u64, _: Platform, _: bool) -> BoxFuture<'_, Result<Grant, BrokerError>> {
+            Box::pin(async { Err(BrokerError::Disconnected) })
+        }
+    }
+    let (database, mut state) = fixture().await;
+    state
+        .store
+        .query(
+            "ALTER TABLE relay.users ADD COLUMN dock_token_hash text",
+            &[],
+        )
+        .await
+        .unwrap();
+    let response = router(state.clone())
+        .oneshot(request(
+            "POST",
+            "/v1/me/dock-token/rotate?streamer_id=11",
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let encrypted: Vec<u8> = state
+        .store
+        .query(
+            "SELECT dock_token_enc FROM relay.users WHERE streamer_id=11",
+            &[],
+        )
+        .await
+        .unwrap()[0]
+        .get(0);
+    let token = state
+        .secrets
+        .encryption
+        .open(&encrypted, "dock_token:11")
+        .unwrap();
+    let token = std::str::from_utf8(token.expose()).unwrap();
+    let make_hub = || {
+        ChatHub::new(
+            ChatConfig::default(),
+            Arc::new(uplink_service::chat::StoredDockIdentity(
+                state.store.clone(),
+            )),
+            Arc::new(Disconnected),
+        )
+        .unwrap()
+    };
+    let first_hub = make_hub();
+    first_hub.shutdown().await;
+    let hub = make_hub();
+    Arc::get_mut(&mut state).unwrap().chat = Some(hub.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = router(state.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let response = client
+        .get(format!("http://{addr}/dock/chat"))
+        .query(&[("t", token)])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["Cache-Control"], "no-store");
+    let mut request = format!("ws://{addr}/v1/chat/ws?t={token}")
+        .into_client_request()
+        .unwrap();
+    request.headers_mut().insert(
+        "Origin",
+        "https://deutsche-deadlock-community.de".parse().unwrap(),
+    );
+    let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+    assert!(socket.next().await.unwrap().unwrap().is_text());
+    let response = client
+        .post(format!(
+            "http://{addr}/v1/me/dock-token/rotate?streamer_id=11"
+        ))
+        .header("X-Relay-Auth", "synthetic-api")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while let Some(Ok(message)) = socket.next().await {
+            if message.is_close() {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("Rotation muss bereits offene Verbindung sofort schließen");
+    assert_eq!(
+        client
+            .get(format!("http://{addr}/dock/chat"))
+            .query(&[("t", token)])
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    // Neuer persistenter Token wird nach einer Nutzersperre ebenfalls abgelehnt.
+    state
+        .store
+        .query(
+            "UPDATE relay.users SET enabled=false WHERE streamer_id=11",
+            &[],
+        )
+        .await
+        .unwrap();
+    let response = client
+        .get(format!("http://{addr}/v1/me?streamer_id=11"))
+        .header("X-Relay-Auth", "synthetic-api")
+        .send()
+        .await
+        .unwrap();
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["ingest_key"], "");
+    assert!(body["dock_urls"].is_null());
+    hub.shutdown().await;
+    server.abort();
+    let _ = server.await;
+    database.stop().await;
 }
 
 #[tokio::test]
@@ -618,6 +982,19 @@ async fn unsafe_legacy_endpoint_is_redacted_and_other_targets_remain_visible() {
     assert!(value["destinations"][0]["error"].is_string());
     assert_eq!(value["destinations"][1]["blocked"], false);
     database.stop().await;
+    let response = router(state.clone())
+        .oneshot(request(
+            "GET",
+            "/v1/me/status?streamer_id=11",
+            Body::empty(),
+        ))
+        .await
+        .unwrap();
+    let body = to_bytes(response.into_body(), 16384).await.unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap()["service_status"],
+        "unavailable"
+    );
     let response = router(state)
         .oneshot(request("GET", "/v1/health", Body::empty()))
         .await
@@ -865,30 +1242,23 @@ async fn executable_smoke(database: &Database) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let provider = tokio::spawn(async { axum::serve(listener, app).await.unwrap() });
-    let config = format!(
-        "loopback_test_ca = {:?}\n{}",
-        public_ca,
-        include_str!("../../../config/uplink-beispiel.toml")
-    )
-    .replace("127.0.0.1:8892", "127.0.0.1:0")
-    .replace("127.0.0.1:8893", "127.0.0.1:0")
-    .replace(
-        "rtmps://deutsche-deadlock-community.de:443/live",
-        "rtmps://localhost/live",
-    )
-    .replace("http://127.0.0.1:8080", &format!("http://{address}"))
-    .replace(
-        "credential_fd = 5",
-        &format!("credential_fd = {}", identity.as_raw_fd()),
-    )
-    .replace("/opt/uplink/media/ffmpeg", "/usr/bin/ffmpeg")
-    .replace("/opt/uplink/media/ffprobe", "/usr/bin/ffprobe")
-    .replace(
-        "/run/user/1000/uplink-media",
-        database.directory.join("media").to_str().unwrap(),
+    let mut config: toml::Value =
+        toml::from_str(include_str!("../../../config/uplink-beispiel.toml")).unwrap();
+    config.as_table_mut().unwrap().insert(
+        "loopback_test_ca".into(),
+        toml::Value::String(public_ca.to_str().unwrap().into()),
     );
+    config["api_bind"] = toml::Value::String("127.0.0.1:0".into());
+    config["ingest_bind"] = toml::Value::String("127.0.0.1:0".into());
+    config["public_ingest_url"] = toml::Value::String("rtmps://localhost/live".into());
+    config["infisical"]["base_url"] = toml::Value::String(format!("http://{address}"));
+    config["infisical"]["credential_fd"] = toml::Value::Integer(identity.as_raw_fd().into());
+    config["media"]["ffmpeg"] = toml::Value::String("/usr/bin/ffmpeg".into());
+    config["media"]["ffprobe"] = toml::Value::String("/usr/bin/ffprobe".into());
+    config["media"]["work_directory"] =
+        toml::Value::String(database.directory.join("media").to_str().unwrap().into());
     let config_path = database.directory.join("service.toml");
-    std::fs::write(&config_path, config).unwrap();
+    std::fs::write(&config_path, toml::to_string(&config).unwrap()).unwrap();
     let binary = std::env::current_exe()
         .unwrap()
         .parent()
@@ -966,6 +1336,7 @@ async fn controlplane_preserves_credentials_and_rejects_unauthorized_changes() {
     };
     store.query("INSERT INTO relay.users(streamer_id,enabled,ingest_key_enc,ingest_key_hash) VALUES(11,true,$1,$2),(12,false,NULL,NULL)",&[&key,&hash]).await.unwrap();
     let state = Arc::new(ServiceState {
+        chat: None,
         tls: None,
         config: Config::parse(include_str!("../../../config/uplink-beispiel.toml")).unwrap(),
         store: store.clone(),
@@ -1061,6 +1432,7 @@ async fn controlplane_preserves_credentials_and_rejects_unauthorized_changes() {
     runtime_config.api_bind = "127.0.0.1:0".parse().unwrap();
     runtime_config.ingest_bind = "127.0.0.1:0".parse().unwrap();
     let runtime_state = Arc::new(ServiceState {
+        chat: None,
         tls: None,
         config: runtime_config,
         store: store.clone(),

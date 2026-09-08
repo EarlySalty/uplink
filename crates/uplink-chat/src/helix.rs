@@ -89,6 +89,7 @@ pub struct HelixClient {
 
 pub fn fehler_aus_token(fehler: TokenFehler) -> ChatFehler {
     match fehler {
+        TokenFehler::ZugangUnbestaetigt(p) => ChatFehler::ZugangUnbestaetigt(p),
         TokenFehler::NichtVerbunden(p) => ChatFehler::NichtVerbunden(p),
         TokenFehler::NeuAnmeldungNoetig(p) => ChatFehler::NeuAnmeldungNoetig(p),
         // Eigene Variante statt eines Netzfehlers mit Text: ein abgelehnter

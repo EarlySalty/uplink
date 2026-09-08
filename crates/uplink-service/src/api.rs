@@ -1,15 +1,16 @@
 use crate::{config::Config, registry::Registry, secrets::ServiceSecrets, store::Store};
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Query, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::{HeaderMap, StatusCode},
-    routing::{get, post},
+    routing::{delete, get, post, put},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::sync::Arc;
 
 pub struct ServiceState {
+    pub chat: Option<Arc<uplink_chat::ChatHub>>,
     pub config: Config,
     pub store: Arc<Store>,
     pub secrets: Arc<ServiceSecrets>,
@@ -32,7 +33,8 @@ fn authorize(
     let candidate = headers
         .get("X-Relay-Auth")
         .map_or(&[][..], |v| v.as_bytes());
-    if !state.secrets.api.matches(candidate)
+    if state.secrets.api.expose().is_empty()
+        || !state.secrets.api.matches(candidate)
         || tenant <= 0
         || !state.config.permits_tenant(tenant as u64)
     {
@@ -60,6 +62,20 @@ pub fn router(state: Arc<ServiceState>) -> Router {
             )
             .route("/v1/me/waitlist", post(waitlist))
             .route("/v1/me/key/rotate", post(rotate_key))
+            .route("/v1/me/dock/rotate", post(rotate_dock))
+            .route("/v1/me/dock-token/rotate", post(rotate_dock))
+            .route("/v1/me/reconnect-wait", put(reconnect_wait))
+            .route("/v1/me/destinations/{platform}", delete(delete_destination))
+            .route("/v1/caps", get(caps))
+            .route("/v1/admin/waitlist", get(admin_waitlist))
+            .route("/v1/admin/waitlist/{id}", delete(reject_waitlist))
+            .route("/v1/admin/users", post(admit_user))
+    };
+    let routes = routes.with_state(state.clone());
+    let routes = if let Some(hub) = &state.chat {
+        routes.merge(uplink_chat::router(hub.clone()))
+    } else {
+        routes
     };
     routes
         .layer(DefaultBodyLimit::max(32 * 1024))
@@ -102,7 +118,6 @@ pub fn router(state: Arc<ServiceState>) -> Router {
                 }
             },
         ))
-        .with_state(state)
 }
 
 #[derive(Deserialize)]
@@ -265,15 +280,79 @@ async fn health(State(state): State<Arc<ServiceState>>) -> (StatusCode, Json<Val
         ),
     )
 }
+async fn rotate_dock(
+    State(state): State<Arc<ServiceState>>,
+    headers: HeaderMap,
+    Query(query): Query<TenantQuery>,
+) -> ApiResult {
+    authorize(&state, &headers, query.streamer_id)?;
+    let mut random = [0; 16];
+    getrandom::fill(&mut random).map_err(|_| {
+        failure(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Zufallsquelle ist nicht verfügbar.",
+        )
+    })?;
+    let token = zeroize::Zeroizing::new(format!("dock_{}", hex::encode(random)));
+    use sha2::Digest;
+    let hash = hex::encode(sha2::Sha256::digest(token.as_bytes()));
+    let encrypted = state
+        .secrets
+        .encryption
+        .seal(
+            token.as_bytes(),
+            &format!("dock_token:{}", query.streamer_id),
+        )
+        .map_err(|e| failure(StatusCode::SERVICE_UNAVAILABLE, e))?;
+    let rows = state.store.query("UPDATE relay.users SET dock_token_hash=$2,dock_token_enc=$3 WHERE streamer_id=$1 AND enabled=true RETURNING streamer_id", &[&query.streamer_id,&hash,&encrypted]).await
+        .map_err(|e|failure(StatusCode::SERVICE_UNAVAILABLE,e))?;
+    if rows.is_empty() {
+        return Err(failure(
+            StatusCode::FORBIDDEN,
+            "Der Zugang ist nicht freigeschaltet.",
+        ));
+    }
+    if let Some(hub) = &state.chat {
+        hub.invalidate(query.streamer_id as u64);
+    }
+    Ok(Json(
+        json!({"ok":true,"dock_urls":dock_urls(&state.config.dock_base_url,&token)}),
+    ))
+}
+fn dock_urls(base: &str, token: &str) -> Value {
+    let base = base.trim_end_matches('/');
+    json!({"chat":format!("{base}/dock/chat?t={token}"),"activity":format!("{base}/dock/activity?t={token}"),"stream_info":format!("{base}/dock/stream-info?t={token}"),"points":format!("{base}/dock/points?t={token}")})
+}
+fn service_status(state: &ServiceState) -> &'static str {
+    if state.config.test_ingest.is_some() {
+        "input_only"
+    } else if state.tls.as_ref().is_some_and(|tls| !tls.ready()) {
+        "unavailable"
+    } else {
+        "ready"
+    }
+}
+fn capabilities() -> Value {
+    json!({"reconnect":false,"layout":false,"delay":false,"vod":false})
+}
+fn dashboard_state(state: &ServiceState, id: u64) -> Value {
+    let statuses = state.registry.status(id);
+    let session = statuses.iter().find(|s| s.active);
+    json!({"sessions":statuses,"session":session,"service_status":service_status(state),"capabilities":capabilities()})
+}
 async fn status(
     State(state): State<Arc<ServiceState>>,
     headers: HeaderMap,
     Query(query): Query<TenantQuery>,
 ) -> ApiResult {
     authorize(&state, &headers, query.streamer_id)?;
-    Ok(Json(
-        json!({"sessions": state.registry.status(query.streamer_id as u64)}),
-    ))
+    let mut status = dashboard_state(&state, query.streamer_id as u64);
+    let database_ready = state.store.ready().await;
+    status["database_ready"] = json!(database_ready);
+    if !database_ready {
+        status["service_status"] = json!("unavailable");
+    }
+    Ok(Json(status))
 }
 async fn me(
     State(state): State<Arc<ServiceState>>,
@@ -302,7 +381,7 @@ async fn me(
     })?;
     let Some(enabled) = enabled else {
         return Ok(Json(
-            json!({"enabled":false,"waitlisted":waitlisted,"ingest_key":"","ingest_url":state.config.public_ingest_url,"srt_hint":"","session":null,"public_visible":false,"status_text":"Zugang ist noch nicht freigeschaltet.","reconnect_wait_s":0,"reconnect_wait_max_s":0,"dock_url_vorhanden":false,"dock_urls":null,"chat":[]}),
+            json!({"enabled":false,"waitlisted":waitlisted,"ingest_key":"","public_ingest_url":state.config.public_ingest_url,"ingest_url":state.config.public_ingest_url,"service_status":service_status(&state),"capabilities":capabilities(),"srt_hint":"","session":null,"public_visible":false,"status_text":"Zugang ist noch nicht freigeschaltet.","reconnect_wait_s":0,"reconnect_wait_max_s":0,"dock_url_vorhanden":false,"dock_urls":null,"chat":[]}),
         ));
     };
     let encrypted: Option<Vec<u8>> = row.try_get(1).map_err(|_| {
@@ -312,6 +391,7 @@ async fn me(
         )
     })?;
     let key = encrypted
+        .filter(|_| enabled)
         .as_ref()
         .map(|encrypted| {
             state
@@ -335,7 +415,7 @@ async fn me(
             "Dockzugang ist ungültig.",
         )
     })?;
-    let dock_urls = if let Some(dock) = dock {
+    let dock_urls = if let Some(dock) = dock.filter(|_| enabled) {
         let token = state
             .secrets
             .encryption
@@ -356,8 +436,7 @@ async fn me(
                 "Dockzugang ist ungültig.",
             ));
         }
-        let base = state.config.dock_base_url.trim_end_matches('/');
-        json!({"chat":format!("{base}/dock/chat?t={token}"),"activity":format!("{base}/dock/activity?t={token}"),"stream_info":format!("{base}/dock/stream-info?t={token}"),"points":format!("{base}/dock/points?t={token}")})
+        dock_urls(&state.config.dock_base_url, token)
     } else {
         Value::Null
     };
@@ -367,8 +446,26 @@ async fn me(
             "Nutzerdaten sind ungültig.",
         )
     })?;
+    let chat = match &state.chat {
+        Some(hub) if enabled => serde_json::to_value(
+            hub.status_for(query.streamer_id as u64)
+                .map_err(|e| failure(StatusCode::SERVICE_UNAVAILABLE, e))?,
+        )
+        .map_err(|_| {
+            failure(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Chatstatus ist nicht verfügbar.",
+            )
+        })?,
+        Some(hub) => {
+            hub.invalidate(query.streamer_id as u64);
+            json!([])
+        }
+        None => json!([]),
+    };
+    let status = dashboard_state(&state, query.streamer_id as u64);
     Ok(Json(
-        json!({"enabled":enabled,"waitlisted":waitlisted,"ingest_key":key,"ingest_url":state.config.public_ingest_url,"srt_hint":"","session":null,"public_visible":false,"status_text":null,"reconnect_wait_s":wait,"reconnect_wait_max_s":300,"dock_url_vorhanden":!dock_urls.is_null(),"dock_urls":dock_urls,"chat":[],"uplink_sessions":state.registry.status(query.streamer_id as u64)}),
+        json!({"enabled":enabled,"waitlisted":waitlisted,"ingest_key":key,"public_ingest_url":state.config.public_ingest_url,"ingest_url":state.config.public_ingest_url,"service_status":status["service_status"],"capabilities":capabilities(),"srt_hint":"","session":status["session"],"public_visible":false,"status_text":null,"reconnect_wait_s":wait,"reconnect_wait_max_s":300,"dock_url_vorhanden":!dock_urls.is_null(),"dock_urls":dock_urls,"chat":chat,"uplink_sessions":status["sessions"]}),
     ))
 }
 async fn destinations(
@@ -379,6 +476,7 @@ async fn destinations(
     authorize(&state, &headers, query.streamer_id)?;
     let rows = state.store.query("SELECT platform,rtmp_url,enabled,width,height,fps,bitrate_kbps FROM relay.destinations WHERE streamer_id=$1 ORDER BY platform", &[&query.streamer_id]).await.map_err(|e|failure(StatusCode::SERVICE_UNAVAILABLE,e))?;
     let mut outputs = Vec::with_capacity(rows.len());
+    let sessions = state.registry.status(query.streamer_id as u64);
     for row in rows {
         let invalid = || {
             failure(
@@ -388,7 +486,248 @@ async fn destinations(
         };
         let endpoint = zeroize::Zeroizing::new(row.try_get::<_, String>(1).map_err(|_| invalid())?);
         let blocked = crate::destinations::public_endpoint(&endpoint).is_err();
-        outputs.push(json!({"platform":row.try_get::<_,String>(0).map_err(|_|invalid())?,"rtmp_url":if blocked {""} else {endpoint.as_str()},"enabled":row.try_get::<_,bool>(2).map_err(|_|invalid())?,"blocked":blocked,"error":if blocked {Some("Gespeicherte Zieladresse ist gesperrt; Serveradresse und Zugang müssen getrennt eingerichtet werden.")} else {None},"requested":{"width":row.try_get::<_,Option<i32>>(3).map_err(|_|invalid())?,"height":row.try_get::<_,Option<i32>>(4).map_err(|_|invalid())?,"fps":row.try_get::<_,Option<i32>>(5).map_err(|_|invalid())?,"bitrate_kbps":row.try_get::<_,Option<i32>>(6).map_err(|_|invalid())?}}));
+        let platform = row.try_get::<_, String>(0).map_err(|_| invalid())?;
+        let (output_state, reason) = output_status(sessions.first(), &platform, blocked);
+        outputs.push(json!({"platform":platform,"rtmp_url":if blocked {""} else {endpoint.as_str()},"enabled":row.try_get::<_,bool>(2).map_err(|_|invalid())?,"blocked":blocked,"error":if blocked {Some("Gespeicherte Zieladresse ist gesperrt; Serveradresse und Zugang müssen getrennt eingerichtet werden.")} else {None},"requested":{"width":row.try_get::<_,Option<i32>>(3).map_err(|_|invalid())?,"height":row.try_get::<_,Option<i32>>(4).map_err(|_|invalid())?,"fps":row.try_get::<_,Option<i32>>(5).map_err(|_|invalid())?,"bitrate_kbps":row.try_get::<_,Option<i32>>(6).map_err(|_|invalid())?},"active_profile":null,"output_state":output_state,"reason":reason,"publication_confirmed":false}));
     }
     Ok(Json(json!({"destinations": outputs})))
+}
+fn output_status(
+    session: Option<&crate::registry::SessionStatus>,
+    platform: &str,
+    blocked: bool,
+) -> (&'static str, Option<&'static str>) {
+    if blocked {
+        return (
+            "failed",
+            Some("Gespeicherte Zieladresse ist gesperrt. Verbindung im Dashboard erneuern."),
+        );
+    }
+    let Some(session) = session else {
+        return ("unknown", None);
+    };
+    if let Some(reason) = session.blocked_outputs.get(platform) {
+        return ("failed", Some(*reason));
+    }
+    let output = session
+        .outputs
+        .as_ref()
+        .and_then(|s| s.get("outputs"))
+        .and_then(Value::as_array)
+        .and_then(|list| list.iter().find(|o| o["id"] == platform));
+    match output.map(|o| &o["state"]) {
+        Some(value) if value.get("failed").is_some() => (
+            "failed",
+            Some("Ausgang wurde abgewiesen oder unterbrochen."),
+        ),
+        Some(value) if value == "ended" || value == "local_end_unconfirmed" => (
+            "finished",
+            Some("Lokaler Versand beendet; Plattformannahme ist nicht bestätigt."),
+        ),
+        Some(value) if value == "publishing" && session.active => ("sending", None),
+        Some(value) if value == "starting" && session.active => ("starting", None),
+        _ if session.error.is_some() => ("failed", session.error),
+        _ if !session.active => (
+            "finished",
+            Some("Session beendet; Plattformannahme ist nicht bestätigt."),
+        ),
+        _ => ("unknown", None),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReconnectChange {
+    reconnect_wait_s: i32,
+}
+async fn reconnect_wait(
+    State(state): State<Arc<ServiceState>>,
+    headers: HeaderMap,
+    Query(query): Query<TenantQuery>,
+    body: Result<Json<ReconnectChange>, axum::extract::rejection::JsonRejection>,
+) -> ApiResult {
+    authorize(&state, &headers, query.streamer_id)?;
+    let Json(body) = body.map_err(|_| {
+        failure(
+            StatusCode::BAD_REQUEST,
+            "Wiederverbindungsfrist ist ungültig.",
+        )
+    })?;
+    if !(0..=300).contains(&body.reconnect_wait_s) {
+        return Err(failure(
+            StatusCode::BAD_REQUEST,
+            "Wiederverbindungsfrist muss zwischen 0 und 300 Sekunden liegen.",
+        ));
+    }
+    let rows=state.store.query("UPDATE relay.users SET reconnect_wait_s=$2 WHERE streamer_id=$1 AND enabled=true RETURNING reconnect_wait_s",&[&query.streamer_id,&body.reconnect_wait_s]).await.map_err(|e|failure(StatusCode::SERVICE_UNAVAILABLE,e))?;
+    if rows.is_empty() {
+        return Err(failure(
+            StatusCode::FORBIDDEN,
+            "Der Zugang ist nicht freigeschaltet.",
+        ));
+    }
+    Ok(Json(
+        json!({"reconnect_wait_s":body.reconnect_wait_s,"reconnect_wait_max_s":300,"applied":false,"message":"Frist gespeichert. Die Wiederverbindung der neuen Medienstrecke ist noch nicht freigegeben."}),
+    ))
+}
+async fn delete_destination(
+    State(state): State<Arc<ServiceState>>,
+    headers: HeaderMap,
+    Query(query): Query<TenantQuery>,
+    Path(platform): Path<String>,
+) -> ApiResult {
+    authorize(&state, &headers, query.streamer_id)?;
+    if !matches!(platform.as_str(), "twitch" | "kick" | "youtube" | "tiktok") {
+        return Err(failure(StatusCode::BAD_REQUEST, "Ziel ist ungültig."));
+    }
+    let guard = state
+        .registry
+        .begin_change(query.streamer_id as u64)
+        .map_err(|e| failure(StatusCode::CONFLICT, e))?;
+    state
+        .store
+        .query_with_retention(
+            "DELETE FROM relay.destinations WHERE streamer_id=$1 AND platform=$2",
+            &[&query.streamer_id, &platform],
+            Some(guard),
+        )
+        .await
+        .map_err(|e| failure(StatusCode::SERVICE_UNAVAILABLE, e))?;
+    Ok(Json(json!({"platform":platform,"deleted":true})))
+}
+fn internal_auth(
+    state: &ServiceState,
+    headers: &HeaderMap,
+    admin: bool,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    let secret = if admin {
+        &state.secrets.admin
+    } else {
+        &state.secrets.api
+    };
+    let candidate = headers
+        .get("X-Relay-Auth")
+        .map_or(&[][..], |header| header.as_bytes());
+    if secret.expose().is_empty() || !secret.matches(candidate) {
+        return Err(failure(
+            StatusCode::UNAUTHORIZED,
+            "Zugriff wurde abgewiesen.",
+        ));
+    }
+    Ok(())
+}
+async fn caps(State(state): State<Arc<ServiceState>>, headers: HeaderMap) -> ApiResult {
+    internal_auth(&state, &headers, false)?;
+    let platforms:Vec<_>=state.config.platforms.iter().map(|p|json!({"platform":p.name,"recommended_width":null,"recommended_height":null,"recommended_fps":null,"recommended_bitrate_kbps":null,"force_cbr":true,"verification":"requires_source_and_target"})).collect();
+    Ok(Json(
+        json!({"platforms":platforms,"ingest":null,"capabilities":capabilities(),"message":"Profile werden mit dem tatsächlichen Eingang und dem Ziel geprüft. Noch unbestätigte Empfehlungen bleiben leer."}),
+    ))
+}
+fn admin_id(id: i64) -> Result<(), (StatusCode, Json<Value>)> {
+    if id <= 0 {
+        return Err(failure(
+            StatusCode::BAD_REQUEST,
+            "Plattformidentität ist ungültig.",
+        ));
+    }
+    Ok(())
+}
+async fn admin_waitlist(State(state): State<Arc<ServiceState>>, headers: HeaderMap) -> ApiResult {
+    internal_auth(&state, &headers, true)?;
+    let rows=state.store.query("SELECT w.streamer_id,w.requested_at::text,w.note,COALESCE(u.enabled,false) FROM relay.waitlist w LEFT JOIN relay.users u USING(streamer_id) ORDER BY w.requested_at,w.streamer_id LIMIT 1000",&[]).await.map_err(|e|failure(StatusCode::SERVICE_UNAVAILABLE,e))?;
+    let invalid = || {
+        failure(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Wartelistendaten sind ungültig.",
+        )
+    };
+    let mut entries = Vec::with_capacity(rows.len());
+    for row in rows {
+        entries.push(json!({"streamer_id":row.try_get::<_,i64>(0).map_err(|_|invalid())?,"requested_at":row.try_get::<_,String>(1).map_err(|_|invalid())?,"note":row.try_get::<_,Option<String>>(2).map_err(|_|invalid())?,"enabled":row.try_get::<_,bool>(3).map_err(|_|invalid())?}));
+    }
+    Ok(Json(json!({"entries":entries})))
+}
+async fn reject_waitlist(
+    State(state): State<Arc<ServiceState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> ApiResult {
+    internal_auth(&state, &headers, true)?;
+    admin_id(id)?;
+    let rows = state
+        .store
+        .query(
+            "DELETE FROM relay.waitlist WHERE streamer_id=$1 RETURNING streamer_id",
+            &[&id],
+        )
+        .await
+        .map_err(|e| failure(StatusCode::SERVICE_UNAVAILABLE, e))?;
+    if rows.is_empty() {
+        return Err(failure(
+            StatusCode::NOT_FOUND,
+            "Anfrage ist nicht mehr auf der Warteliste.",
+        ));
+    }
+    Ok(Json(json!({"streamer_id":id,"rejected":true})))
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Admission {
+    streamer_id: i64,
+}
+async fn admit_user(
+    State(state): State<Arc<ServiceState>>,
+    headers: HeaderMap,
+    body: Result<Json<Admission>, axum::extract::rejection::JsonRejection>,
+) -> ApiResult {
+    internal_auth(&state, &headers, true)?;
+    let Json(body) =
+        body.map_err(|_| failure(StatusCode::BAD_REQUEST, "Plattformidentität ist ungültig."))?;
+    let id = body.streamer_id;
+    admin_id(id)?;
+    let mut random = [0u8; 16];
+    getrandom::fill(&mut random).map_err(|_| {
+        failure(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Zufallsquelle ist nicht verfügbar.",
+        )
+    })?;
+    let key = zeroize::Zeroizing::new(format!("rsr_{}", hex::encode(random)));
+    use sha2::Digest;
+    let hash = hex::encode(sha2::Sha256::digest(key.as_bytes()));
+    let encrypted = state
+        .secrets
+        .encryption
+        .seal(key.as_bytes(), &format!("ingest_key:{id}"))
+        .map_err(|e| failure(StatusCode::SERVICE_UNAVAILABLE, e))?;
+    let rows=state.store.query("WITH admitted AS (INSERT INTO relay.users(streamer_id,enabled,ingest_key_hash,ingest_key_enc) VALUES($1,true,$2,$3) ON CONFLICT(streamer_id) DO UPDATE SET enabled=true RETURNING streamer_id,ingest_key_enc), removed AS (DELETE FROM relay.waitlist w USING admitted a WHERE w.streamer_id=a.streamer_id) SELECT streamer_id,ingest_key_enc FROM admitted",&[&id,&hash,&encrypted]).await.map_err(|e|failure(StatusCode::SERVICE_UNAVAILABLE,e))?;
+    let encrypted: Vec<u8> = rows
+        .first()
+        .ok_or_else(|| {
+            failure(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Freigabe konnte nicht bestätigt werden.",
+            )
+        })?
+        .try_get(1)
+        .map_err(|_| {
+            failure(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Bestehender Streamzugang ist ungültig.",
+            )
+        })?;
+    let stored = state
+        .secrets
+        .encryption
+        .open(&encrypted, &format!("ingest_key:{id}"))
+        .map_err(|e| failure(StatusCode::SERVICE_UNAVAILABLE, e))?;
+    let key = std::str::from_utf8(stored.expose()).map_err(|_| {
+        failure(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Bestehender Streamzugang ist ungültig.",
+        )
+    })?;
+    Ok(Json(
+        json!({"streamer_id":id,"enabled":true,"ingest_key":key,"public_ingest_url":state.config.public_ingest_url,"srt_hint":""}),
+    ))
 }
