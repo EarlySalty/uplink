@@ -293,7 +293,9 @@ pub struct OutputStatus {
 pub enum OutputState {
     Starting,
     Publishing,
-    Ended,
+    /// Lokal vollständig geschrieben und Verbindung beendet. Entfernte
+    /// Medienannahme, Verarbeitung und Veröffentlichung bleiben unbestätigt.
+    LocalEndUnconfirmed,
     Failed(MediaError),
 }
 

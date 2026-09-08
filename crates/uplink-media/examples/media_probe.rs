@@ -14,7 +14,7 @@ use std::{
 use tokio::{
     io::AsyncReadExt,
     process::Command,
-    sync::{mpsc, oneshot},
+    sync::{mpsc, oneshot, watch},
     task::JoinHandle,
     time::{Instant, timeout},
 };
@@ -38,13 +38,20 @@ const H264: &[u8] = include_bytes!("../../../experiments/scuffle-probe/fixtures/
 #[path = "media_probe/platform.rs"]
 mod platform;
 
-struct ProbeAuth;
+struct ProbeAuth {
+    completed: Option<watch::Sender<Option<SessionReport>>>,
+}
 impl Authorizer for ProbeAuth {
     async fn authorize(&self, app: &str, stream: &str) -> Result<AuthorizedSession, ()> {
         if app == "live" && stream == "local-fixture" {
             AuthorizedSession::new(1, 1).map_err(|_| ())
         } else {
             Err(())
+        }
+    }
+    fn completed(&self, _: AuthorizedSession, report: &SessionReport) {
+        if let Some(completed) = &self.completed {
+            completed.send_replace(Some(report.clone()));
         }
     }
 }
@@ -136,6 +143,14 @@ async fn endpoint_budget(
     queued_events: usize,
     max_event: usize,
 ) -> ProbeResult<(Arc<IngestServer<ProbeAuth>>, PublishTarget)> {
+    endpoint_observed(id, queued_events, max_event, None).await
+}
+async fn endpoint_observed(
+    id: &str,
+    queued_events: usize,
+    max_event: usize,
+    completed: Option<watch::Sender<Option<SessionReport>>>,
+) -> ProbeResult<(Arc<IngestServer<ProbeAuth>>, PublishTarget)> {
     let (server_tls, client_tls) = tls()?;
     let mut limits = IngestLimits::local_probe();
     limits.max_queued_events = queued_events;
@@ -145,7 +160,7 @@ async fn endpoint_budget(
     limits.rtmp.chunk.max_partial_bytes = max_event * 4;
     limits.media_idle_timeout = DEADLINE;
     let server = Arc::new(
-        IngestServer::bind_loopback(0, server_tls, Arc::new(ProbeAuth), limits)
+        IngestServer::bind_loopback(0, server_tls, Arc::new(ProbeAuth { completed }), limits)
             .await
             .map_err(|_| "Lokaler Probe-Eingang nicht verfügbar")?,
     );
@@ -263,6 +278,8 @@ struct ProbeReport {
     vod_audio_packets: usize,
     different_audio_signals: bool,
     slow_receiver_isolated: bool,
+    slow_output_state: Option<OutputState>,
+    slow_receiver_accepted_events: Option<u64>,
     common_timestamp_offset_ms: i64,
     source_audio_ids: [u8; 2],
     stalled_handshake_isolated: bool,
@@ -386,7 +403,8 @@ async fn run(
     }
     let mut release_slow = None;
     if with_slow {
-        let (server, target) = endpoint("slow", 1).await?;
+        let (completed, mut observed) = watch::channel(None);
+        let (server, target) = endpoint_observed("slow", 1, 65536, Some(completed)).await?;
         outputs.push(desired(target, audio_ids[0], None)?);
         let (release, wait) = oneshot::channel();
         release_slow = Some(release);
@@ -398,6 +416,18 @@ async fn run(
             // Der erste Event bleibt gehalten; weitere Events füllen genau eine
             // Queueposition. Der echte Eingang muss danach Backpressure melden.
             let held = connection.next().await;
+            // Der echte Receiver muss bereits an seinem gehaltenen Eventbudget
+            // gescheitert sein, bevor die Probe irgendetwas freigibt. Damit ist
+            // Backpressure ein gemessener Endgrund und keine Timingannahme.
+            let failed = timeout(DEADLINE, observed.wait_for(|report| report.is_some()))
+                .await
+                .map_err(|_| "Rückstau des Testempfängers blieb aus")?
+                .map_err(|_| "Empfängerabschluss fehlt")?
+                .clone()
+                .ok_or("Empfängerabschluss fehlt")?;
+            if failed.reason != EndReason::Backpressure || failed.received_events != 1 {
+                return Err("Testempfänger erreichte das beabsichtigte Eventlimit nicht");
+            }
             let _ = wait.await;
             while connection.next().await.is_some() {}
             drop(held);
@@ -539,10 +569,9 @@ async fn run(
                 loop {
                     let state = running.status();
                     if ["left", "right"].iter().all(|id| {
-                        state
-                            .outputs
-                            .iter()
-                            .any(|output| output.id == *id && output.state == OutputState::Ended)
+                        state.outputs.iter().any(|output| {
+                            output.id == *id && output.state == OutputState::LocalEndUnconfirmed
+                        })
                     }) {
                         if !state.outputs.iter().any(|output| {
                             output.id == "stalled-handshake"
@@ -626,6 +655,13 @@ async fn run(
             return Err("Audio- und Videozeitstempel haben unterschiedlichen Versatz");
         }
     }
+    let slow_output_state = report
+        .status
+        .outputs
+        .iter()
+        .find(|o| o.id == "slow")
+        .map(|o| o.state);
+    let slow_receiver_accepted_events = slow_report.as_ref().map(|r| r.received_events);
     let isolated = if let Some(slow) = slow_report {
         slow.reason == EndReason::Backpressure
             && report
@@ -661,6 +697,8 @@ async fn run(
         vod_audio_packets: vod.len(),
         different_audio_signals: true,
         slow_receiver_isolated: isolated,
+        slow_output_state,
+        slow_receiver_accepted_events,
         common_timestamp_offset_ms: timestamp_offset,
         source_audio_ids: audio_ids,
         stalled_handshake_isolated: stalled_isolated,
@@ -983,11 +1021,25 @@ async fn generate_source(ffmpeg: &std::path::Path, codec: Codec) -> ProbeResult<
         }
     }
 }
-fn arguments() -> ProbeResult<(PathBuf, PathBuf)> {
+fn arguments() -> ProbeResult<(PathBuf, PathBuf, u32)> {
     let mut args = std::env::args_os().skip(1);
     let mut ffmpeg = None;
     let mut ffprobe = None;
+    let mut slow_repetitions = None;
     while let Some(flag) = args.next() {
+        if flag == "--slow-repetitions" {
+            if slow_repetitions.is_some() {
+                return Err("Wiederholungen doppelt angegeben");
+            }
+            let value = args
+                .next()
+                .and_then(|s| s.into_string().ok())
+                .and_then(|s| s.parse::<u32>().ok())
+                .filter(|n| (1..=100).contains(n))
+                .ok_or("Wiederholungen müssen zwischen 1 und 100 liegen")?;
+            slow_repetitions = Some(value);
+            continue;
+        }
         let destination = if flag == "--ffmpeg" {
             &mut ffmpeg
         } else if flag == "--ffprobe" {
@@ -1007,12 +1059,13 @@ fn arguments() -> ProbeResult<(PathBuf, PathBuf)> {
     Ok((
         ffmpeg.ok_or("--ffmpeg fehlt")?,
         ffprobe.ok_or("--ffprobe fehlt")?,
+        slow_repetitions.unwrap_or(1),
     ))
 }
 #[tokio::main]
 async fn main() -> ExitCode {
     let result = async {
-        let (ffmpeg, ffprobe) = arguments()?;
+        let (ffmpeg, ffprobe, slow_repetitions) = arguments()?;
         ffmpeg_listener(&ffmpeg).await?;
         let av1 = generate_av1(&ffmpeg).await?;
         let hevc = generate_source(&ffmpeg, Codec::Hevc).await?;
@@ -1074,28 +1127,36 @@ async fn main() -> ExitCode {
                 Codec::Av1,
             ),
         ] {
-            let report = timeout(
-                DEADLINE,
-                run(
-                    ffmpeg.clone(),
-                    ffprobe.clone(),
-                    fixture,
-                    ProbeCase {
-                        source_name: name,
-                        output_codec,
-                        with_slow: slow,
-                        audio_ids,
-                        with_stalled: stalled,
-                    },
-                ),
-            )
-            .await
-            .map_err(|_| "Gekoppelte Medienprobe überschritt die Frist")??;
-            println!(
-                "{}",
-                serde_json::to_string(&report)
-                    .map_err(|_| "Probebericht konnte nicht erzeugt werden")?
-            );
+            for repetition in 0..if slow { slow_repetitions } else { 1 } {
+                if slow {
+                    eprintln!(
+                        "Rückstau-Wiederholung {} von {slow_repetitions}",
+                        repetition + 1
+                    );
+                }
+                let report = timeout(
+                    DEADLINE,
+                    run(
+                        ffmpeg.clone(),
+                        ffprobe.clone(),
+                        fixture.clone(),
+                        ProbeCase {
+                            source_name: name,
+                            output_codec,
+                            with_slow: slow,
+                            audio_ids,
+                            with_stalled: stalled,
+                        },
+                    ),
+                )
+                .await
+                .map_err(|_| "Gekoppelte Medienprobe überschritt die Frist")??;
+                println!(
+                    "{}",
+                    serde_json::to_string(&report)
+                        .map_err(|_| "Probebericht konnte nicht erzeugt werden")?
+                );
+            }
         }
         platform::run(&ffmpeg, &ffprobe).await?;
         Ok::<_, &'static str>(())

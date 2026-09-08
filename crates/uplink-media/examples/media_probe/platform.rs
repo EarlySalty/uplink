@@ -222,8 +222,8 @@ pub(super) async fn run(ffmpeg: &std::path::Path, ffprobe: &std::path::Path) -> 
     if report.error.is_some()
         || report.status.encode_groups != 2
         || report.status.video_decoders != 1
-        || report.status.outputs[0].state != OutputState::Ended
-        || report.status.outputs[1].state != OutputState::Ended
+        || report.status.outputs[0].state != OutputState::LocalEndUnconfirmed
+        || report.status.outputs[1].state != OutputState::LocalEndUnconfirmed
         || report.status.outputs[2].state
             != OutputState::Failed(uplink_media::MediaError::MissingTrack)
     {

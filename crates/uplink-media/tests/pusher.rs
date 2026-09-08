@@ -176,7 +176,7 @@ async fn native_rtmps_preserves_av1_h264_and_two_aac_tracks_exactly() {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(report.state, OutputState::Ended);
+        assert_eq!(report.state, OutputState::LocalEndUnconfirmed);
         assert_eq!(report.received_events, tags);
         let (received, report) = timeout(Duration::from_secs(5), capture)
             .await
@@ -240,7 +240,7 @@ async fn queued_short_stream_finishes_after_delayed_publish_without_losing_heade
         .unwrap()
         .unwrap()
         .unwrap();
-    assert_eq!(status.state, OutputState::Ended);
+    assert_eq!(status.state, OutputState::LocalEndUnconfirmed);
     let (received, report) = timeout(Duration::from_secs(2), capture)
         .await
         .unwrap()
@@ -771,7 +771,7 @@ async fn cancellation_is_joined_and_one_failed_target_does_not_stop_another() {
         100
     );
     let (report, ()) = tokio::join!(fast.finish(), fast_peer.expect_command("deleteStream"));
-    assert_eq!(report.unwrap().state, OutputState::Ended);
+    assert_eq!(report.unwrap().state, OutputState::LocalEndUnconfirmed);
 }
 
 #[tokio::test]
@@ -820,4 +820,60 @@ async fn late_peer_close_and_unacknowledged_media_fail_visibly() {
     .unwrap();
     assert_eq!(failure, MediaError::Io);
     assert!(matches!(pusher.finish().await, Err(MediaError::Io)));
+}
+
+#[tokio::test]
+async fn fragmented_rejection_after_delete_stream_is_not_a_successful_finish() {
+    let (mut peer, pusher) = raw_published().await;
+    let (result, ()) = tokio::join!(pusher.finish(), async {
+        peer.expect_command("deleteStream").await;
+        let mut body = Vec::new();
+        let mut encoder = Amf0Encoder::new(&mut body);
+        encoder.encode_string("_error").unwrap();
+        encoder.encode_number(0.0).unwrap();
+        let wire = peer.wire(20, &body);
+        peer.socket.write_all(&wire[..5]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        peer.socket.write_all(&wire[5..]).await.unwrap();
+    });
+    assert!(matches!(result, Err(MediaError::PublishRejected)));
+}
+
+#[tokio::test]
+async fn silent_peer_and_close_after_delete_are_only_local_unconfirmed_ends() {
+    for close in [false, true] {
+        let (mut peer, pusher) = raw_published().await;
+        let started = tokio::time::Instant::now();
+        let (result, ()) = tokio::join!(pusher.finish(), async {
+            peer.expect_command("deleteStream").await;
+            if close {
+                peer.socket.shutdown().await.unwrap();
+            }
+        });
+        let status = result.unwrap();
+        assert_eq!(status.state, OutputState::LocalEndUnconfirmed);
+        assert_eq!(
+            serde_json::to_value(status.state).unwrap(),
+            "local_end_unconfirmed"
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+}
+
+#[tokio::test]
+async fn requested_unpublish_response_is_not_media_or_publication_confirmation() {
+    let (mut peer, pusher) = raw_published().await;
+    let (result, ()) = tokio::join!(pusher.finish(), async {
+        peer.expect_command("deleteStream").await;
+        peer.command(
+            "onStatus",
+            0.0,
+            &[
+                Amf0Value::Null,
+                status_object("NetStream.Unpublish.Success", "status"),
+            ],
+        )
+        .await;
+    });
+    assert_eq!(result.unwrap().state, OutputState::LocalEndUnconfirmed);
 }
