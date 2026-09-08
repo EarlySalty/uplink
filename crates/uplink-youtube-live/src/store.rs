@@ -1,4 +1,6 @@
-use crate::model::{Endegrund, LiveEinstellungen, RunZustand, Schritt, Sichtbarkeit};
+use crate::model::{
+    Endegrund, LiveEinstellungen, RunZustand, Schritt, Sichtbarkeit, titel_pruefen,
+};
 use chrono::{DateTime, Utc};
 use futures::future::BoxFuture;
 use std::collections::HashMap;
@@ -37,6 +39,7 @@ pub struct Run {
     pub youtube_bestaetigt: Option<bool>,
     pub unterbrochen_at: Option<DateTime<Utc>>,
     pub live_seit: Option<DateTime<Utc>>,
+    pub start_angefordert_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone)]
@@ -74,6 +77,7 @@ pub trait RunStore: Send + Sync {
     fn stream_id_merken<'a>(
         &'a self,
         streamer_id: i64,
+        generation: i64,
         stream_id: &'a str,
     ) -> BoxFuture<'a, Result<(), &'static str>>;
     fn aktiven_run_laden<'a>(
@@ -92,9 +96,17 @@ pub trait RunStore: Send + Sync {
         run_id: i64,
         generation: i64,
     ) -> BoxFuture<'a, Result<(), &'static str>>;
+    fn schritt_abschliessen<'a>(
+        &'a self,
+        run_id: i64,
+        generation: i64,
+        stream_id: Option<&'a str>,
+        broadcast_id: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<(), &'static str>>;
     fn referenzen_setzen<'a>(
         &'a self,
         run_id: i64,
+        generation: i64,
         stream_id: Option<&'a str>,
         broadcast_id: Option<&'a str>,
     ) -> BoxFuture<'a, Result<(), &'static str>>;
@@ -105,6 +117,11 @@ pub trait RunStore: Send + Sync {
         von: &'a [&'a str],
         nach: &'a str,
     ) -> BoxFuture<'a, Result<(), &'static str>>;
+    fn start_angefordert_setzen<'a>(
+        &'a self,
+        run_id: i64,
+        generation: i64,
+    ) -> BoxFuture<'a, Result<(), &'static str>>;
     fn run_schliessen<'a>(
         &'a self,
         run_id: i64,
@@ -113,11 +130,15 @@ pub trait RunStore: Send + Sync {
         youtube_bestaetigt: Option<bool>,
         fehler: Option<&'a str>,
     ) -> BoxFuture<'a, Result<(), &'static str>>;
-    fn unterbrochen_vermerken<'a>(&'a self, run_id: i64)
-    -> BoxFuture<'a, Result<(), &'static str>>;
+    fn unterbrochen_vermerken<'a>(
+        &'a self,
+        run_id: i64,
+        generation: i64,
+    ) -> BoxFuture<'a, Result<(), &'static str>>;
     fn live_seit_setzen<'a>(
         &'a self,
         run_id: i64,
+        generation: i64,
         seit: DateTime<Utc>,
     ) -> BoxFuture<'a, Result<(), &'static str>>;
 }
@@ -128,7 +149,8 @@ pub struct PostgresRunStore {
 
 const RUN_SPALTEN: &str = "run_id, streamer_id, channel_id, connection_generation, uplink_session, \
     zustand, schritt, schritt_seit, stream_id, broadcast_id, titel, sichtbarkeit, auto_start, \
-    auto_stop, fehler, ende_grund, youtube_bestaetigt, unterbrochen_at, live_seit";
+    auto_stop, fehler, ende_grund, youtube_bestaetigt, unterbrochen_at, live_seit, \
+    start_angefordert_at";
 
 impl PostgresRunStore {
     pub fn neu(sql: Arc<dyn SqlZugang>) -> Self {
@@ -168,6 +190,7 @@ fn run_aus_row(row: &Row) -> Result<Run, &'static str> {
         youtube_bestaetigt: row.try_get(16).map_err(|_| "Run-Zeile ist unlesbar.")?,
         unterbrochen_at: row.try_get(17).map_err(|_| "Run-Zeile ist unlesbar.")?,
         live_seit: row.try_get(18).map_err(|_| "Run-Zeile ist unlesbar.")?,
+        start_angefordert_at: row.try_get(19).map_err(|_| "Run-Zeile ist unlesbar.")?,
     })
 }
 
@@ -211,6 +234,7 @@ impl RunStore for PostgresRunStore {
         einstellungen: &'a LiveEinstellungen,
     ) -> BoxFuture<'a, Result<(), &'static str>> {
         Box::pin(async move {
+            let titel = titel_pruefen(&einstellungen.titel)?;
             let sql = "INSERT INTO relay.youtube_live_settings \
                 (streamer_id, channel_id, connection_generation, titel, sichtbarkeit, auto_start, \
                 auto_stop, live_freigegeben_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) \
@@ -227,7 +251,7 @@ impl RunStore for PostgresRunStore {
                         &streamer_id,
                         &channel_id,
                         &einstellungen.connection_generation,
-                        &einstellungen.titel,
+                        &titel,
                         &sichtbarkeit,
                         &einstellungen.auto_start,
                         &einstellungen.auto_stop,
@@ -242,13 +266,18 @@ impl RunStore for PostgresRunStore {
     fn stream_id_merken<'a>(
         &'a self,
         streamer_id: i64,
+        generation: i64,
         stream_id: &'a str,
     ) -> BoxFuture<'a, Result<(), &'static str>> {
         Box::pin(async move {
-            let sql = "UPDATE relay.youtube_live_settings SET stream_id=$2, \
-                updated_at=clock_timestamp() WHERE streamer_id=$1";
-            self.sql.query(sql, &[&streamer_id, &stream_id]).await?;
-            Ok(())
+            let sql = "UPDATE relay.youtube_live_settings SET stream_id=$3, \
+                updated_at=clock_timestamp() WHERE streamer_id=$1 AND connection_generation=$2 \
+                RETURNING streamer_id";
+            let zeilen = self
+                .sql
+                .query(sql, &[&streamer_id, &generation, &stream_id])
+                .await?;
+            if zeilen.is_empty() { Err(CAS) } else { Ok(()) }
         })
     }
 
@@ -330,19 +359,40 @@ impl RunStore for PostgresRunStore {
         })
     }
 
-    fn referenzen_setzen<'a>(
+    fn schritt_abschliessen<'a>(
         &'a self,
         run_id: i64,
+        generation: i64,
         stream_id: Option<&'a str>,
         broadcast_id: Option<&'a str>,
     ) -> BoxFuture<'a, Result<(), &'static str>> {
         Box::pin(async move {
-            let sql = "UPDATE relay.youtube_live_runs SET stream_id=COALESCE($2,stream_id), \
-                broadcast_id=COALESCE($3,broadcast_id), updated_at=clock_timestamp() \
-                WHERE run_id=$1 AND ended_at IS NULL RETURNING run_id";
+            let sql = "UPDATE relay.youtube_live_runs SET schritt=NULL, schritt_seit=NULL, \
+                stream_id=COALESCE($3,stream_id), broadcast_id=COALESCE($4,broadcast_id), \
+                updated_at=clock_timestamp() WHERE run_id=$1 AND connection_generation=$2 \
+                AND ended_at IS NULL RETURNING run_id";
             let zeilen = self
                 .sql
-                .query(sql, &[&run_id, &stream_id, &broadcast_id])
+                .query(sql, &[&run_id, &generation, &stream_id, &broadcast_id])
+                .await?;
+            if zeilen.is_empty() { Err(CAS) } else { Ok(()) }
+        })
+    }
+
+    fn referenzen_setzen<'a>(
+        &'a self,
+        run_id: i64,
+        generation: i64,
+        stream_id: Option<&'a str>,
+        broadcast_id: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<(), &'static str>> {
+        Box::pin(async move {
+            let sql = "UPDATE relay.youtube_live_runs SET stream_id=COALESCE($3,stream_id), \
+                broadcast_id=COALESCE($4,broadcast_id), updated_at=clock_timestamp() \
+                WHERE run_id=$1 AND connection_generation=$2 AND ended_at IS NULL RETURNING run_id";
+            let zeilen = self
+                .sql
+                .query(sql, &[&run_id, &generation, &stream_id, &broadcast_id])
                 .await?;
             if zeilen.is_empty() { Err(CAS) } else { Ok(()) }
         })
@@ -363,6 +413,21 @@ impl RunStore for PostgresRunStore {
                 .sql
                 .query(sql, &[&run_id, &generation, &nach, &von])
                 .await?;
+            if zeilen.is_empty() { Err(CAS) } else { Ok(()) }
+        })
+    }
+
+    fn start_angefordert_setzen<'a>(
+        &'a self,
+        run_id: i64,
+        generation: i64,
+    ) -> BoxFuture<'a, Result<(), &'static str>> {
+        Box::pin(async move {
+            let sql = "UPDATE relay.youtube_live_runs SET \
+                start_angefordert_at=COALESCE(start_angefordert_at, clock_timestamp()), \
+                updated_at=clock_timestamp() WHERE run_id=$1 AND connection_generation=$2 \
+                AND ended_at IS NULL RETURNING run_id";
+            let zeilen = self.sql.query(sql, &[&run_id, &generation]).await?;
             if zeilen.is_empty() { Err(CAS) } else { Ok(()) }
         })
     }
@@ -400,26 +465,29 @@ impl RunStore for PostgresRunStore {
     fn unterbrochen_vermerken<'a>(
         &'a self,
         run_id: i64,
+        generation: i64,
     ) -> BoxFuture<'a, Result<(), &'static str>> {
         Box::pin(async move {
             let sql = "UPDATE relay.youtube_live_runs SET unterbrochen_at=clock_timestamp(), \
-                updated_at=clock_timestamp() WHERE run_id=$1 AND ended_at IS NULL";
-            self.sql.query(sql, &[&run_id]).await?;
-            Ok(())
+                updated_at=clock_timestamp() WHERE run_id=$1 AND connection_generation=$2 \
+                AND ended_at IS NULL RETURNING run_id";
+            let zeilen = self.sql.query(sql, &[&run_id, &generation]).await?;
+            if zeilen.is_empty() { Err(CAS) } else { Ok(()) }
         })
     }
 
     fn live_seit_setzen<'a>(
         &'a self,
         run_id: i64,
+        generation: i64,
         seit: DateTime<Utc>,
     ) -> BoxFuture<'a, Result<(), &'static str>> {
         Box::pin(async move {
-            let sql = "UPDATE relay.youtube_live_runs SET live_seit=$2, \
-                updated_at=clock_timestamp() WHERE run_id=$1 AND ended_at IS NULL \
-                AND live_seit IS NULL";
-            self.sql.query(sql, &[&run_id, &seit]).await?;
-            Ok(())
+            let sql = "UPDATE relay.youtube_live_runs SET live_seit=COALESCE(live_seit,$3), \
+                updated_at=clock_timestamp() WHERE run_id=$1 AND connection_generation=$2 \
+                AND ended_at IS NULL RETURNING live_seit";
+            let zeilen = self.sql.query(sql, &[&run_id, &generation, &seit]).await?;
+            if zeilen.is_empty() { Err(CAS) } else { Ok(()) }
         })
     }
 }
@@ -451,6 +519,12 @@ impl SpeicherRunStore {
     pub fn neu() -> Self {
         Self::default()
     }
+
+    fn treffer(runs: &mut [RunZeile], run_id: i64, generation: i64) -> Option<&mut RunZeile> {
+        runs.iter_mut().find(|z| {
+            !z.beendet && z.run.run_id == run_id && z.run.connection_generation == generation
+        })
+    }
 }
 
 impl RunStore for SpeicherRunStore {
@@ -478,6 +552,7 @@ impl RunStore for SpeicherRunStore {
         einstellungen: &'a LiveEinstellungen,
     ) -> BoxFuture<'a, Result<(), &'static str>> {
         Box::pin(async move {
+            titel_pruefen(&einstellungen.titel)?;
             let mut inner = self.inner.lock().expect("Speicher");
             let vorher = inner
                 .settings
@@ -498,16 +573,17 @@ impl RunStore for SpeicherRunStore {
     fn stream_id_merken<'a>(
         &'a self,
         streamer_id: i64,
+        generation: i64,
         stream_id: &'a str,
     ) -> BoxFuture<'a, Result<(), &'static str>> {
         Box::pin(async move {
             let mut inner = self.inner.lock().expect("Speicher");
             match inner.settings.get_mut(&streamer_id) {
-                Some(zeile) => {
+                Some(zeile) if zeile.einstellungen.connection_generation == generation => {
                     zeile.stream_id = Some(stream_id.to_owned());
                     Ok(())
                 }
-                None => Err("Einstellungen fehlen."),
+                _ => Err(CAS),
             }
         })
     }
@@ -529,6 +605,13 @@ impl RunStore for SpeicherRunStore {
     fn run_anlegen<'a>(&'a self, neu: RunNeu<'a>) -> BoxFuture<'a, Result<Run, &'static str>> {
         Box::pin(async move {
             let mut inner = self.inner.lock().expect("Speicher");
+            if inner
+                .runs
+                .iter()
+                .any(|z| !z.beendet && z.run.streamer_id == neu.streamer_id)
+            {
+                return Err("Es läuft bereits ein aktiver Run.");
+            }
             inner.naechste_id += 1;
             let run = Run {
                 run_id: inner.naechste_id,
@@ -550,6 +633,7 @@ impl RunStore for SpeicherRunStore {
                 youtube_bestaetigt: None,
                 unterbrochen_at: None,
                 live_seit: None,
+                start_angefordert_at: None,
             };
             inner.runs.push(RunZeile {
                 run: run.clone(),
@@ -567,9 +651,7 @@ impl RunStore for SpeicherRunStore {
     ) -> BoxFuture<'a, Result<(), &'static str>> {
         Box::pin(async move {
             let mut inner = self.inner.lock().expect("Speicher");
-            match inner.runs.iter_mut().find(|z| {
-                !z.beendet && z.run.run_id == run_id && z.run.connection_generation == generation
-            }) {
+            match Self::treffer(&mut inner.runs, run_id, generation) {
                 Some(z) => {
                     z.run.schritt = Some(schritt);
                     z.run.schritt_seit = Some(Utc::now());
@@ -587,9 +669,7 @@ impl RunStore for SpeicherRunStore {
     ) -> BoxFuture<'a, Result<(), &'static str>> {
         Box::pin(async move {
             let mut inner = self.inner.lock().expect("Speicher");
-            match inner.runs.iter_mut().find(|z| {
-                !z.beendet && z.run.run_id == run_id && z.run.connection_generation == generation
-            }) {
+            match Self::treffer(&mut inner.runs, run_id, generation) {
                 Some(z) => {
                     z.run.schritt = None;
                     z.run.schritt_seit = None;
@@ -600,19 +680,42 @@ impl RunStore for SpeicherRunStore {
         })
     }
 
-    fn referenzen_setzen<'a>(
+    fn schritt_abschliessen<'a>(
         &'a self,
         run_id: i64,
+        generation: i64,
         stream_id: Option<&'a str>,
         broadcast_id: Option<&'a str>,
     ) -> BoxFuture<'a, Result<(), &'static str>> {
         Box::pin(async move {
             let mut inner = self.inner.lock().expect("Speicher");
-            match inner
-                .runs
-                .iter_mut()
-                .find(|z| !z.beendet && z.run.run_id == run_id)
-            {
+            match Self::treffer(&mut inner.runs, run_id, generation) {
+                Some(z) => {
+                    z.run.schritt = None;
+                    z.run.schritt_seit = None;
+                    if let Some(s) = stream_id {
+                        z.run.stream_id = Some(s.to_owned());
+                    }
+                    if let Some(b) = broadcast_id {
+                        z.run.broadcast_id = Some(b.to_owned());
+                    }
+                    Ok(())
+                }
+                None => Err(CAS),
+            }
+        })
+    }
+
+    fn referenzen_setzen<'a>(
+        &'a self,
+        run_id: i64,
+        generation: i64,
+        stream_id: Option<&'a str>,
+        broadcast_id: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<(), &'static str>> {
+        Box::pin(async move {
+            let mut inner = self.inner.lock().expect("Speicher");
+            match Self::treffer(&mut inner.runs, run_id, generation) {
                 Some(z) => {
                     if let Some(s) = stream_id {
                         z.run.stream_id = Some(s.to_owned());
@@ -637,14 +740,28 @@ impl RunStore for SpeicherRunStore {
         Box::pin(async move {
             let ziel = RunZustand::from_str(nach).map_err(|_| "Run-Zustand ist ungültig.")?;
             let mut inner = self.inner.lock().expect("Speicher");
-            match inner.runs.iter_mut().find(|z| {
-                !z.beendet
-                    && z.run.run_id == run_id
-                    && z.run.connection_generation == generation
-                    && von.contains(&z.run.zustand.as_str())
-            }) {
-                Some(z) => {
+            match Self::treffer(&mut inner.runs, run_id, generation) {
+                Some(z) if von.contains(&z.run.zustand.as_str()) => {
                     z.run.zustand = ziel;
+                    Ok(())
+                }
+                _ => Err(CAS),
+            }
+        })
+    }
+
+    fn start_angefordert_setzen<'a>(
+        &'a self,
+        run_id: i64,
+        generation: i64,
+    ) -> BoxFuture<'a, Result<(), &'static str>> {
+        Box::pin(async move {
+            let mut inner = self.inner.lock().expect("Speicher");
+            match Self::treffer(&mut inner.runs, run_id, generation) {
+                Some(z) => {
+                    if z.run.start_angefordert_at.is_none() {
+                        z.run.start_angefordert_at = Some(Utc::now());
+                    }
                     Ok(())
                 }
                 None => Err(CAS),
@@ -662,9 +779,7 @@ impl RunStore for SpeicherRunStore {
     ) -> BoxFuture<'a, Result<(), &'static str>> {
         Box::pin(async move {
             let mut inner = self.inner.lock().expect("Speicher");
-            match inner.runs.iter_mut().find(|z| {
-                !z.beendet && z.run.run_id == run_id && z.run.connection_generation == generation
-            }) {
+            match Self::treffer(&mut inner.runs, run_id, generation) {
                 Some(z) => {
                     z.beendet = true;
                     z.run.zustand = RunZustand::Beendet;
@@ -681,35 +796,37 @@ impl RunStore for SpeicherRunStore {
     fn unterbrochen_vermerken<'a>(
         &'a self,
         run_id: i64,
+        generation: i64,
     ) -> BoxFuture<'a, Result<(), &'static str>> {
         Box::pin(async move {
             let mut inner = self.inner.lock().expect("Speicher");
-            if let Some(z) = inner
-                .runs
-                .iter_mut()
-                .find(|z| !z.beendet && z.run.run_id == run_id)
-            {
-                z.run.unterbrochen_at = Some(Utc::now());
+            match Self::treffer(&mut inner.runs, run_id, generation) {
+                Some(z) => {
+                    z.run.unterbrochen_at = Some(Utc::now());
+                    Ok(())
+                }
+                None => Err(CAS),
             }
-            Ok(())
         })
     }
 
     fn live_seit_setzen<'a>(
         &'a self,
         run_id: i64,
+        generation: i64,
         seit: DateTime<Utc>,
     ) -> BoxFuture<'a, Result<(), &'static str>> {
         Box::pin(async move {
             let mut inner = self.inner.lock().expect("Speicher");
-            if let Some(z) = inner
-                .runs
-                .iter_mut()
-                .find(|z| !z.beendet && z.run.run_id == run_id && z.run.live_seit.is_none())
-            {
-                z.run.live_seit = Some(seit);
+            match Self::treffer(&mut inner.runs, run_id, generation) {
+                Some(z) => {
+                    if z.run.live_seit.is_none() {
+                        z.run.live_seit = Some(seit);
+                    }
+                    Ok(())
+                }
+                None => Err(CAS),
             }
-            Ok(())
         })
     }
 }

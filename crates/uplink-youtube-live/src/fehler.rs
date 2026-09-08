@@ -20,6 +20,8 @@ pub enum ApiFehler {
     Transport(String),
     #[error("YouTube hat den Schreibversuch nicht bestätigt")]
     Unklar,
+    #[error("YouTube liefert zu viele Seiten für einen eindeutigen Abgleich")]
+    ZuVieleSeiten,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

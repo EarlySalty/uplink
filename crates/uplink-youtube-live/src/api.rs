@@ -2,6 +2,7 @@ use crate::fehler::ApiFehler;
 use crate::model::Sichtbarkeit;
 use chrono::{DateTime, Utc};
 use futures::future::BoxFuture;
+use reqwest::header::HeaderValue;
 use reqwest::{Method, Response};
 use serde_json::{Value, json};
 use std::fmt;
@@ -10,7 +11,9 @@ use zeroize::Zeroizing;
 
 pub const STANDARD_BASIS: &str = "https://www.googleapis.com/youtube/v3";
 const STANDARD_FRIST: Duration = Duration::from_secs(10);
-const MAX_KOERPER: usize = 256 * 1024;
+const MAX_GET: usize = 1024 * 1024;
+const MAX_POST: usize = 256 * 1024;
+const MAX_SEITEN: usize = 5;
 
 #[derive(Clone)]
 pub struct StreamRessource {
@@ -62,87 +65,74 @@ pub struct BroadcastWunsch {
 
 pub trait LiveApi: Send + Sync {
     fn stream_anlegen<'a>(
-        &'a self,
-        token: &str,
+        &self,
+        token: &'a Zeroizing<String>,
         titel: &str,
     ) -> BoxFuture<'a, Result<StreamRessource, ApiFehler>>;
     fn stream_lesen<'a>(
-        &'a self,
-        token: &str,
+        &self,
+        token: &'a Zeroizing<String>,
         stream_id: &str,
     ) -> BoxFuture<'a, Result<Option<StreamRessource>, ApiFehler>>;
     fn streams_eigene<'a>(
-        &'a self,
-        token: &str,
+        &self,
+        token: &'a Zeroizing<String>,
     ) -> BoxFuture<'a, Result<Vec<StreamRessource>, ApiFehler>>;
     fn broadcast_anlegen<'a>(
-        &'a self,
-        token: &str,
+        &self,
+        token: &'a Zeroizing<String>,
         wunsch: &BroadcastWunsch,
     ) -> BoxFuture<'a, Result<BroadcastRessource, ApiFehler>>;
     fn broadcast_lesen<'a>(
-        &'a self,
-        token: &str,
+        &self,
+        token: &'a Zeroizing<String>,
         broadcast_id: &str,
     ) -> BoxFuture<'a, Result<Option<BroadcastRessource>, ApiFehler>>;
     fn broadcasts_eigene<'a>(
-        &'a self,
-        token: &str,
+        &self,
+        token: &'a Zeroizing<String>,
         status: &str,
     ) -> BoxFuture<'a, Result<Vec<BroadcastRessource>, ApiFehler>>;
     fn binden<'a>(
-        &'a self,
-        token: &str,
+        &self,
+        token: &'a Zeroizing<String>,
         broadcast_id: &str,
         stream_id: &str,
     ) -> BoxFuture<'a, Result<BroadcastRessource, ApiFehler>>;
     fn transition<'a>(
-        &'a self,
-        token: &str,
+        &self,
+        token: &'a Zeroizing<String>,
         broadcast_id: &str,
         ziel: &str,
     ) -> BoxFuture<'a, Result<BroadcastRessource, ApiFehler>>;
 }
 
-pub struct GoogleLiveApi {
-    basis: String,
+#[derive(Clone)]
+struct Klient {
     http: reqwest::Client,
+    basis: String,
 }
 
-impl GoogleLiveApi {
-    pub fn neu() -> Self {
-        Self::mit_basis(STANDARD_BASIS)
-    }
-
-    pub fn mit_basis(basis: impl Into<String>) -> Self {
-        Self::mit_basis_und_frist(basis, STANDARD_FRIST)
-    }
-
-    pub fn mit_basis_und_frist(basis: impl Into<String>, frist: Duration) -> Self {
-        Self {
-            basis: basis.into(),
-            http: reqwest::Client::builder()
-                .no_proxy()
-                .timeout(frist)
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .expect("reqwest-Client ohne Sonderoptionen"),
-        }
-    }
-
+impl Klient {
     async fn anfrage(
         &self,
         method: Method,
         pfad: &str,
         query: &[(&str, &str)],
         body: Option<Value>,
-        token: &str,
+        token: &Zeroizing<String>,
         ist_schreiben: bool,
     ) -> Result<Value, ApiFehler> {
+        let mut bearer = Zeroizing::new(String::with_capacity(7 + token.len()));
+        bearer.push_str("Bearer ");
+        bearer.push_str(token);
+        let mut kopf = HeaderValue::from_str(&bearer)
+            .map_err(|_| ApiFehler::Transport("Tokenkopf ist ungültig".into()))?;
+        kopf.set_sensitive(true);
         let mut bau = self
             .http
             .request(method, format!("{}{pfad}", self.basis))
-            .header("Authorization", format!("Bearer {token}"))
+            .header("Authorization", kopf)
             .query(query);
         if let Some(body) = &body {
             bau = bau.json(body);
@@ -150,23 +140,29 @@ impl GoogleLiveApi {
         let antwort = match bau.send().await {
             Ok(a) => a,
             Err(_) => {
-                return Err(if ist_schreiben {
-                    ApiFehler::Unklar
-                } else {
-                    ApiFehler::Transport("Verbindung zu YouTube fehlgeschlagen".into())
-                });
+                return Err(unklar_oder_transport(
+                    ist_schreiben,
+                    "Verbindung fehlgeschlagen",
+                ));
             }
         };
         let status = antwort.status().as_u16();
-        let rohdaten = koerper_lesen(antwort)
-            .await
-            .map_err(|_| ApiFehler::Transport("Antwort von YouTube ist nicht lesbar".into()))?;
+        let deckel = if ist_schreiben { MAX_POST } else { MAX_GET };
+        let rohdaten = match koerper_lesen(antwort, deckel).await {
+            Ok(daten) => daten,
+            Err(_) => {
+                return Err(unklar_oder_transport(
+                    ist_schreiben,
+                    "Antwort ist nicht lesbar",
+                ));
+            }
+        };
         if (200..300).contains(&status) {
             if rohdaten.is_empty() {
                 return Ok(Value::Null);
             }
             return serde_json::from_slice(&rohdaten)
-                .map_err(|_| ApiFehler::Transport("Antwort von YouTube ist nicht lesbar".into()));
+                .map_err(|_| unklar_oder_transport(ist_schreiben, "Antwort ist nicht lesbar"));
         }
         let grund = serde_json::from_slice::<Value>(&rohdaten)
             .ok()
@@ -174,11 +170,103 @@ impl GoogleLiveApi {
             .and_then(|v| v.pointer("/error/errors/0/reason"))
             .and_then(Value::as_str)
             .map(str::to_owned);
-        Err(fehler_aus_status(status, grund.as_deref()))
+        Err(fehler_aus_status(status, grund.as_deref(), ist_schreiben))
+    }
+
+    async fn seiten_sammeln(
+        &self,
+        pfad: &str,
+        basis_query: &[(&str, &str)],
+        token: &Zeroizing<String>,
+    ) -> Result<Vec<Value>, ApiFehler> {
+        let mut gesammelt = Vec::new();
+        let mut seite: Option<String> = None;
+        for _ in 0..MAX_SEITEN {
+            let mut query = basis_query.to_vec();
+            if let Some(page) = &seite {
+                query.push(("pageToken", page));
+            }
+            let antwort = self
+                .anfrage(Method::GET, pfad, &query, None, token, false)
+                .await?;
+            if let Some(items) = antwort.pointer("/items").and_then(Value::as_array) {
+                gesammelt.extend(items.iter().cloned());
+            }
+            match antwort
+                .pointer("/nextPageToken")
+                .and_then(Value::as_str)
+                .filter(|t| !t.is_empty())
+            {
+                Some(naechste) => seite = Some(naechste.to_owned()),
+                None => return Ok(gesammelt),
+            }
+        }
+        Err(ApiFehler::ZuVieleSeiten)
     }
 }
 
-fn fehler_aus_status(status: u16, grund: Option<&str>) -> ApiFehler {
+pub struct GoogleLiveApi {
+    klient: Klient,
+}
+
+fn basis_pruefen(basis: &str) -> Result<(), &'static str> {
+    let url = reqwest::Url::parse(basis).map_err(|_| "Basis-URL ist ungültig.")?;
+    if url.scheme() != "https" {
+        return Err("Basis-URL muss https verwenden.");
+    }
+    match url.host_str() {
+        Some(host) if host == "www.googleapis.com" || host.ends_with(".googleapis.com") => Ok(()),
+        _ => Err("Basis-URL muss auf googleapis.com zeigen."),
+    }
+}
+
+impl GoogleLiveApi {
+    pub fn neu() -> Self {
+        Self::mit_basis(STANDARD_BASIS).expect("Standardbasis ist gültig")
+    }
+
+    pub fn mit_basis(basis: impl Into<String>) -> Result<Self, &'static str> {
+        Self::mit_basis_und_frist(basis, STANDARD_FRIST)
+    }
+
+    pub fn mit_basis_und_frist(
+        basis: impl Into<String>,
+        frist: Duration,
+    ) -> Result<Self, &'static str> {
+        let basis = basis.into();
+        basis_pruefen(&basis)?;
+        Ok(Self::bauen(basis, frist))
+    }
+
+    #[doc(hidden)]
+    pub fn mit_basis_ungeprueft(basis: impl Into<String>, frist: Duration) -> Self {
+        Self::bauen(basis.into(), frist)
+    }
+
+    fn bauen(basis: String, frist: Duration) -> Self {
+        Self {
+            klient: Klient {
+                basis,
+                http: reqwest::Client::builder()
+                    .no_proxy()
+                    .timeout(frist)
+                    .redirect(reqwest::redirect::Policy::none())
+                    .build()
+                    .expect("reqwest-Client ohne Sonderoptionen"),
+            },
+        }
+    }
+}
+
+fn unklar_oder_transport(ist_schreiben: bool, meldung: &str) -> ApiFehler {
+    if ist_schreiben {
+        ApiFehler::Unklar
+    } else {
+        ApiFehler::Transport(format!("YouTube ist nicht erreichbar: {meldung}"))
+    }
+}
+
+fn fehler_aus_status(status: u16, grund: Option<&str>, ist_schreiben: bool) -> ApiFehler {
     if status == 429 {
         return ApiFehler::Ratelimit;
     }
@@ -199,22 +287,16 @@ fn fehler_aus_status(status: u16, grund: Option<&str>) -> ApiFehler {
     if status == 400 {
         return ApiFehler::Ungueltig(grund.unwrap_or("badRequest").to_owned());
     }
-    if (500..600).contains(&status) {
-        return ApiFehler::Transport(format!("YouTube antwortet mit HTTP {status}"));
-    }
-    ApiFehler::Transport(format!("YouTube antwortet unerwartet mit HTTP {status}"))
+    unklar_oder_transport(ist_schreiben, &format!("HTTP {status}"))
 }
 
-async fn koerper_lesen(mut antwort: Response) -> Result<Vec<u8>, ()> {
-    if antwort
-        .content_length()
-        .is_some_and(|n| n > MAX_KOERPER as u64)
-    {
+async fn koerper_lesen(mut antwort: Response, deckel: usize) -> Result<Vec<u8>, ()> {
+    if antwort.content_length().is_some_and(|n| n > deckel as u64) {
         return Err(());
     }
     let mut daten = Vec::new();
     while let Some(brocken) = antwort.chunk().await.map_err(|_| ())? {
-        if daten.len().saturating_add(brocken.len()) > MAX_KOERPER {
+        if daten.len().saturating_add(brocken.len()) > deckel {
             return Err(());
         }
         daten.extend_from_slice(&brocken);
@@ -281,6 +363,7 @@ fn broadcast_aus(item: &Value) -> Option<BroadcastRessource> {
         bound_stream_id: item
             .pointer("/contentDetails/boundStreamId")
             .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
             .map(str::to_owned),
         enable_auto_start: item
             .pointer("/contentDetails/enableAutoStart")
@@ -291,20 +374,19 @@ fn broadcast_aus(item: &Value) -> Option<BroadcastRessource> {
     })
 }
 
-fn erste_liste<T>(v: &Value, wandeln: impl Fn(&Value) -> Option<T>) -> Vec<T> {
+fn erstes_item<T>(v: &Value, wandeln: impl Fn(&Value) -> Option<T>) -> Option<T> {
     v.pointer("/items")
         .and_then(Value::as_array)
-        .map(|items| items.iter().filter_map(wandeln).collect())
-        .unwrap_or_default()
+        .and_then(|items| items.iter().find_map(wandeln))
 }
 
 impl LiveApi for GoogleLiveApi {
     fn stream_anlegen<'a>(
-        &'a self,
-        token: &str,
+        &self,
+        token: &'a Zeroizing<String>,
         titel: &str,
     ) -> BoxFuture<'a, Result<StreamRessource, ApiFehler>> {
-        let token = token.to_owned();
+        let klient = self.klient.clone();
         let titel = titel.to_owned();
         Box::pin(async move {
             let body = json!({
@@ -316,36 +398,35 @@ impl LiveApi for GoogleLiveApi {
                 },
                 "contentDetails": { "isReusable": true }
             });
-            let v = self
+            let v = klient
                 .anfrage(
                     Method::POST,
                     "/liveStreams",
                     &[("part", "snippet,cdn,contentDetails,status")],
                     Some(body),
-                    &token,
+                    token,
                     true,
                 )
                 .await?;
-            stream_aus(&v)
-                .ok_or_else(|| ApiFehler::Transport("YouTube-Antwort ohne Streamdaten".into()))
+            stream_aus(&v).ok_or(ApiFehler::Unklar)
         })
     }
 
     fn stream_lesen<'a>(
-        &'a self,
-        token: &str,
+        &self,
+        token: &'a Zeroizing<String>,
         stream_id: &str,
     ) -> BoxFuture<'a, Result<Option<StreamRessource>, ApiFehler>> {
-        let token = token.to_owned();
+        let klient = self.klient.clone();
         let stream_id = stream_id.to_owned();
         Box::pin(async move {
-            let v = match self
+            let v = match klient
                 .anfrage(
                     Method::GET,
                     "/liveStreams",
                     &[("part", "id,snippet,cdn,status"), ("id", &stream_id)],
                     None,
-                    &token,
+                    token,
                     false,
                 )
                 .await
@@ -354,40 +435,37 @@ impl LiveApi for GoogleLiveApi {
                 Err(ApiFehler::NichtGefunden) => return Ok(None),
                 Err(e) => return Err(e),
             };
-            Ok(erste_liste(&v, stream_aus).into_iter().next())
+            Ok(erstes_item(&v, stream_aus))
         })
     }
 
     fn streams_eigene<'a>(
-        &'a self,
-        token: &str,
+        &self,
+        token: &'a Zeroizing<String>,
     ) -> BoxFuture<'a, Result<Vec<StreamRessource>, ApiFehler>> {
-        let token = token.to_owned();
+        let klient = self.klient.clone();
         Box::pin(async move {
-            let v = self
-                .anfrage(
-                    Method::GET,
+            let items = klient
+                .seiten_sammeln(
                     "/liveStreams",
                     &[
                         ("part", "id,snippet,cdn,status"),
                         ("mine", "true"),
                         ("maxResults", "50"),
                     ],
-                    None,
-                    &token,
-                    false,
+                    token,
                 )
                 .await?;
-            Ok(erste_liste(&v, stream_aus))
+            Ok(items.iter().filter_map(stream_aus).collect())
         })
     }
 
     fn broadcast_anlegen<'a>(
-        &'a self,
-        token: &str,
+        &self,
+        token: &'a Zeroizing<String>,
         wunsch: &BroadcastWunsch,
     ) -> BoxFuture<'a, Result<BroadcastRessource, ApiFehler>> {
-        let token = token.to_owned();
+        let klient = self.klient.clone();
         let wunsch = wunsch.clone();
         Box::pin(async move {
             let body = json!({
@@ -402,30 +480,29 @@ impl LiveApi for GoogleLiveApi {
                     "monitorStream": { "enableMonitorStream": false }
                 }
             });
-            let v = self
+            let v = klient
                 .anfrage(
                     Method::POST,
                     "/liveBroadcasts",
                     &[("part", "snippet,status,contentDetails")],
                     Some(body),
-                    &token,
+                    token,
                     true,
                 )
                 .await?;
-            broadcast_aus(&v)
-                .ok_or_else(|| ApiFehler::Transport("YouTube-Antwort ohne Broadcastdaten".into()))
+            broadcast_aus(&v).ok_or(ApiFehler::Unklar)
         })
     }
 
     fn broadcast_lesen<'a>(
-        &'a self,
-        token: &str,
+        &self,
+        token: &'a Zeroizing<String>,
         broadcast_id: &str,
     ) -> BoxFuture<'a, Result<Option<BroadcastRessource>, ApiFehler>> {
-        let token = token.to_owned();
+        let klient = self.klient.clone();
         let broadcast_id = broadcast_id.to_owned();
         Box::pin(async move {
-            let v = match self
+            let v = match klient
                 .anfrage(
                     Method::GET,
                     "/liveBroadcasts",
@@ -434,7 +511,7 @@ impl LiveApi for GoogleLiveApi {
                         ("id", &broadcast_id),
                     ],
                     None,
-                    &token,
+                    token,
                     false,
                 )
                 .await
@@ -443,21 +520,20 @@ impl LiveApi for GoogleLiveApi {
                 Err(ApiFehler::NichtGefunden) => return Ok(None),
                 Err(e) => return Err(e),
             };
-            Ok(erste_liste(&v, broadcast_aus).into_iter().next())
+            Ok(erstes_item(&v, broadcast_aus))
         })
     }
 
     fn broadcasts_eigene<'a>(
-        &'a self,
-        token: &str,
+        &self,
+        token: &'a Zeroizing<String>,
         status: &str,
     ) -> BoxFuture<'a, Result<Vec<BroadcastRessource>, ApiFehler>> {
-        let token = token.to_owned();
+        let klient = self.klient.clone();
         let status = status.to_owned();
         Box::pin(async move {
-            let v = self
-                .anfrage(
-                    Method::GET,
+            let items = klient
+                .seiten_sammeln(
                     "/liveBroadcasts",
                     &[
                         ("part", "id,snippet,status,contentDetails"),
@@ -465,26 +541,24 @@ impl LiveApi for GoogleLiveApi {
                         ("broadcastStatus", &status),
                         ("maxResults", "50"),
                     ],
-                    None,
-                    &token,
-                    false,
+                    token,
                 )
                 .await?;
-            Ok(erste_liste(&v, broadcast_aus))
+            Ok(items.iter().filter_map(broadcast_aus).collect())
         })
     }
 
     fn binden<'a>(
-        &'a self,
-        token: &str,
+        &self,
+        token: &'a Zeroizing<String>,
         broadcast_id: &str,
         stream_id: &str,
     ) -> BoxFuture<'a, Result<BroadcastRessource, ApiFehler>> {
-        let token = token.to_owned();
+        let klient = self.klient.clone();
         let broadcast_id = broadcast_id.to_owned();
         let stream_id = stream_id.to_owned();
         Box::pin(async move {
-            let v = self
+            let v = klient
                 .anfrage(
                     Method::POST,
                     "/liveBroadcasts/bind",
@@ -494,26 +568,25 @@ impl LiveApi for GoogleLiveApi {
                         ("part", "id,contentDetails"),
                     ],
                     None,
-                    &token,
+                    token,
                     true,
                 )
                 .await?;
-            broadcast_aus(&v)
-                .ok_or_else(|| ApiFehler::Transport("YouTube-Antwort ohne Bindungsdaten".into()))
+            broadcast_aus(&v).ok_or(ApiFehler::Unklar)
         })
     }
 
     fn transition<'a>(
-        &'a self,
-        token: &str,
+        &self,
+        token: &'a Zeroizing<String>,
         broadcast_id: &str,
         ziel: &str,
     ) -> BoxFuture<'a, Result<BroadcastRessource, ApiFehler>> {
-        let token = token.to_owned();
+        let klient = self.klient.clone();
         let broadcast_id = broadcast_id.to_owned();
         let ziel = ziel.to_owned();
         Box::pin(async move {
-            let v = self
+            let v = klient
                 .anfrage(
                     Method::POST,
                     "/liveBroadcasts/transition",
@@ -523,12 +596,11 @@ impl LiveApi for GoogleLiveApi {
                         ("part", "id,status"),
                     ],
                     None,
-                    &token,
+                    token,
                     true,
                 )
                 .await?;
-            broadcast_aus(&v)
-                .ok_or_else(|| ApiFehler::Transport("YouTube-Antwort ohne Übergangsdaten".into()))
+            broadcast_aus(&v).ok_or(ApiFehler::Unklar)
         })
     }
 }

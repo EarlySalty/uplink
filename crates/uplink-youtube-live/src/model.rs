@@ -83,6 +83,20 @@ impl RunAnforderung {
     }
 }
 
+pub fn channel_id_pruefen(channel_id: &str) -> Result<(), &'static str> {
+    let laenge = channel_id.chars().count();
+    if !(1..=64).contains(&laenge) {
+        return Err("Kanal-ID muss zwischen 1 und 64 Zeichen lang sein.");
+    }
+    if !channel_id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err("Kanal-ID enthält unerlaubte Zeichen.");
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct IngestZugang {
     pub rtmps_url: String,
@@ -154,7 +168,6 @@ pub enum Blockgrund {
     IdentitaetAbweichung,
     VeralteteGeneration,
     UnklareZuordnung,
-    Quota,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

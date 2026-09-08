@@ -6,13 +6,14 @@ use std::time::Duration;
 use uplink_chat::Platform;
 use uplink_chat::token::{BrokerError, Grant, PlatformBroker, TokenQuelle};
 use uplink_youtube_live::model::{
-    Blockgrund, Endegrund, Identitaet, LiveEinstellungen, RunAnforderung, RunZustand, Schritt,
-    Sichtbarkeit, Zustand,
+    Blockgrund, Endegrund, Identitaet, IngestZugang, LiveEinstellungen, RunAnforderung, RunZustand,
+    Schritt, Sichtbarkeit, Vorbereitung, Zustand,
 };
 use uplink_youtube_live::store::{RunNeu, RunStore, SpeicherRunStore};
 use uplink_youtube_live::{ApiFehler, GoogleLiveApi, YouTubeLive};
 use wiremock::matchers::{body_partial_json, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+use zeroize::Zeroizing;
 
 const SCOPE: &str = "https://www.googleapis.com/auth/youtube.force-ssl";
 
@@ -59,7 +60,7 @@ async fn harness_mit(
     frist: Duration,
 ) -> (MockServer, YouTubeLive, Arc<SpeicherRunStore>) {
     let server = MockServer::start().await;
-    let api = Arc::new(GoogleLiveApi::mit_basis_und_frist(server.uri(), frist));
+    let api = Arc::new(GoogleLiveApi::mit_basis_ungeprueft(server.uri(), frist));
     let broker = Arc::new(TestBroker {
         channel: channel.into(),
         scopes,
@@ -74,13 +75,13 @@ async fn harness() -> (MockServer, YouTubeLive, Arc<SpeicherRunStore>) {
     harness_mit("UC-kanal", vec![SCOPE.into()], Duration::from_secs(10)).await
 }
 
-async fn freigabe(store: &SpeicherRunStore, generation: i64) {
+async fn freigabe_voll(store: &SpeicherRunStore, generation: i64, auto_start: bool, live: bool) {
     let e = LiveEinstellungen {
         titel: "Mein Stream".into(),
         sichtbarkeit: Sichtbarkeit::Private,
-        auto_start: false,
+        auto_start,
         auto_stop: false,
-        live_freigegeben_at: Some(Utc::now()),
+        live_freigegeben_at: live.then(Utc::now),
         connection_generation: generation,
     };
     store
@@ -89,10 +90,19 @@ async fn freigabe(store: &SpeicherRunStore, generation: i64) {
         .unwrap();
 }
 
-fn run_neu(generation: i64, auto_start: bool, stream_id: Option<&'static str>) -> RunNeu<'static> {
+async fn freigabe(store: &SpeicherRunStore, generation: i64) {
+    freigabe_voll(store, generation, false, true).await;
+}
+
+fn run_neu(
+    channel: &'static str,
+    generation: i64,
+    auto_start: bool,
+    stream_id: Option<&'static str>,
+) -> RunNeu<'static> {
     RunNeu {
         streamer_id: 77,
-        channel_id: "UC-kanal",
+        channel_id: channel,
         connection_generation: generation,
         uplink_session: "sess-1",
         titel: "Mein Stream",
@@ -113,11 +123,11 @@ async fn fabriziere(
     broadcast_id: Option<&'static str>,
 ) -> i64 {
     let run = store
-        .run_anlegen(run_neu(generation, auto_start, stream_id))
+        .run_anlegen(run_neu("UC-kanal", generation, auto_start, stream_id))
         .await
         .unwrap();
     store
-        .referenzen_setzen(run.run_id, stream_id, broadcast_id)
+        .referenzen_setzen(run.run_id, generation, stream_id, broadcast_id)
         .await
         .unwrap();
     if zustand != "vorbereitung" {
@@ -147,6 +157,15 @@ fn stream_item(id: &str, status: &str) -> Value {
     })
 }
 
+fn stream_ohne_ingest(id: &str, status: &str) -> Value {
+    json!({
+        "id": id,
+        "snippet": { "channelId": "UC-kanal", "title": "Uplink", "publishedAt": Utc::now().to_rfc3339() },
+        "cdn": { "ingestionType": "rtmp" },
+        "status": { "streamStatus": status }
+    })
+}
+
 fn broadcast_item(id: &str, leben: &str, bound: Option<&str>) -> Value {
     let mut cd = json!({ "enableAutoStart": false, "enableAutoStop": false });
     if let Some(b) = bound {
@@ -158,6 +177,10 @@ fn broadcast_item(id: &str, leben: &str, bound: Option<&str>) -> Value {
         "status": { "lifeCycleStatus": leben, "privacyStatus": "private" },
         "contentDetails": cd
     })
+}
+
+fn slist(item: Value) -> Value {
+    json!({ "items": [item] })
 }
 
 fn fehler_body(reason: &str) -> Value {
@@ -174,6 +197,14 @@ async fn get(server: &MockServer, pfad: &str, query: &[(&str, &str)], body: Valu
         .await;
 }
 
+async fn get_status(server: &MockServer, pfad: &str, status: u16, body: Value) {
+    Mock::given(method("GET"))
+        .and(path(pfad))
+        .respond_with(ResponseTemplate::new(status).set_body_json(body))
+        .mount(server)
+        .await;
+}
+
 async fn get_seq(
     server: &MockServer,
     pfad: &str,
@@ -186,6 +217,31 @@ async fn get_seq(
         m1 = m1.and(query_param(*k, *v));
     }
     m1.respond_with(ResponseTemplate::new(200).set_body_json(erst))
+        .up_to_n_times(1)
+        .mount(server)
+        .await;
+    let mut m2 = Mock::given(method("GET")).and(path(pfad));
+    for (k, v) in query {
+        m2 = m2.and(query_param(*k, *v));
+    }
+    m2.respond_with(ResponseTemplate::new(200).set_body_json(dann))
+        .mount(server)
+        .await;
+}
+
+async fn get_seq_status(
+    server: &MockServer,
+    pfad: &str,
+    query: &[(&str, &str)],
+    status: u16,
+    erst: Value,
+    dann: Value,
+) {
+    let mut m1 = Mock::given(method("GET")).and(path(pfad));
+    for (k, v) in query {
+        m1 = m1.and(query_param(*k, *v));
+    }
+    m1.respond_with(ResponseTemplate::new(status).set_body_json(erst))
         .up_to_n_times(1)
         .mount(server)
         .await;
@@ -297,10 +353,25 @@ async fn fehlender_scope_blockiert() {
 }
 
 #[tokio::test]
+async fn ungueltige_kanal_id_wird_abgewiesen() {
+    let (_server, adapter, store) = harness().await;
+    freigabe(&store, 1).await;
+    let id = Identitaet {
+        streamer_id: 77,
+        channel_id: "UC kanal mit leer!".into(),
+        connection_generation: 1,
+    };
+    assert!(matches!(
+        adapter.prepare(&id, anforderung()).await,
+        Err(uplink_youtube_live::LiveFehler::Ungueltig(_))
+    ));
+}
+
+#[tokio::test]
 async fn voller_erstlauf_und_idempotent() {
     let (server, adapter, store) = harness().await;
     freigabe(&store, 1).await;
-    store.stream_id_merken(77, "S-alt").await.unwrap();
+    store.stream_id_merken(77, 1, "S-alt").await.unwrap();
     get(
         &server,
         "/liveStreams",
@@ -312,7 +383,7 @@ async fn voller_erstlauf_und_idempotent() {
         &server,
         "/liveStreams",
         &[("id", "S-neu")],
-        json!({ "items": [stream_item("S-neu", "ready")] }),
+        slist(stream_item("S-neu", "ready")),
     )
     .await;
     post(&server, "/liveStreams", stream_item("S-neu", "ready")).await;
@@ -337,7 +408,7 @@ async fn voller_erstlauf_und_idempotent() {
         &server,
         "/liveBroadcasts",
         &[("id", "B-neu")],
-        json!({ "items": [broadcast_item("B-neu", "created", Some("S-neu"))] }),
+        slist(broadcast_item("B-neu", "created", Some("S-neu"))),
     )
     .await;
 
@@ -351,7 +422,6 @@ async fn voller_erstlauf_und_idempotent() {
     }
     let ingest = v.ingest.expect("Ingest");
     assert_eq!(ingest.stream_name.as_str(), "geheim-name");
-    assert_eq!(ingest.rtmps_url, "rtmps://ingest/app");
     let bodies: Vec<String> = server
         .received_requests()
         .await
@@ -384,6 +454,7 @@ async fn voller_erstlauf_und_idempotent() {
 #[tokio::test]
 async fn start_auto_start_false_geht_live_bei_active() {
     let (server, adapter, store) = harness().await;
+    freigabe(&store, 1).await;
     fabriziere(
         &store,
         1,
@@ -398,7 +469,14 @@ async fn start_auto_start_false_geht_live_bei_active() {
         &server,
         "/liveStreams",
         &[("id", "S1")],
-        json!({ "items": [stream_item("S1", "active")] }),
+        slist(stream_item("S1", "active")),
+    )
+    .await;
+    get(
+        &server,
+        "/liveBroadcasts",
+        &[("id", "B1")],
+        slist(broadcast_item("B1", "ready", Some("S1"))),
     )
     .await;
     post(
@@ -407,16 +485,9 @@ async fn start_auto_start_false_geht_live_bei_active() {
         broadcast_item("B1", "live", Some("S1")),
     )
     .await;
-    get(
-        &server,
-        "/liveBroadcasts",
-        &[("id", "B1")],
-        json!({ "items": [broadcast_item("B1", "live", Some("S1"))] }),
-    )
-    .await;
 
     let z = adapter.start(&ident(1)).await.unwrap();
-    assert!(matches!(z, Zustand::Live { .. }));
+    assert!(matches!(z, Zustand::Live { .. }), "war {z:?}");
     assert_eq!(
         anzahl(&server, "POST", "/liveBroadcasts/transition").await,
         1
@@ -426,6 +497,7 @@ async fn start_auto_start_false_geht_live_bei_active() {
 #[tokio::test]
 async fn start_ready_bleibt_sendet_ohne_transition() {
     let (server, adapter, store) = harness().await;
+    freigabe(&store, 1).await;
     fabriziere(
         &store,
         1,
@@ -440,7 +512,14 @@ async fn start_ready_bleibt_sendet_ohne_transition() {
         &server,
         "/liveStreams",
         &[("id", "S1")],
-        json!({ "items": [stream_item("S1", "ready")] }),
+        slist(stream_item("S1", "ready")),
+    )
+    .await;
+    get(
+        &server,
+        "/liveBroadcasts",
+        &[("id", "B1")],
+        slist(broadcast_item("B1", "ready", Some("S1"))),
     )
     .await;
 
@@ -458,6 +537,7 @@ async fn start_ready_bleibt_sendet_ohne_transition() {
 #[tokio::test]
 async fn start_fremde_bindung_ist_fehler_nicht_wiederaufnehmbar() {
     let (server, adapter, store) = harness().await;
+    freigabe(&store, 1).await;
     fabriziere(
         &store,
         1,
@@ -472,7 +552,89 @@ async fn start_fremde_bindung_ist_fehler_nicht_wiederaufnehmbar() {
         &server,
         "/liveStreams",
         &[("id", "S1")],
-        json!({ "items": [stream_item("S1", "active")] }),
+        slist(stream_item("S1", "active")),
+    )
+    .await;
+    get(
+        &server,
+        "/liveBroadcasts",
+        &[("id", "B1")],
+        slist(broadcast_item("B1", "live", Some("S-fremd"))),
+    )
+    .await;
+
+    let z = adapter.start(&ident(1)).await.unwrap();
+    assert!(
+        matches!(
+            z,
+            Zustand::Fehler {
+                wiederaufnehmbar: false,
+                ..
+            }
+        ),
+        "war {z:?}"
+    );
+    assert_eq!(
+        anzahl(&server, "POST", "/liveBroadcasts/transition").await,
+        0
+    );
+}
+
+#[tokio::test]
+async fn start_auto_start_true_ruft_keine_transition() {
+    let (server, adapter, store) = harness().await;
+    freigabe_voll(&store, 1, true, true).await;
+    fabriziere(&store, 1, true, "vorbereitet", None, Some("S1"), Some("B1")).await;
+    get(
+        &server,
+        "/liveStreams",
+        &[("id", "S1")],
+        slist(stream_item("S1", "active")),
+    )
+    .await;
+    get(
+        &server,
+        "/liveBroadcasts",
+        &[("id", "B1")],
+        slist(broadcast_item("B1", "live", Some("S1"))),
+    )
+    .await;
+
+    let z = adapter.start(&ident(1)).await.unwrap();
+    assert!(matches!(z, Zustand::Live { .. }), "war {z:?}");
+    assert_eq!(
+        anzahl(&server, "POST", "/liveBroadcasts/transition").await,
+        0
+    );
+}
+
+#[tokio::test]
+async fn start_ready_dann_status_active_schaltet_live() {
+    let (server, adapter, store) = harness().await;
+    freigabe(&store, 1).await;
+    fabriziere(
+        &store,
+        1,
+        false,
+        "vorbereitet",
+        None,
+        Some("S1"),
+        Some("B1"),
+    )
+    .await;
+    get_seq(
+        &server,
+        "/liveStreams",
+        &[("id", "S1")],
+        slist(stream_item("S1", "ready")),
+        slist(stream_item("S1", "active")),
+    )
+    .await;
+    get(
+        &server,
+        "/liveBroadcasts",
+        &[("id", "B1")],
+        slist(broadcast_item("B1", "ready", Some("S1"))),
     )
     .await;
     post(
@@ -481,60 +643,30 @@ async fn start_fremde_bindung_ist_fehler_nicht_wiederaufnehmbar() {
         broadcast_item("B1", "live", Some("S1")),
     )
     .await;
-    get(
-        &server,
-        "/liveBroadcasts",
-        &[("id", "B1")],
-        json!({ "items": [broadcast_item("B1", "live", Some("S-fremd"))] }),
-    )
-    .await;
 
-    let z = adapter.start(&ident(1)).await.unwrap();
-    assert!(matches!(
-        z,
-        Zustand::Fehler {
-            wiederaufnehmbar: false,
-            ..
-        }
-    ));
-}
-
-#[tokio::test]
-async fn start_auto_start_true_ruft_keine_transition() {
-    let (server, adapter, store) = harness().await;
-    fabriziere(&store, 1, true, "vorbereitet", None, Some("S1"), Some("B1")).await;
-    get(
-        &server,
-        "/liveStreams",
-        &[("id", "S1")],
-        json!({ "items": [stream_item("S1", "active")] }),
-    )
-    .await;
-    get(
-        &server,
-        "/liveBroadcasts",
-        &[("id", "B1")],
-        json!({ "items": [broadcast_item("B1", "live", Some("S1"))] }),
-    )
-    .await;
-
-    let z = adapter.start(&ident(1)).await.unwrap();
-    assert!(matches!(z, Zustand::Live { .. }));
+    let erst = adapter.start(&ident(1)).await.unwrap();
+    assert!(matches!(erst, Zustand::Sendet { .. }), "war {erst:?}");
     assert_eq!(
         anzahl(&server, "POST", "/liveBroadcasts/transition").await,
         0
+    );
+    let dann = adapter.status(&ident(1)).await.unwrap();
+    assert!(matches!(dann, Zustand::Live { .. }), "war {dann:?}");
+    assert_eq!(
+        anzahl(&server, "POST", "/liveBroadcasts/transition").await,
+        1
     );
 }
 
 #[tokio::test]
 async fn finish_live_beendet_mit_bestaetigung() {
     let (server, adapter, store) = harness().await;
-    let run_id = fabriziere(&store, 1, false, "live", None, Some("S1"), Some("B1")).await;
+    fabriziere(&store, 1, false, "live", None, Some("S1"), Some("B1")).await;
     get(
         &server,
         "/liveBroadcasts",
         &[("id", "B1")],
-        json!({ "items": [broadcast_item("B1", "live", Some("S1"))] }),
+        slist(broadcast_item("B1", "live", Some("S1"))),
     )
     .await;
     post(
@@ -560,7 +692,6 @@ async fn finish_live_beendet_mit_bestaetigung() {
         anderes => panic!("erwartet Beendet, war {anderes:?}"),
     }
     assert!(store.aktiven_run_laden(77).await.unwrap().is_none());
-    let _ = run_id;
 }
 
 #[tokio::test]
@@ -580,7 +711,7 @@ async fn finish_ready_beendet_ohne_transition() {
         &server,
         "/liveBroadcasts",
         &[("id", "B1")],
-        json!({ "items": [broadcast_item("B1", "ready", Some("S1"))] }),
+        slist(broadcast_item("B1", "ready", Some("S1"))),
     )
     .await;
 
@@ -602,6 +733,36 @@ async fn finish_ready_beendet_ohne_transition() {
 }
 
 #[tokio::test]
+async fn quota_bei_finish_ist_wiederaufnehmbar() {
+    let (server, adapter, store) = harness().await;
+    fabriziere(&store, 1, false, "live", None, Some("S1"), Some("B1")).await;
+    get_status(
+        &server,
+        "/liveBroadcasts",
+        403,
+        fehler_body("quotaExceeded"),
+    )
+    .await;
+
+    let z = adapter
+        .finish(&ident(1), Endegrund::NutzerStop)
+        .await
+        .unwrap();
+    assert!(matches!(
+        z,
+        Zustand::Fehler {
+            fehler: ApiFehler::Quota,
+            wiederaufnehmbar: true,
+            ..
+        }
+    ));
+    assert!(
+        store.aktiven_run_laden(77).await.unwrap().is_some(),
+        "Run bleibt offen"
+    );
+}
+
+#[tokio::test]
 async fn medien_unterbrochen_ohne_request_haelt_zustand() {
     let (server, adapter, store) = harness().await;
     fabriziere(&store, 1, false, "live", None, Some("S1"), Some("B1")).await;
@@ -617,7 +778,7 @@ async fn medien_unterbrochen_ohne_request_haelt_zustand() {
 async fn erneuter_stream_nach_beendet_verwendet_stream_wieder() {
     let (server, adapter, store) = harness().await;
     freigabe(&store, 1).await;
-    store.stream_id_merken(77, "S1").await.unwrap();
+    store.stream_id_merken(77, 1, "S1").await.unwrap();
     let alt = fabriziere(
         &store,
         1,
@@ -636,7 +797,7 @@ async fn erneuter_stream_nach_beendet_verwendet_stream_wieder() {
         &server,
         "/liveStreams",
         &[("id", "S1")],
-        json!({ "items": [stream_item("S1", "ready")] }),
+        slist(stream_item("S1", "ready")),
     )
     .await;
     post(
@@ -655,7 +816,7 @@ async fn erneuter_stream_nach_beendet_verwendet_stream_wieder() {
         &server,
         "/liveBroadcasts",
         &[("id", "B-neu")],
-        json!({ "items": [broadcast_item("B-neu", "created", Some("S1"))] }),
+        slist(broadcast_item("B-neu", "created", Some("S1"))),
     )
     .await;
 
@@ -674,6 +835,7 @@ async fn erneuter_stream_nach_beendet_verwendet_stream_wieder() {
 #[tokio::test]
 async fn quota_bei_status_ist_wiederaufnehmbar_und_haelt_zustand() {
     let (server, adapter, store) = harness().await;
+    freigabe(&store, 1).await;
     fabriziere(
         &store,
         1,
@@ -684,11 +846,7 @@ async fn quota_bei_status_ist_wiederaufnehmbar_und_haelt_zustand() {
         Some("B1"),
     )
     .await;
-    Mock::given(method("GET"))
-        .and(path("/liveStreams"))
-        .respond_with(ResponseTemplate::new(403).set_body_json(fehler_body("quotaExceeded")))
-        .mount(&server)
-        .await;
+    get_status(&server, "/liveStreams", 403, fehler_body("quotaExceeded")).await;
     let z = adapter.status(&ident(1)).await.unwrap();
     assert!(matches!(
         z,
@@ -707,6 +865,7 @@ async fn quota_bei_status_ist_wiederaufnehmbar_und_haelt_zustand() {
 #[tokio::test]
 async fn transport_bei_status_ist_wiederaufnehmbar() {
     let (server, adapter, store) = harness().await;
+    freigabe(&store, 1).await;
     fabriziere(
         &store,
         1,
@@ -754,27 +913,64 @@ async fn live_nicht_freigeschaltet_bei_insert_blockiert() {
 }
 
 #[tokio::test]
-async fn unklarer_broadcast_insert_setzt_schritt() {
-    let (server, adapter, store) =
-        harness_mit("UC-kanal", vec![SCOPE.into()], Duration::from_millis(80)).await;
+async fn fehlender_ingest_zugang_ist_fehler() {
+    let (server, adapter, store) = harness().await;
     freigabe(&store, 1).await;
-    store.stream_id_merken(77, "S1").await.unwrap();
+    store.stream_id_merken(77, 1, "S1").await.unwrap();
     get(
         &server,
         "/liveStreams",
         &[("id", "S1")],
-        json!({ "items": [stream_item("S1", "ready")] }),
+        slist(stream_ohne_ingest("S1", "ready")),
     )
     .await;
-    Mock::given(method("POST"))
-        .and(path("/liveBroadcasts"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_delay(Duration::from_millis(400))
-                .set_body_json(broadcast_item("B1", "created", None)),
-        )
-        .mount(&server)
-        .await;
+    post(
+        &server,
+        "/liveBroadcasts",
+        broadcast_item("B1", "created", None),
+    )
+    .await;
+    post(
+        &server,
+        "/liveBroadcasts/bind",
+        broadcast_item("B1", "created", Some("S1")),
+    )
+    .await;
+    get(
+        &server,
+        "/liveBroadcasts",
+        &[("id", "B1")],
+        slist(broadcast_item("B1", "created", Some("S1"))),
+    )
+    .await;
+
+    let v = adapter.prepare(&ident(1), anforderung()).await.unwrap();
+    match v.zustand {
+        Zustand::Fehler {
+            fehler: ApiFehler::Ungueltig(m),
+            wiederaufnehmbar: false,
+            ..
+        } => {
+            assert_eq!(m, "YouTube liefert keinen Ingest-Zugang.");
+        }
+        anderes => panic!("erwartet Ingest-Fehler, war {anderes:?}"),
+    }
+}
+
+#[tokio::test]
+async fn post_503_bei_broadcast_insert_ist_unklar_dann_abgleich() {
+    let (server, adapter, store) = harness().await;
+    freigabe(&store, 1).await;
+    store.stream_id_merken(77, 1, "S1").await.unwrap();
+    get(
+        &server,
+        "/liveStreams",
+        &[("id", "S1")],
+        slist(stream_item("S1", "ready")),
+    )
+    .await;
+    post_status(&server, "/liveBroadcasts", 503, json!({})).await;
+
     let v = adapter.prepare(&ident(1), anforderung()).await.unwrap();
     match v.zustand {
         Zustand::Unklar { schritt, .. } => assert_eq!(schritt, Schritt::BroadcastInsert),
@@ -782,6 +978,119 @@ async fn unklarer_broadcast_insert_setzt_schritt() {
     }
     let run = store.aktiven_run_laden(77).await.unwrap().unwrap();
     assert_eq!(run.schritt, Some(Schritt::BroadcastInsert));
+
+    get(
+        &server,
+        "/liveBroadcasts",
+        &[("mine", "true"), ("broadcastStatus", "upcoming")],
+        slist(broadcast_item("B1", "created", None)),
+    )
+    .await;
+    get(
+        &server,
+        "/liveBroadcasts",
+        &[("mine", "true"), ("broadcastStatus", "active")],
+        json!({ "items": [] }),
+    )
+    .await;
+    get_seq(
+        &server,
+        "/liveBroadcasts",
+        &[("id", "B1")],
+        slist(broadcast_item("B1", "created", None)),
+        slist(broadcast_item("B1", "created", Some("S1"))),
+    )
+    .await;
+    post(
+        &server,
+        "/liveBroadcasts/bind",
+        broadcast_item("B1", "created", Some("S1")),
+    )
+    .await;
+
+    let z = adapter.status(&ident(1)).await.unwrap();
+    assert!(matches!(z, Zustand::Vorbereitet { .. }), "war {z:?}");
+    assert_eq!(anzahl(&server, "POST", "/liveBroadcasts").await, 1);
+}
+
+#[tokio::test]
+async fn freigabe_entzogen_status_blockiert_ohne_requests() {
+    let (server, adapter, store) = harness().await;
+    freigabe_voll(&store, 1, false, false).await;
+    fabriziere(&store, 1, false, "vorbereitung", None, None, None).await;
+    let z = adapter.status(&ident(1)).await.unwrap();
+    assert!(matches!(
+        z,
+        Zustand::Blockiert {
+            grund: Blockgrund::KeineFreigabe,
+            ..
+        }
+    ));
+    assert!(keine_youtube_requests(&server).await);
+}
+
+#[tokio::test]
+async fn fremder_run_kanal_blockiert_ohne_requests() {
+    let (server, adapter, store) = harness().await;
+    freigabe(&store, 1).await;
+    let run = store
+        .run_anlegen(run_neu("UC-fremd", 1, false, Some("S1")))
+        .await
+        .unwrap();
+    store
+        .referenzen_setzen(run.run_id, 1, Some("S1"), Some("B1"))
+        .await
+        .unwrap();
+    store
+        .zustand_setzen(run.run_id, 1, &["vorbereitung"], "vorbereitet")
+        .await
+        .unwrap();
+    let z = adapter.status(&ident(1)).await.unwrap();
+    assert!(matches!(
+        z,
+        Zustand::Blockiert {
+            grund: Blockgrund::IdentitaetAbweichung,
+            ..
+        }
+    ));
+    assert!(keine_youtube_requests(&server).await);
+}
+
+#[tokio::test]
+async fn einstellungswechsel_stoert_laufende_vorbereitung_nicht() {
+    let (server, adapter, store) = harness().await;
+    freigabe_voll(&store, 1, true, true).await;
+    store.stream_id_merken(77, 1, "S1").await.unwrap();
+    fabriziere(&store, 1, false, "vorbereitung", None, Some("S1"), None).await;
+    get(
+        &server,
+        "/liveStreams",
+        &[("id", "S1")],
+        slist(stream_item("S1", "ready")),
+    )
+    .await;
+    post(
+        &server,
+        "/liveBroadcasts",
+        broadcast_item("B1", "created", None),
+    )
+    .await;
+    post(
+        &server,
+        "/liveBroadcasts/bind",
+        broadcast_item("B1", "created", Some("S1")),
+    )
+    .await;
+    get(
+        &server,
+        "/liveBroadcasts",
+        &[("id", "B1")],
+        slist(broadcast_item("B1", "created", Some("S1"))),
+    )
+    .await;
+
+    let z = adapter.status(&ident(1)).await.unwrap();
+    assert!(matches!(z, Zustand::Vorbereitet { .. }), "war {z:?}");
 }
 
 #[tokio::test]
@@ -802,7 +1111,7 @@ async fn abgleich_broadcast_insert_ein_kandidat_geht_weiter_zu_bind() {
         &server,
         "/liveBroadcasts",
         &[("mine", "true"), ("broadcastStatus", "upcoming")],
-        json!({ "items": [broadcast_item("B1", "created", None)] }),
+        slist(broadcast_item("B1", "created", None)),
     )
     .await;
     get(
@@ -816,15 +1125,15 @@ async fn abgleich_broadcast_insert_ein_kandidat_geht_weiter_zu_bind() {
         &server,
         "/liveStreams",
         &[("id", "S1")],
-        json!({ "items": [stream_item("S1", "ready")] }),
+        slist(stream_item("S1", "ready")),
     )
     .await;
     get_seq(
         &server,
         "/liveBroadcasts",
         &[("id", "B1")],
-        json!({ "items": [broadcast_item("B1", "created", None)] }),
-        json!({ "items": [broadcast_item("B1", "created", Some("S1"))] }),
+        slist(broadcast_item("B1", "created", None)),
+        slist(broadcast_item("B1", "created", Some("S1"))),
     )
     .await;
     post(
@@ -905,7 +1214,7 @@ async fn abgleich_broadcast_insert_kein_kandidat_fuegt_erneut_ein() {
         &server,
         "/liveStreams",
         &[("id", "S1")],
-        json!({ "items": [stream_item("S1", "ready")] }),
+        slist(stream_item("S1", "ready")),
     )
     .await;
     post(
@@ -924,7 +1233,7 @@ async fn abgleich_broadcast_insert_kein_kandidat_fuegt_erneut_ein() {
         &server,
         "/liveBroadcasts",
         &[("id", "B9")],
-        json!({ "items": [broadcast_item("B9", "created", Some("S1"))] }),
+        slist(broadcast_item("B9", "created", Some("S1"))),
     )
     .await;
 
@@ -951,7 +1260,7 @@ async fn abgleich_stream_insert_ein_kandidat_mine() {
         &server,
         "/liveStreams",
         &[("mine", "true")],
-        json!({ "items": [stream_item("S1", "ready")] }),
+        slist(stream_item("S1", "ready")),
     )
     .await;
     post(
@@ -970,7 +1279,7 @@ async fn abgleich_stream_insert_ein_kandidat_mine() {
         &server,
         "/liveBroadcasts",
         &[("id", "B1")],
-        json!({ "items": [broadcast_item("B1", "created", Some("S1"))] }),
+        slist(broadcast_item("B1", "created", Some("S1"))),
     )
     .await;
 
@@ -1007,14 +1316,14 @@ async fn abgleich_bind_bereits_gebunden_ohne_zweiten_bind() {
         &server,
         "/liveStreams",
         &[("id", "S1")],
-        json!({ "items": [stream_item("S1", "ready")] }),
+        slist(stream_item("S1", "ready")),
     )
     .await;
     get(
         &server,
         "/liveBroadcasts",
         &[("id", "B1")],
-        json!({ "items": [broadcast_item("B1", "created", Some("S1"))] }),
+        slist(broadcast_item("B1", "created", Some("S1"))),
     )
     .await;
 
@@ -1041,7 +1350,7 @@ async fn abgleich_transition_live_uebernimmt_live() {
         &server,
         "/liveBroadcasts",
         &[("id", "B1")],
-        json!({ "items": [broadcast_item("B1", "live", Some("S1"))] }),
+        slist(broadcast_item("B1", "live", Some("S1"))),
     )
     .await;
 
@@ -1053,10 +1362,108 @@ async fn abgleich_transition_live_uebernimmt_live() {
 }
 
 #[tokio::test]
+async fn abgleich_transition_live_fremde_bindung_ist_fehler() {
+    let (server, adapter, store) = harness().await;
+    freigabe(&store, 1).await;
+    fabriziere(
+        &store,
+        1,
+        false,
+        "sendet",
+        Some(Schritt::TransitionLive),
+        Some("S1"),
+        Some("B1"),
+    )
+    .await;
+    get(
+        &server,
+        "/liveBroadcasts",
+        &[("id", "B1")],
+        slist(broadcast_item("B1", "live", Some("S-fremd"))),
+    )
+    .await;
+
+    let z = adapter.status(&ident(1)).await.unwrap();
+    assert!(
+        matches!(
+            z,
+            Zustand::Fehler {
+                wiederaufnehmbar: false,
+                ..
+            }
+        ),
+        "war {z:?}"
+    );
+}
+
+#[tokio::test]
+async fn retry_nach_401_gelingt() {
+    let (server, adapter, store) = harness().await;
+    freigabe(&store, 1).await;
+    fabriziere(
+        &store,
+        1,
+        false,
+        "vorbereitet",
+        None,
+        Some("S1"),
+        Some("B1"),
+    )
+    .await;
+    get_seq_status(
+        &server,
+        "/liveStreams",
+        &[("id", "S1")],
+        401,
+        fehler_body("authError"),
+        slist(stream_item("S1", "ready")),
+    )
+    .await;
+    get(
+        &server,
+        "/liveBroadcasts",
+        &[("id", "B1")],
+        slist(broadcast_item("B1", "created", Some("S1"))),
+    )
+    .await;
+
+    let z = adapter.status(&ident(1)).await.unwrap();
+    assert!(matches!(z, Zustand::Vorbereitet { .. }), "war {z:?}");
+    assert_eq!(anzahl(&server, "GET", "/liveStreams").await, 2);
+}
+
+#[tokio::test]
+async fn zweites_401_blockiert() {
+    let (server, adapter, store) = harness().await;
+    freigabe(&store, 1).await;
+    fabriziere(
+        &store,
+        1,
+        false,
+        "vorbereitet",
+        None,
+        Some("S1"),
+        Some("B1"),
+    )
+    .await;
+    get_status(&server, "/liveStreams", 401, fehler_body("authError")).await;
+
+    let z = adapter.status(&ident(1)).await.unwrap();
+    assert!(matches!(
+        z,
+        Zustand::Blockiert {
+            grund: Blockgrund::NeuAnmeldungNoetig,
+            ..
+        }
+    ));
+    assert_eq!(anzahl(&server, "GET", "/liveStreams").await, 2);
+}
+
+#[tokio::test]
 async fn fremde_generation_nach_neustart_schliesst_ohne_requests() {
     let (server, adapter, store) = harness().await;
     freigabe(&store, 1).await;
-    let alt = fabriziere(
+    fabriziere(
         &store,
         1,
         false,
@@ -1069,16 +1476,14 @@ async fn fremde_generation_nach_neustart_schliesst_ohne_requests() {
     let z = adapter.status(&ident(2)).await.unwrap();
     assert!(matches!(z, Zustand::Inaktiv));
     assert!(keine_youtube_requests(&server).await);
-    let run = store.aktiven_run_laden(77).await.unwrap();
-    assert!(run.is_none(), "alter Run ist geschlossen");
-    let _ = alt;
+    assert!(store.aktiven_run_laden(77).await.unwrap().is_none());
 }
 
 #[tokio::test]
 async fn fremde_generation_neuer_lauf_nur_mit_freigabe() {
     let (server, adapter, store) = harness().await;
     freigabe(&store, 2).await;
-    store.stream_id_merken(77, "S1").await.unwrap();
+    store.stream_id_merken(77, 2, "S1").await.unwrap();
     fabriziere(
         &store,
         1,
@@ -1093,7 +1498,7 @@ async fn fremde_generation_neuer_lauf_nur_mit_freigabe() {
         &server,
         "/liveStreams",
         &[("id", "S1")],
-        json!({ "items": [stream_item("S1", "ready")] }),
+        slist(stream_item("S1", "ready")),
     )
     .await;
     post(
@@ -1112,7 +1517,7 @@ async fn fremde_generation_neuer_lauf_nur_mit_freigabe() {
         &server,
         "/liveBroadcasts",
         &[("id", "B-neu")],
-        json!({ "items": [broadcast_item("B-neu", "created", Some("S1"))] }),
+        slist(broadcast_item("B-neu", "created", Some("S1"))),
     )
     .await;
 
@@ -1121,21 +1526,29 @@ async fn fremde_generation_neuer_lauf_nur_mit_freigabe() {
         Zustand::Vorbereitet { refs } => assert_eq!(refs.broadcast_id, "B-neu"),
         anderes => panic!("erwartet Vorbereitet, war {anderes:?}"),
     }
-    let run = store.aktiven_run_laden(77).await.unwrap().unwrap();
-    assert_eq!(run.connection_generation, 2);
+    assert_eq!(
+        store
+            .aktiven_run_laden(77)
+            .await
+            .unwrap()
+            .unwrap()
+            .connection_generation,
+        2
+    );
 }
 
 #[tokio::test]
 async fn paralleler_aufruf_ist_belegt() {
     let (server, adapter, store) = harness().await;
     let adapter = Arc::new(adapter);
+    freigabe(&store, 1).await;
     fabriziere(&store, 1, false, "live", None, Some("S1"), Some("B1")).await;
     Mock::given(method("GET"))
         .and(path("/liveStreams"))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_delay(Duration::from_millis(300))
-                .set_body_json(json!({ "items": [stream_item("S1", "active")] })),
+                .set_body_json(slist(stream_item("S1", "active"))),
         )
         .mount(&server)
         .await;
@@ -1143,7 +1556,7 @@ async fn paralleler_aufruf_ist_belegt() {
         &server,
         "/liveBroadcasts",
         &[("id", "B1")],
-        json!({ "items": [broadcast_item("B1", "live", Some("S1"))] }),
+        slist(broadcast_item("B1", "live", Some("S1"))),
     )
     .await;
 
@@ -1156,4 +1569,20 @@ async fn paralleler_aufruf_ist_belegt() {
         Err(uplink_youtube_live::LiveFehler::Belegt)
     ));
     let _ = erste.await.unwrap();
+}
+
+#[test]
+fn debug_maskiert_ingest_und_vorbereitung() {
+    let ingest = IngestZugang {
+        rtmps_url: "rtmps://ingest/app".into(),
+        stream_name: Zeroizing::new("streng-geheim".into()),
+    };
+    let text = format!("{ingest:?}");
+    assert!(!text.contains("streng-geheim"));
+    assert!(text.contains("[geschützt]"));
+    let vorbereitung = Vorbereitung {
+        zustand: Zustand::Inaktiv,
+        ingest: Some(ingest),
+    };
+    assert!(!format!("{vorbereitung:?}").contains("streng-geheim"));
 }

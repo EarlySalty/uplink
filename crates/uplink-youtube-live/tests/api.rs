@@ -5,6 +5,11 @@ use uplink_youtube_live::fehler::ApiFehler;
 use uplink_youtube_live::model::Sichtbarkeit;
 use wiremock::matchers::{body_partial_json, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+use zeroize::Zeroizing;
+
+fn tok() -> Zeroizing<String> {
+    Zeroizing::new("acc-token".into())
+}
 
 fn stream_json(id: &str, status: &str) -> serde_json::Value {
     json!({
@@ -28,7 +33,7 @@ fn broadcast_json(id: &str, leben: &str) -> serde_json::Value {
 }
 
 async fn api(server: &MockServer) -> GoogleLiveApi {
-    GoogleLiveApi::mit_basis(server.uri())
+    GoogleLiveApi::mit_basis_ungeprueft(server.uri(), Duration::from_secs(10))
 }
 
 #[tokio::test]
@@ -48,7 +53,7 @@ async fn stream_anlegen_sendet_pflichtfelder() {
         .await;
     let stream = api(&server)
         .await
-        .stream_anlegen("tok", "Uplink")
+        .stream_anlegen(&tok(), "Uplink")
         .await
         .expect("Stream");
     assert_eq!(stream.id, "S1");
@@ -77,8 +82,8 @@ async fn stream_lesen_liefert_treffer_und_leer() {
         .mount(&server)
         .await;
     let api = api(&server).await;
-    assert!(api.stream_lesen("tok", "S1").await.unwrap().is_some());
-    assert!(api.stream_lesen("tok", "S9").await.unwrap().is_none());
+    assert!(api.stream_lesen(&tok(), "S1").await.unwrap().is_some());
+    assert!(api.stream_lesen(&tok(), "S9").await.unwrap().is_none());
 }
 
 #[tokio::test]
@@ -94,7 +99,7 @@ async fn stream_lesen_404_ist_leer() {
     assert!(
         api(&server)
             .await
-            .stream_lesen("tok", "S1")
+            .stream_lesen(&tok(), "S1")
             .await
             .unwrap()
             .is_none()
@@ -112,7 +117,7 @@ async fn streams_eigene_liefert_liste() {
         })))
         .mount(&server)
         .await;
-    let liste = api(&server).await.streams_eigene("tok").await.unwrap();
+    let liste = api(&server).await.streams_eigene(&tok()).await.unwrap();
     assert_eq!(liste.len(), 2);
 }
 
@@ -144,7 +149,7 @@ async fn broadcast_anlegen_sendet_felder() {
     };
     let b = api(&server)
         .await
-        .broadcast_anlegen("tok", &wunsch)
+        .broadcast_anlegen(&tok(), &wunsch)
         .await
         .unwrap();
     assert_eq!(b.id, "B1");
@@ -163,7 +168,7 @@ async fn binden_traegt_query_und_liefert_bindung() {
         .expect(1)
         .mount(&server)
         .await;
-    let b = api(&server).await.binden("tok", "B1", "S1").await.unwrap();
+    let b = api(&server).await.binden(&tok(), "B1", "S1").await.unwrap();
     assert_eq!(b.bound_stream_id.as_deref(), Some("S1"));
 }
 
@@ -181,7 +186,7 @@ async fn transition_traegt_zielstatus() {
         .await;
     let b = api(&server)
         .await
-        .transition("tok", "B1", "live")
+        .transition(&tok(), "B1", "live")
         .await
         .unwrap();
     assert_eq!(b.life_cycle_status.as_deref(), Some("live"));
@@ -195,7 +200,7 @@ async fn fehler_bei_get(server: &MockServer, status: u16, reason: &str) -> ApiFe
         })))
         .mount(server)
         .await;
-    api(server).await.streams_eigene("tok").await.unwrap_err()
+    api(server).await.streams_eigene(&tok()).await.unwrap_err()
 }
 
 #[tokio::test]
@@ -237,11 +242,11 @@ async fn get_500_ist_transport_post_404_ist_nicht_gefunden() {
         .await;
     let api = api(&server).await;
     assert!(matches!(
-        api.streams_eigene("tok").await.unwrap_err(),
+        api.streams_eigene(&tok()).await.unwrap_err(),
         ApiFehler::Transport(_)
     ));
     assert_eq!(
-        api.transition("tok", "B1", "live").await.unwrap_err(),
+        api.transition(&tok(), "B1", "live").await.unwrap_err(),
         ApiFehler::NichtGefunden
     );
 }
@@ -259,13 +264,63 @@ async fn timeout_ist_transport_bei_get_und_unklar_bei_post() {
         .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(400)))
         .mount(&server)
         .await;
-    let api = GoogleLiveApi::mit_basis_und_frist(server.uri(), Duration::from_millis(80));
+    let api = GoogleLiveApi::mit_basis_ungeprueft(server.uri(), Duration::from_millis(80));
     assert!(matches!(
-        api.streams_eigene("tok").await.unwrap_err(),
+        api.streams_eigene(&tok()).await.unwrap_err(),
         ApiFehler::Transport(_)
     ));
     assert_eq!(
-        api.stream_anlegen("tok", "Uplink").await.unwrap_err(),
+        api.stream_anlegen(&tok(), "Uplink").await.unwrap_err(),
         ApiFehler::Unklar
     );
+}
+
+#[tokio::test]
+async fn zu_viele_seiten_werden_gemeldet() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/liveStreams"))
+        .and(query_param("mine", "true"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": [stream_json("S1", "ready")],
+            "nextPageToken": "weiter"
+        })))
+        .mount(&server)
+        .await;
+    assert_eq!(
+        api(&server).await.streams_eigene(&tok()).await.unwrap_err(),
+        ApiFehler::ZuVieleSeiten
+    );
+}
+
+#[tokio::test]
+async fn paginierung_sammelt_mehrere_seiten() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/liveStreams"))
+        .and(query_param("pageToken", "P2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": [stream_json("S2", "ready")]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/liveStreams"))
+        .and(query_param("mine", "true"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": [stream_json("S1", "ready")],
+            "nextPageToken": "P2"
+        })))
+        .mount(&server)
+        .await;
+    let liste = api(&server).await.streams_eigene(&tok()).await.unwrap();
+    assert_eq!(liste.len(), 2);
+}
+
+#[test]
+fn basis_pruefung_lehnt_fremde_hosts_ab() {
+    assert!(GoogleLiveApi::mit_basis("http://www.googleapis.com/youtube/v3").is_err());
+    assert!(GoogleLiveApi::mit_basis("https://boese.example.com/youtube/v3").is_err());
+    assert!(GoogleLiveApi::mit_basis("https://www.googleapis.com/youtube/v3").is_ok());
+    assert!(GoogleLiveApi::mit_basis("https://youtube.googleapis.com/v3").is_ok());
 }

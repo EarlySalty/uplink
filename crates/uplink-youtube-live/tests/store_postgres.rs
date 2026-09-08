@@ -161,7 +161,11 @@ async fn postgres_store_deckt_lebenszyklus_ab() {
     assert_eq!(geladen.channel_id, "UC-kanal");
     assert_eq!(geladen.stream_id, None);
 
-    store.stream_id_merken(77, "S-alt").await.unwrap();
+    store.stream_id_merken(77, 3, "S-alt").await.unwrap();
+    assert!(
+        store.stream_id_merken(77, 999, "S-x").await.is_err(),
+        "falsche Generation trifft keine Einstellung"
+    );
     store
         .einstellungen_speichern(77, "UC-kanal", &einstellung("Titel zwei", 4))
         .await
@@ -198,6 +202,13 @@ async fn postgres_store_deckt_lebenszyklus_ab() {
     let ohne_schritt = store.aktiven_run_laden(77).await.unwrap().unwrap();
     assert_eq!(ohne_schritt.schritt, None);
 
+    assert!(
+        store
+            .zustand_setzen(run.run_id, 999, &["vorbereitung"], "vorbereitet")
+            .await
+            .is_err(),
+        "CAS lehnt falsche Generation ab"
+    );
     store
         .zustand_setzen(run.run_id, 4, &["vorbereitung"], "vorbereitet")
         .await
@@ -207,6 +218,51 @@ async fn postgres_store_deckt_lebenszyklus_ab() {
         vorbereitet.zustand,
         uplink_youtube_live::model::RunZustand::Vorbereitet
     );
+
+    store
+        .referenzen_setzen(run.run_id, 4, Some("S1"), Some("B1"))
+        .await
+        .unwrap();
+    assert!(
+        store
+            .referenzen_setzen(run.run_id, 999, Some("S2"), None)
+            .await
+            .is_err()
+    );
+    store
+        .schritt_abschliessen(run.run_id, 4, Some("S3"), None)
+        .await
+        .unwrap();
+    let nach_abschluss = store.aktiven_run_laden(77).await.unwrap().unwrap();
+    assert_eq!(nach_abschluss.schritt, None);
+    assert_eq!(nach_abschluss.stream_id.as_deref(), Some("S3"));
+    assert_eq!(nach_abschluss.broadcast_id.as_deref(), Some("B1"));
+
+    store.unterbrochen_vermerken(run.run_id, 4).await.unwrap();
+    assert!(store.unterbrochen_vermerken(run.run_id, 999).await.is_err());
+    let nach_unterbrechung = store.aktiven_run_laden(77).await.unwrap().unwrap();
+    assert!(nach_unterbrechung.unterbrochen_at.is_some());
+
+    let jetzt = Utc::now();
+    store.live_seit_setzen(run.run_id, 4, jetzt).await.unwrap();
+    assert!(
+        store
+            .live_seit_setzen(run.run_id, 999, jetzt)
+            .await
+            .is_err()
+    );
+    let mit_live = store.aktiven_run_laden(77).await.unwrap().unwrap();
+    assert!(mit_live.live_seit.is_some());
+
+    store.start_angefordert_setzen(run.run_id, 4).await.unwrap();
+    assert!(
+        store
+            .start_angefordert_setzen(run.run_id, 999)
+            .await
+            .is_err()
+    );
+    let mit_start = store.aktiven_run_laden(77).await.unwrap().unwrap();
+    assert!(mit_start.start_angefordert_at.is_some());
 
     store
         .run_schliessen(run.run_id, 4, Some("nutzer_stop"), Some(true), None)

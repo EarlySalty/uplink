@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS relay.youtube_live_runs (
     youtube_bestaetigt boolean,
     unterbrochen_at timestamptz,
     live_seit timestamptz,
+    start_angefordert_at timestamptz,
     created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     ended_at timestamptz

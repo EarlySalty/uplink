@@ -9,7 +9,7 @@ pub use api::{BroadcastRessource, BroadcastWunsch, GoogleLiveApi, LiveApi, Strea
 pub use fehler::{ApiFehler, LiveFehler};
 pub use model::{
     Blockgrund, Endegrund, Identitaet, IngestZugang, LiveEinstellungen, Referenzen, RunAnforderung,
-    RunZustand, Schritt, Sichtbarkeit, Vorbereitung, Zustand, titel_pruefen,
+    RunZustand, Schritt, Sichtbarkeit, Vorbereitung, Zustand, channel_id_pruefen, titel_pruefen,
 };
 pub use store::{
     GespeicherteEinstellungen, PostgresRunStore, Run, RunNeu, RunStore, SpeicherRunStore, SqlZugang,
