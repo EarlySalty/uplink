@@ -211,9 +211,14 @@ async fn fetch_with_token(config: &Config, token: &Secret) -> Result<ServiceSecr
     } else {
         None
     };
+    let api = take("RS_RELAY_API_SECRET")?;
+    let admin = take("RS_RELAY_ADMIN_SECRET")?;
+    if api.matches(admin.expose()) {
+        return Err("API- und Adminzugang müssen verschieden sein. Start abgebrochen.");
+    }
     Ok(ServiceSecrets {
-        api: take("RS_RELAY_API_SECRET")?,
-        admin: take("RS_RELAY_ADMIN_SECRET")?,
+        api,
+        admin,
         encryption,
         database: take("RS_RELAY_DATABASE_URL")?,
         bot_internal: take("RS_RELAY_BOT_INTERNAL_TOKEN")?,

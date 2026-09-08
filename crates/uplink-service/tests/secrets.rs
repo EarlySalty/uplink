@@ -17,6 +17,38 @@ use uplink_service::{config::Config, secrets::fetch};
 mod infisical;
 
 #[tokio::test]
+async fn identical_api_and_admin_secrets_abort_bootstrap() {
+    let memory = memfd::MemfdOptions::default()
+        .create("synthetic-identical-credentials")
+        .unwrap();
+    memory.as_file().write_all(b"synthetic-bootstrap").unwrap();
+    memory.as_file().rewind().unwrap();
+    let server = infisical::InfisicalMock::start(Router::new().route(
+        "/api/v4/secrets/",
+        get(|| async {
+            Json(serde_json::json!({"secrets":[
+                {"secretKey":"RS_RELAY_API_SECRET","secretValue":"synthetic-identical"},
+                {"secretKey":"RS_RELAY_ADMIN_SECRET","secretValue":"synthetic-identical"},
+                {"secretKey":"RS_RELAY_KEY_ENC","secretValue":STANDARD.encode([7; 32])},
+                {"secretKey":"RS_RELAY_DATABASE_URL","secretValue":"synthetic-database"},
+                {"secretKey":"RS_RELAY_BOT_INTERNAL_TOKEN","secretValue":"synthetic-broker"},
+                {"secretKey":"UPLINK_TLS_CERTIFICATE","secretValue":"synthetic-certificate"},
+                {"secretKey":"UPLINK_TLS_PRIVATE_KEY","secretValue":"synthetic-key"}
+            ]}))
+        }),
+    ));
+    let mut config = Config::parse(include_str!("../../../config/uplink-beispiel.toml")).unwrap();
+    config.infisical.credential_fd = memory.as_raw_fd() as u32;
+    config.infisical.socket_path = server.path.clone();
+    config.infisical.socket_owner_uid = server.owner;
+    let result = fetch(&config).await;
+    assert_eq!(
+        result.err(),
+        Some("API- und Adminzugang müssen verschieden sein. Start abgebrochen.")
+    );
+}
+
+#[tokio::test]
 async fn bootstrap_protects_all_injected_fds_before_the_first_read() {
     let descriptors: Vec<_> = (0..3)
         .map(|_| {
