@@ -426,7 +426,7 @@ footer {
   var sucheTimer = null;
   var sucheLauf = 0;
   var letzteId = 0;
-  var generation = 0;
+  var generation = null;
   var sock = null;
   var wartezeit = 1000;
   var ohneStatus = 0;
@@ -872,8 +872,8 @@ footer {
         statusGesehen = true;
         ohneStatus = 0;
         lage("verbunden", "verbunden");
-        if (typeof daten.generation === "number" && daten.generation !== generation) {
-          if (generation !== 0) letzteId = 0;
+        if (typeof daten.generation === "string" && /^[0-9a-f]{32}$/.test(daten.generation) && daten.generation !== generation) {
+          if (generation !== null) letzteId = 0;
           generation = daten.generation;
         }
         statusAnzeigen(daten.plattformen);

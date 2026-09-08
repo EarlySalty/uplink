@@ -69,7 +69,7 @@ try {
     window.WebSocket = class { constructor(url) { this.url = url; __probe.sockets.push(this); } close() {} };
     window.fetch = (url, options = {}) => new Promise((resolve, reject) => __probe.requests.push({ url, options, resolve, reject }));
     __probe.emit = data => __probe.sockets.at(-1).onmessage({data: JSON.stringify(data)});
-    __probe.status = () => __probe.emit({typ:'status',generation:1,plattformen:[
+    __probe.status = (generation = '11111111111111111111111111111111') => __probe.emit({typ:'status',generation,plattformen:[
       {platform:'twitch',eingerichtet:true,verbunden:true,zustand:'connected'},
       {platform:'youtube',eingerichtet:true,verbunden:true,zustand:'connected'}
     ]});
@@ -127,6 +127,14 @@ try {
       await flush();
       assert.equal(await evaluate('document.getElementById("vorschlaege").style.display'), 'none');
     }
+    await evaluate('__probe.sockets.at(-1).onclose({code:1012})');
+    await evaluate('new Promise(resolve => setTimeout(resolve, 1200))');
+    assert.equal(await evaluate('new URL(__probe.sockets.at(-1).url).searchParams.get("gen")'), '11111111111111111111111111111111');
+    await evaluate('__probe.status("22222222222222222222222222222222"); __probe.sockets.at(-1).onclose({code:1012})');
+    await evaluate('new Promise(resolve => setTimeout(resolve, 1200))');
+    assert.equal(await evaluate('new URL(__probe.sockets.at(-1).url).searchParams.get("gen")'), '22222222222222222222222222222222');
+    assert.equal(await evaluate('new URL(__probe.sockets.at(-1).url).searchParams.get("seit")'), '0');
+    await evaluate('__probe.status("22222222222222222222222222222222")');
     assert.equal(await evaluate('document.documentElement.scrollWidth > innerWidth'), false, `${name}: no horizontal page overflow`);
     // Capture the final state after the retained entry/feedback animations.
     await evaluate('new Promise(resolve => setTimeout(resolve, 550))');

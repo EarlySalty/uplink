@@ -58,7 +58,7 @@ pub fn router(hub: Arc<ChatHub>) -> Router {
 struct DockQuery {
     t: Option<String>,
     seit: Option<u64>,
-    r#gen: Option<u64>,
+    r#gen: Option<String>,
     arten: Option<String>,
 }
 fn origin(hub: &ChatHub, headers: &HeaderMap, required: bool) -> Result<(), Error> {
@@ -129,8 +129,16 @@ async fn authenticate(hub: &ChatHub, token: Option<&str>) -> Result<(u64, [u8; 3
 async fn header_user(hub: &Arc<ChatHub>, h: &HeaderMap, write: bool) -> Result<Arc<User>, Error> {
     origin(hub, h, write)?;
     let (id, _) = authenticate(hub, h.get("X-Dock-Token").and_then(|v| v.to_str().ok())).await?;
-    hub.ensure(id)
-        .map_err(|e| error(StatusCode::SERVICE_UNAVAILABLE, e))
+    let user = hub
+        .ensure(id)
+        .map_err(|e| error(StatusCode::SERVICE_UNAVAILABLE, e))?;
+    if !user.access_confirmed() {
+        return Err(error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Chatzugang wird erneut geprüft.",
+        ));
+    }
+    Ok(user)
 }
 async fn page(
     State(h): State<Arc<ChatHub>>,
@@ -165,17 +173,19 @@ async fn ws(
     let user = h
         .ensure(id)
         .map_err(|e| error(StatusCode::SERVICE_UNAVAILABLE, e))?;
+    if !user.access_confirmed() {
+        return Err(error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Chatzugang wird erneut geprüft.",
+        ));
+    }
     let permit = SocketPermit::acquire(user.clone(), h.config.max_sockets_per_user)?;
-    let since = if q.r#gen == Some(h.generation) {
-        q.seit
-    } else {
-        None
-    };
+    let cursor = (q.r#gen, q.seit);
     let filter = ArtFilter::parse(q.arten.as_deref());
     Ok(upgrade
         .max_frame_size(8192)
         .max_message_size(8192)
-        .on_upgrade(move |socket| socket_loop(h, user, hash, since, filter, socket, permit))
+        .on_upgrade(move |socket| socket_loop(h, user, hash, cursor, filter, socket, permit))
         .into_response())
 }
 struct SocketPermit(Arc<User>, tokio_util::sync::CancellationToken);
@@ -215,15 +225,15 @@ async fn socket_loop(
     h: Arc<ChatHub>,
     u: Arc<User>,
     hash: [u8; 32],
-    since: Option<u64>,
+    cursor: (Option<String>, Option<u64>),
     filter: ArtFilter,
     mut socket: WebSocket,
     permit: SocketPermit,
 ) {
     let cancel = permit.1.clone();
     let session = async {
-        let (mut rx, replay, gap) = u.bus.subscribe(since);
-        if ws_send(&mut socket,&json!({"typ":"status","generation":h.generation,"plattformen":h.status(&u),"nachlauf_unvollstaendig":gap})).await.is_err(){return}
+        let (mut rx, replay, gap) = u.resume(cursor.0.as_deref(), cursor.1);
+        if ws_send(&mut socket,&json!({"typ":"status","generation":u.generation,"plattformen":h.status(&u),"nachlauf_unvollstaendig":gap})).await.is_err(){return}
         for frame in replay {
             if filter.passt(&frame.ereignis) && ws_send(&mut socket, &frame).await.is_err() {
                 return;
@@ -237,7 +247,7 @@ async fn socket_loop(
                let (code,reason)=if matches!(valid,Ok(Ok(_))){(1008,"OBS-Adresse ist nicht mehr gültig")}else{(1013,"Zugang konnte gerade nicht geprüft werden")};
                let _=tokio::time::timeout(Duration::from_secs(2),socket.send(Message::Close(Some(axum::extract::ws::CloseFrame{code,reason:reason.into()})))).await;break
              }
-             if ws_send(&mut socket,&json!({"typ":"status","generation":h.generation,"plattformen":h.status(&u)})).await.is_err(){break}
+             if ws_send(&mut socket,&json!({"typ":"status","generation":u.generation,"plattformen":h.status(&u)})).await.is_err(){break}
              let metrics=u.metrics.lock().expect("Kennzahlen").clone();if let Some(metrics)=metrics&& ws_send(&mut socket,&metrics).await.is_err(){break}
             },frame=rx.recv()=>{match frame{Ok(frame)=>if filter.passt(&frame.ereignis)&&ws_send(&mut socket,&frame).await.is_err(){break},Err(_)=>break}},incoming=socket.next()=>{match incoming{Some(Ok(Message::Close(_)))|Some(Err(_))|None=>break,Some(Ok(Message::Ping(v)))=>{if tokio::time::timeout(Duration::from_secs(5),socket.send(Message::Pong(v))).await.is_err(){break}},_=>{}}}}
         }
@@ -667,8 +677,8 @@ mod delivery_tests {
     async fn actual_websocket_replays_updates_and_rotation_closes_it() {
         use tokio_tungstenite::tungstenite::{Message as TMessage, client::IntoClientRequest};
         let (h, identity) = super::tests::testhub();
-        assert!(h.generation < (1u64 << 53));
         let user = h.ensure(7).unwrap();
+        assert_eq!(user.generation.len(), 32);
         let fixture = |title: &str| {
             crate::nachricht::Ereignis::Chat(serde_json::from_value(json!({"platform":"youtube","channel_id":"7","channel_login":"example","message_id":"same","sender_id":"9","sender_login":"viewer","sender_display":"Viewer","badges":[],"fragments":[{"art":"text","text":title}],"sent_at":"2026-09-08T10:00:00Z","is_action":false,"eigene":false})).unwrap())
         };
@@ -681,7 +691,7 @@ mod delivery_tests {
         let mut request = format!(
             "ws://{addr}/v1/chat/ws?t={}&gen={}&seit=1",
             super::tests::TOKEN,
-            h.generation
+            user.generation
         )
         .into_client_request()
         .unwrap();
@@ -709,6 +719,68 @@ mod delivery_tests {
         .unwrap();
         assert_eq!(u16::from(code), 1008);
         h.shutdown().await;
+        server.abort();
+        let _ = server.await;
+    }
+}
+
+#[cfg(test)]
+mod recreated_cursor_tests {
+    use super::*;
+    #[tokio::test]
+    async fn websocket_new_bus_replays_all_events_despite_overlapping_old_cursor() {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let (hub, _) = super::tests::testhub();
+        let previous = hub.ensure(7).unwrap();
+        let old_generation = previous.generation.clone();
+        let event = |title| {
+            crate::nachricht::Ereignis::Info(
+                serde_json::from_value(json!({"platform":"twitch","channel_id":"7","title":title}))
+                    .unwrap(),
+            )
+        };
+        for title in ["A", "B", "C"] {
+            previous.bus.publish(event(title)).unwrap();
+        }
+        hub.invalidate(7);
+        let current = hub.ensure(7).unwrap();
+        for title in ["D", "E", "F", "G"] {
+            current.bus.publish(event(title)).unwrap();
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = router(hub.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut request = format!(
+            "ws://{address}/v1/chat/ws?t={}&gen={old_generation}&seit=3",
+            super::tests::TOKEN
+        )
+        .into_client_request()
+        .unwrap();
+        request.headers_mut().insert(
+            "Origin",
+            "https://deutsche-deadlock-community.de".parse().unwrap(),
+        );
+        let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+        let frames = tokio::time::timeout(Duration::from_secs(3), async {
+            let mut frames = Vec::new();
+            for _ in 0..5 {
+                let message = socket.next().await.unwrap().unwrap();
+                frames.push(
+                    serde_json::from_str::<serde_json::Value>(message.to_text().unwrap()).unwrap(),
+                );
+            }
+            frames
+        })
+        .await
+        .unwrap();
+        assert_eq!(frames[0]["generation"], current.generation);
+        assert_eq!(frames[0]["nachlauf_unvollstaendig"], true);
+        for (index, title) in ["D", "E", "F", "G"].iter().enumerate() {
+            assert_eq!(frames[index + 1]["id"], index + 1);
+            assert_eq!(frames[index + 1]["ereignis"]["title"], *title);
+        }
+        hub.shutdown().await;
         server.abort();
         let _ = server.await;
     }

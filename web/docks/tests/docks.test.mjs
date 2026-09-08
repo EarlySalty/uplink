@@ -46,7 +46,7 @@ function dock(t, name) {
   const document = dom.window.document;
   const element = id => document.getElementById(id);
   const message = data => sockets.at(-1).onmessage({ data: JSON.stringify(data) });
-  const status = () => message({ typ: 'status', generation: 1, plattformen: connected });
+  const status = () => message({ typ: 'status', generation: '11111111111111111111111111111111', plattformen: connected });
   function input(id, value) {
     element(id).value = value;
     element(id).dispatchEvent(new dom.window.Event('input', { bubbles: true }));
@@ -69,7 +69,7 @@ function dock(t, name) {
     request.resolve({ status: statusCode, ok: statusCode >= 200 && statusCode < 300, json: async () => body });
     await setImmediate();
   }
-  return { dom, document, element, message, status, input, tick, respond, requests };
+  return { dom, document, element, message, status, input, tick, respond, requests, sockets };
 }
 
 function chatEvent(id, text, platform = 'youtube') {
@@ -118,7 +118,7 @@ test('Chat: a status frame cannot allow a second send while fetch is pending', a
   assert.equal(app.element('senden').disabled, true);
   app.element('senden').click();
   assert.equal(app.requests.length, 1);
-  app.message({ typ: 'status', generation: 1, plattformen: [] });
+  app.message({ typ: 'status', generation: '11111111111111111111111111111111', plattformen: [] });
   await app.respond(app.requests[0], { ergebnisse: [{ platform: 'twitch', ok: true }] });
   assert.equal(app.element('senden').disabled, true);
 });
@@ -264,7 +264,7 @@ test('Docks: markup has no remote scripts or remote fonts', () => {
 for (const name of ['chat', 'activity', 'points', 'stream-info']) {
   test(`${name}: unavailable broker and unsupported integration stay visible`, t => {
     const app = dock(t, name);
-    app.message({ typ: 'status', generation: 1, plattformen: [
+    app.message({ typ: 'status', generation: '11111111111111111111111111111111', plattformen: [
       { platform: 'kick', eingerichtet: false, verbunden: false, zustand: 'unavailable', hinweis: 'Kontoverbindung ist nicht erreichbar' },
       { platform: 'tiktok', eingerichtet: false, verbunden: false, zustand: 'unsupported', hinweis: 'TikTok-Chat ist noch nicht verfügbar' },
     ] });
@@ -294,3 +294,26 @@ test('Stream-Info: partial platform failure leaves the submitted wishes retryabl
   app.element('speichern').click();
   assert.deepEqual(JSON.parse(app.requests.at(-1).options.body), { title: 'Für beide Plattformen' });
 });
+
+for (const name of ['chat', 'activity', 'stream-info', 'points']) {
+  test(name + ': bus generation resets cursor while same generation preserves it', async t => {
+    const app = dock(t, name);
+    const first = '11111111111111111111111111111111';
+    const second = '22222222222222222222222222222222';
+    app.message({ typ: 'status', generation: first, plattformen: connected });
+    const sample = name === 'stream-info' ? { id: 3, ereignis: {typ:'info',platform:'twitch',channel_id:'10',title:'Alt'} } : name === 'points' ? pointEvent(3) : name === 'activity' ? {id:3,ereignis:{typ:'activity',platform:'twitch',channel_id:'10',art:'follow',user_display:'Test',occurred_at:'2026-09-08T10:00:00Z',dedupe_key:'follow-1'}} : chatEvent(3,'Alt');
+    app.message(sample);
+    app.message({ typ: 'status', generation: first, plattformen: connected });
+    app.sockets.at(-1).onclose({code:1012});
+    await app.tick(1000);
+    let url = new URL(app.sockets.at(-1).url);
+    assert.equal(url.searchParams.get('gen'), first);
+    assert.equal(url.searchParams.get('seit'), '3');
+    app.message({typ:'status',generation:second,plattformen:connected,nachlauf_unvollstaendig:true});
+    app.sockets.at(-1).onclose({code:1012});
+    await app.tick(1000);
+    url = new URL(app.sockets.at(-1).url);
+    assert.equal(url.searchParams.get('gen'), second);
+    assert.equal(url.searchParams.get('seit'), '0');
+  });
+}
