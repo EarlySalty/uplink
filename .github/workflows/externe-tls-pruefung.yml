@@ -1,0 +1,53 @@
+name: Externe TLS-Prüfung
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tls:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Öffentliches Uplink-Zertifikat und Hostname prüfen
+        timeout-minutes: 1
+        shell: bash
+        run: |
+          set -euo pipefail
+          ulimit -f 128
+          tls_result=$(mktemp)
+          trap 'rm -f -- "$tls_result"' EXIT
+
+          # Kein RTMP-Handshake, keine Anmeldung und keine Mediendaten.
+          # EOF ohne close_notify ist nach verifiziertem TLS erlaubt;
+          # Zertifikatsfehler und ein fehlender Handshake bleiben Fehler.
+          tls_exit=0
+          timeout --kill-after=5s 25s openssl s_client \
+            -connect deutsche-deadlock-community.de:8893 \
+            -servername deutsche-deadlock-community.de \
+            -verify_hostname deutsche-deadlock-community.de \
+            -verify_return_error \
+            -CAfile /etc/ssl/certs/ca-certificates.crt \
+            -min_protocol TLSv1.2 \
+            -brief -no_ign_eof -ignore_unexpected_eof \
+            </dev/null >"$tls_result" 2>&1 || tls_exit=$?
+
+          if (( tls_exit == 124 || tls_exit == 137 )); then
+            echo '::error::Die öffentliche TLS-Prüfung hat ihre Zeitgrenze überschritten.'
+            exit 1
+          fi
+          if (( tls_exit != 0 )); then
+            echo '::error::TLS-Verbindung oder Zertifikatsprüfung fehlgeschlagen.'
+            exit 1
+          fi
+          if ! grep -Fxq 'CONNECTION ESTABLISHED' "$tls_result" \
+            || ! grep -Fxq 'Verification: OK' "$tls_result" \
+            || ! grep -Eq '^Protocol version: TLSv1\.[23]$' "$tls_result"; then
+            echo '::error::Kein vollständig bestätigter und verifizierter TLS-Handshake.'
+            exit 1
+          fi
+
+          echo 'TLS zu deutsche-deadlock-community.de:8893 erfolgreich: Zertifikatskette und Hostname geprüft.'
+          echo 'Diese Prüfung belegt den öffentlichen TLS-Eingang; OBS, Anmeldung und Medienfluss sind eigene Prüfungen.'
