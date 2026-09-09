@@ -37,6 +37,9 @@ use zeroize::Zeroizing;
 const CONTROL_BYTES: usize = 64 * 1024;
 const INPUT_BYTES: usize = 128 * 1024;
 const COMMAND_LIMIT: usize = 4096;
+// C0/S0 (1 Byte) plus C1/S1 und C2/S2 (je 1536 Byte). RTMP 5.4.3–5.4.4
+// zählt ab Verbindungsbeginn; der erfolgreiche Handshake ist bereits übertragen.
+const HANDSHAKE_BYTES: u64 = 1 + 2 * 1536;
 
 /// Eigentümer der Zielverbindung. Drop und abgebrochenes finish terminieren sie.
 pub struct RunningPusher {
@@ -425,10 +428,10 @@ impl Client {
             writer: ChunkWriter::default(),
             input: BytesMut::new(),
             stream_id: 0,
-            received: 0,
+            received: HANDSHAKE_BYTES,
             acknowledged: 0,
             window: 2_500_000,
-            sent: 0,
+            sent: HANDSHAKE_BYTES,
             peer_acknowledged: 0,
             peer_window: None,
             outgoing_chunk_size: 128,
@@ -1164,6 +1167,24 @@ mod tests {
                 .is_ok()
         );
         assert_eq!(client.peer_acknowledged, 0x1_0000_0010);
+        // Eine Wiederholung bestätigt keine weiteren Bytes. Ein alter Zähler
+        // darf dagegen nicht als beinahe vollständiger 32-Bit-Umlauf gelten.
+        for (sequence, accepted) in [(0x10_u32, true), (0x0f, false)] {
+            assert_eq!(
+                client
+                    .handle(Chunk::new(
+                        2,
+                        0,
+                        MessageType(3),
+                        0,
+                        Bytes::copy_from_slice(&sequence.to_be_bytes()),
+                    ))
+                    .await
+                    .is_ok(),
+                accepted,
+            );
+            assert_eq!(client.peer_acknowledged, 0x1_0000_0010);
+        }
         assert!(
             client
                 .handle(Chunk::new(

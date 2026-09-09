@@ -518,8 +518,10 @@ impl Peer {
             parser: ChunkReader::default(),
             writer: ChunkWriter::default(),
             input: BytesMut::new(),
-            read: 0,
-            written: 0,
+            // Absolute RTMP-Zähler beginnen bei C0/S0 und schließen beide
+            // 1536-Byte-Handshakeblöcke ein.
+            read: 3073,
+            written: 3073,
             ack_each_read: false,
         }
     }
@@ -648,6 +650,44 @@ async fn raw_published() -> (Peer, RunningPusher) {
 }
 fn packet(size: usize) -> Arc<FlvTag> {
     Arc::new(FlvTag::new(9, 123, vec![0x17; size].into(), 2 * 1024 * 1024).unwrap())
+}
+
+#[tokio::test]
+async fn handshake_acknowledgements_accept_both_peer_origins_but_not_unsent_bytes() {
+    // OBS zählt den Handshake mit; einige andere Publisher/Server beginnen
+    // ihren ACK-Zähler erst bei den RTMP-Nachrichten.
+    for peer_offset in [0, 3073] {
+        let (mut peer, pusher) = raw_published().await;
+        let acknowledged = peer.read - peer_offset;
+        for _ in 0..2 {
+            peer.send(3, &acknowledged.to_be_bytes()).await;
+            peer.send(4, &[0, 6, 0, 1, 2, 3]).await;
+            let pong = timeout(Duration::from_secs(1), peer.next())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(pong.message_header.msg_type_id.0, 4);
+            assert_eq!(pong.payload.as_ref(), &[0, 7, 0, 1, 2, 3]);
+            assert_eq!(pusher.status().state, OutputState::Publishing);
+        }
+        // Auch nach einem bestätigten Handshake ist ein einziges tatsächlich
+        // ungesendetes Byte kein gültiger ACK; kein pauschales Toleranzfenster.
+        peer.send(3, &(peer.read + 1).to_be_bytes()).await;
+        assert!(
+            timeout(Duration::from_secs(1), peer.next())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            pusher.status().state,
+            OutputState::Failed(MediaError::ProtocolRejected)
+        );
+        assert!(matches!(
+            pusher.finish().await,
+            Err(MediaError::ProtocolRejected)
+        ));
+    }
 }
 
 #[tokio::test]
