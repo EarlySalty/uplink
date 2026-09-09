@@ -583,44 +583,33 @@ async fn obs_shaped_header_order_metadata_large_keyframe_and_60fps_keep_probe_di
     assert_eq!(events[1].identity.track.kind, MediaKind::Video);
     assert_eq!(events[2].event_kind, EventKind::Metadata);
     assert!(events[3].wire_body().len() > 500 * 1024);
-    let last = events
-        .iter()
-        .position(|event| {
-            event.identity.track.kind == MediaKind::Video
-                && event.event_kind == EventKind::Frame
-                && event.dts_ms >= 1000
-        })
-        .unwrap();
-    let mut expected = b"FLV\x01\x05\x00\x00\x00\x09\x00\x00\x00\x00".to_vec();
-    for event in [&events[1], &events[0]]
-        .into_iter()
-        .chain(events[2..=last].iter())
-    {
-        let body = event.wire_body();
-        let length = body.len() as u32;
-        expected.push(if event.identity.track.kind == MediaKind::Audio {
-            8
-        } else {
-            9
-        });
-        expected.extend_from_slice(&length.to_be_bytes()[1..]);
-        expected.extend_from_slice(&event.dts_ms.to_be_bytes()[1..]);
-        expected.push(event.dts_ms.to_be_bytes()[0]);
-        expected.extend_from_slice(&[0, 0, 0]);
-        expected.extend_from_slice(body);
-        expected.extend_from_slice(&(length + 11).to_be_bytes());
-    }
     let (first, mut receiver) = input(events);
     let mut diagnostic = PreparationDiagnostic::default();
     diagnostic.request_probe_dump();
     let result = engine()
         .prepare_source_diagnosed(first, &mut receiver, &HashSet::from([0]), &mut diagnostic)
         .await;
-    assert!(matches!(result, Err(MediaError::Io)));
-    assert_eq!(diagnostic.phase, "probe");
+    let source = result.expect("Gültiger OBS-Vorlauf muss trotz BrokenPipe vorbereitet werden");
+    assert_eq!(
+        (source.observation.width, source.observation.height),
+        (320, 180)
+    );
+    assert_eq!(source.observation.audio.len(), 1);
+    assert_eq!(source.observation.audio[0].codec, "aac");
+    assert_eq!(source.observation.audio[0].sample_rate, 48000);
+    assert_eq!(diagnostic.phase, "observation");
     assert_eq!(diagnostic.ffprobe_exit_code, Some(0));
     assert!(diagnostic.ffprobe_stderr_first_line.is_some());
     assert_eq!(diagnostic.io_error_kind, Some("broken_pipe"));
-    assert!(!diagnostic.probe_result_available);
-    assert_eq!(diagnostic.take_probe_dump().unwrap(), expected);
+    assert!(diagnostic.probe_result_available);
+    assert!(diagnostic.take_probe_dump().is_none());
+    let diagnostic = serde_json::to_value(diagnostic).unwrap();
+    assert_eq!(diagnostic["probe_streams"], 2);
+    assert_eq!(diagnostic["probe"][0]["kind"], "video");
+    assert_eq!(diagnostic["probe"][0]["codec"], "h264");
+    assert_eq!(diagnostic["probe"][0]["width"], 320);
+    assert_eq!(diagnostic["probe"][0]["height"], 180);
+    assert_eq!(diagnostic["probe"][1]["kind"], "audio");
+    assert_eq!(diagnostic["probe"][1]["codec"], "aac");
+    assert_eq!(diagnostic["probe"][1]["sample_rate"], 48000);
 }

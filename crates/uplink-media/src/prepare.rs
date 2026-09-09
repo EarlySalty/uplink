@@ -609,10 +609,12 @@ async fn probe(
     let mut read_error_kind = None;
     let operation = async {
         let write = async {
-            stdin.write_all(bytes).await.map_err(|error| {
+            if let Err(error) = stdin.write_all(bytes).await {
                 write_error_kind = Some(io_error_label(error.kind()));
-                MediaError::Io
-            })?;
+                if error.kind() != std::io::ErrorKind::BrokenPipe {
+                    return Err(MediaError::Io);
+                }
+            }
             drop(stdin);
             Ok::<_, MediaError>(())
         };
@@ -642,7 +644,11 @@ async fn probe(
             .map_err(|_| MediaError::ProcessCleanupFailed)?;
         exit_code = status.code();
         if !status.success() {
-            return Err(MediaError::ProcessFailed);
+            return Err(if write_error_kind.is_some() {
+                MediaError::Io
+            } else {
+                MediaError::ProcessFailed
+            });
         }
         serde_json::from_slice(&output).map_err(|_| MediaError::InvalidMedia)
     };
@@ -894,6 +900,48 @@ mod tests {
         fps.streams[0].r_frame_rate = Some("0/0".into());
         assert!(observation(fps, &audio(), 0, 120, 15000, 1000).is_err());
     }
+    #[tokio::test]
+    async fn early_closed_probe_stdin_accepts_successful_stream_document() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut random = [0u8; 8];
+        getrandom::fill(&mut random).unwrap();
+        let directory = std::path::PathBuf::from(format!(
+            "/tmp/uplink-probe-success-{:016x}",
+            u64::from_ne_bytes(random)
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let executable = directory.join("probe");
+        std::fs::write(
+            &executable,
+            b"#!/bin/sh\n/usr/bin/head -c 65536 >/dev/null\nexec 0<&-\nprintf '%s\\n' '{\"streams\":[{\"codec_type\":\"video\",\"codec_name\":\"av1\",\"width\":2560,\"height\":1440},{\"codec_type\":\"audio\",\"codec_name\":\"aac\",\"sample_rate\":\"48000\",\"channels\":2}]}'\nexit 0\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let config = EngineConfig {
+            ffmpeg: "/usr/bin/true".into(),
+            ffprobe: executable,
+            work_directory: directory.clone(),
+            limits: MediaLimits::default(),
+        };
+        let mut diagnostic = PreparationDiagnostic::default();
+        let result = probe(&config, &vec![0; 4 * 1024 * 1024], &mut diagnostic).await;
+        std::fs::remove_dir_all(directory).unwrap();
+        let document =
+            result.expect("Exit 0 und gültiges JSON müssen trotz BrokenPipe erfolgreich sein");
+        assert_eq!(document.streams.len(), 2);
+        assert_eq!(document.streams[0].codec_type, "video");
+        assert_eq!(document.streams[0].codec_name, "av1");
+        assert_eq!(document.streams[1].codec_type, "audio");
+        assert_eq!(document.streams[1].codec_name, "aac");
+        assert_eq!(diagnostic.ffprobe_exit_code, Some(0));
+        assert_eq!(diagnostic.io_error_kind, Some("broken_pipe"));
+        diagnostic.probe(&document);
+        let diagnostic = serde_json::to_value(diagnostic).unwrap();
+        assert_eq!(diagnostic["probe_streams"], 2);
+        assert_eq!(diagnostic["probe"][0]["width"], 2560);
+        assert_eq!(diagnostic["probe"][1]["sample_rate"], 48000);
+    }
+
     #[tokio::test]
     async fn closed_probe_stdin_preserves_natural_exit_status_and_safe_stderr() {
         use std::os::unix::fs::PermissionsExt;
