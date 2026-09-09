@@ -15,12 +15,14 @@ use uplink_ingest::{MediaKind, WireCodec, WireTrack};
 
 pub(crate) struct EncodeProfile {
     pub video: VideoProfile,
+    pub audio_encoding: Vec<(u8, crate::AudioEncoding)>,
     pub layout: Option<LayoutSpec>,
     /// Fehlende Farbmetadaten der Quelle bleiben unbekannt und werden nicht umetikettiert.
     pub signal_bt709: bool,
 }
 #[derive(Clone)]
 pub(crate) struct Routing {
+    pub timestamp_offset_ms: u32,
     /// Audio/Metadaten kommen nur aus dieser einen Gruppe, auch bei mehreren Videos.
     pub group: Option<usize>,
     pub video: Vec<(Option<usize>, u8)>,
@@ -39,6 +41,7 @@ pub(crate) struct Graph {
 impl Graph {
     pub(crate) fn describe_route(&self, route: &Routing, id: &str) -> crate::OutputGraph {
         crate::OutputGraph {
+            timestamp_offset_ms: route.timestamp_offset_ms,
             id: id.to_owned(),
             profile_origin: "running_graph",
             video: route
@@ -46,6 +49,24 @@ impl Graph {
                 .iter()
                 .map(|(group, wire)| crate::VideoProcessing {
                     wire_track: *wire,
+                    canvas_index: group
+                        .and_then(|group| self.profiles.get(group))
+                        .map_or(0, |p| u8::from(p.layout.is_some())),
+                    encoder: group.and_then(|group| self.profiles.get(group)).map(|p| {
+                        match p.video.codec {
+                            Codec::H264 => "libx264",
+                            Codec::Hevc => "libx265",
+                            Codec::Av1 => "libsvtav1",
+                        }
+                    }),
+                    layout_id: group
+                        .and_then(|group| self.profiles.get(group))
+                        .and_then(|p| p.layout.as_ref())
+                        .map(|l| l.revision.id),
+                    layout_revision: group
+                        .and_then(|group| self.profiles.get(group))
+                        .and_then(|p| p.layout.as_ref())
+                        .map(|l| l.revision.revision),
                     mode: if group.is_some() { "encode" } else { "copy" },
                     encode_group: *group,
                     profile: group.and_then(|group| self.profiles.get(group)).map(|p| {
@@ -161,6 +182,7 @@ impl Graph {
                 video: request.video.clone(),
                 layout,
                 signal_bt709: true,
+                audio_encoding: Vec::new(),
             });
             for id in &group.outputs {
                 output_groups.insert(id.as_str(), index);
@@ -206,6 +228,7 @@ impl Graph {
                 }
             }
             routes.push(Routing {
+                timestamp_offset_ms: 0,
                 group,
                 video: vec![(group, 0)],
                 audio,
@@ -374,6 +397,7 @@ impl Graph {
                             video,
                             layout: output.layout.clone(),
                             signal_bt709: false,
+                            audio_encoding: Vec::new(),
                         });
                         profiles.len() - 1
                     }
@@ -396,6 +420,7 @@ impl Graph {
                     }
                 }
                 Ok(Routing {
+                    timestamp_offset_ms: 0,
                     group: Some(group),
                     video: vec![(Some(group), 0)],
                     audio,
@@ -407,6 +432,7 @@ impl Graph {
                 Err(reason) => {
                     profiles.truncate(prior_profiles);
                     Routing {
+                        timestamp_offset_ms: 0,
                         group: None,
                         video: Vec::new(),
                         audio: Vec::new(),
@@ -429,14 +455,27 @@ impl Graph {
         source: &SourceObservation,
         outputs: &[crate::ProgramOutput],
     ) -> Result<Self> {
+        Self::mixed(source, &[], outputs)
+    }
+
+    pub(crate) fn mixed(
+        source: &SourceObservation,
+        desired: &[DesiredOutput],
+        outputs: &[crate::ProgramOutput],
+    ) -> Result<Self> {
         let selected = outputs
             .iter()
             .flat_map(|output| output.audio.iter().map(|audio| audio.source_wire_track))
+            .chain(desired.iter().flat_map(|output| {
+                std::iter::once(output.live_audio_track).chain(output.vod_audio_track)
+            }))
             .collect();
-        let mut graph = Self::observed_selected(source, &[], &selected)?;
+        let mut graph = Self::observed_selected(source, desired, &selected)?;
         let source_fps = uplink_core::FrameRate::new(source.fps_numerator, source.fps_denominator)
             .map_err(|_| MediaError::InvalidMedia)?;
-        let mut target_ids = HashSet::new();
+        let mut target_ids: HashSet<_> = desired.iter().map(|output| &output.target.id).collect();
+        let mut shared_audio = Vec::new();
+        let mut shared_audio_requests = HashMap::new();
         for output in outputs {
             if output.target.id.is_empty() || !target_ids.insert(&output.target.id) {
                 return Err(MediaError::InvalidConfiguration);
@@ -452,6 +491,8 @@ impl Graph {
                 }
                 let mut audio = Vec::new();
                 let mut audio_ids = HashSet::new();
+                let mut audio_encoding = Vec::new();
+                let mut audio_requests = HashMap::new();
                 for route in &output.audio {
                     if !audio_ids.insert(route.destination_wire_track) {
                         return Err(MediaError::InvalidConfiguration);
@@ -464,6 +505,25 @@ impl Graph {
                         .input_audio
                         .get(&wire)
                         .ok_or(MediaError::MissingTrack)?;
+                    if shared_audio_requests
+                        .get(&source)
+                        .is_some_and(|prior| *prior != route.encoding)
+                        || audio_requests
+                            .insert(source, route.encoding)
+                            .is_some_and(|prior| prior != route.encoding)
+                    {
+                        return Err(MediaError::UnsupportedProfile);
+                    }
+                    if let Some(encoding) = route.encoding {
+                        if !(1..=2).contains(&encoding.channels)
+                            || !(32..=320).contains(&encoding.bitrate_kbps)
+                        {
+                            return Err(MediaError::UnsupportedProfile);
+                        }
+                        if !audio_encoding.contains(&(source, encoding)) {
+                            audio_encoding.push((source, encoding));
+                        }
+                    }
                     audio.push((source, route.destination_wire_track));
                 }
                 let mut video = Vec::new();
@@ -517,19 +577,30 @@ impl Graph {
                     let group = match graph.profiles.iter().position(|existing| {
                         existing.video == *profile && existing.layout == request.layout
                     }) {
-                        Some(index) => index,
+                        Some(index) => {
+                            graph.profiles[index].signal_bt709 = true;
+                            index
+                        }
                         None => {
                             graph.profiles.push(EncodeProfile {
                                 video: profile.clone(),
                                 layout: request.layout.clone(),
                                 signal_bt709: true,
+                                audio_encoding: audio_encoding.clone(),
                             });
                             graph.profiles.len() - 1
                         }
                     };
                     video.push((Some(group), request.wire_track));
                 }
+                for encoding in audio_encoding {
+                    if !shared_audio.contains(&encoding) {
+                        shared_audio.push(encoding);
+                    }
+                }
+                shared_audio_requests.extend(audio_requests);
                 Ok(Routing {
+                    timestamp_offset_ms: 0,
                     group: video[0].0,
                     video,
                     audio,
@@ -541,6 +612,7 @@ impl Graph {
                 Err(reason) => {
                     graph.profiles.truncate(prior);
                     Routing {
+                        timestamp_offset_ms: 0,
                         group: None,
                         video: Vec::new(),
                         audio: Vec::new(),
@@ -548,6 +620,17 @@ impl Graph {
                     }
                 }
             });
+        }
+        for profile in &mut graph.profiles {
+            profile.audio_encoding = shared_audio.clone();
+        }
+        if !shared_audio.is_empty() {
+            for route in graph.routes.iter_mut().take(desired.len()) {
+                route.group = None;
+            }
+            for route in graph.routes.iter_mut().skip(desired.len()) {
+                route.timestamp_offset_ms = AAC_MUX_OFFSET_MS;
+            }
         }
         Ok(graph)
     }
@@ -560,6 +643,13 @@ impl Graph {
     ) -> Result<Vec<OsString>> {
         if paths.len() != self.profiles.len() || paths.is_empty() {
             return Err(MediaError::InvalidConfiguration);
+        }
+        if self.profiles.iter().any(|profile| {
+            profile
+                .maximum_input_timestamp_ms()
+                .is_some_and(|maximum| video_origin_pts_ms > maximum)
+        }) {
+            return Err(MediaError::InvalidMedia);
         }
         let mut args: Vec<OsString> = [
             "-nostdin",
@@ -611,7 +701,25 @@ impl Graph {
                 "-c:a".into(),
                 "copy".into(),
             ]);
+            for (track, encoding) in &profile.audio_encoding {
+                args.extend([
+                    format!("-c:a:{track}").into(),
+                    "aac".into(),
+                    format!("-b:a:{track}").into(),
+                    format!("{}k", encoding.bitrate_kbps).into(),
+                    format!("-ac:a:{track}").into(),
+                    encoding.channels.to_string().into(),
+                    format!("-ar:a:{track}").into(),
+                    "48000".into(),
+                ]);
+            }
             profile.encoder_args(&mut args, threads);
+            if profile.mux_timestamp_offset_ms() != 0 {
+                args.extend([
+                    "-output_ts_offset".into(),
+                    format!("0.{:03}", profile.mux_timestamp_offset_ms()).into(),
+                ]);
+            }
             args.extend([
                 "-f".into(),
                 "flv".into(),
@@ -732,7 +840,30 @@ fn fit(width: u32, height: u32) -> String {
         "scale={width}:{height}:force_original_aspect_ratio=decrease:flags=lanczos,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2"
     )
 }
+const AAC_MUX_OFFSET_MS: u32 = (1024_u32 * 1000).div_ceil(48000);
+
 impl EncodeProfile {
+    pub(crate) fn mux_timestamp_offset_ms(&self) -> u32 {
+        if self.audio_encoding.is_empty() {
+            0
+        } else {
+            AAC_MUX_OFFSET_MS
+        }
+    }
+
+    pub(crate) fn maximum_input_timestamp_ms(&self) -> Option<i64> {
+        if self.audio_encoding.is_empty() {
+            return None;
+        }
+        let numerator = i64::from(self.video.fps.numerator());
+        let frame_ms = (i64::from(self.video.fps.denominator()) * 1000 + numerator - 1) / numerator;
+        Some(
+            i64::from(i32::MAX)
+                - i64::from(AAC_MUX_OFFSET_MS)
+                - frame_ms.max(i64::from(AAC_MUX_OFFSET_MS)),
+        )
+    }
+
     fn filter(&self, index: usize, video_origin_pts_ms: i64) -> String {
         let video = &self.video;
         let tail = format!(
@@ -917,6 +1048,7 @@ mod tests {
     }
     fn program_audio(source: u8, destination: u8) -> crate::ProgramAudio {
         crate::ProgramAudio {
+            encoding: None,
             source_wire_track: source,
             destination_wire_track: destination,
         }
@@ -1197,6 +1329,124 @@ mod tests {
             Err(MediaError::UnsupportedProfile)
         ));
     }
+
+    #[test]
+    fn mixed_rejects_duplicate_ids_and_isolates_unknown_program_colour() {
+        let program = |id| {
+            program_output(
+                id,
+                vec![program_video(
+                    0,
+                    0,
+                    program_profile(Codec::H264, 256, 144),
+                    None,
+                )],
+                vec![program_audio(0, 0)],
+            )
+        };
+        assert!(matches!(
+            Graph::mixed(&source(), &[output("same", 0, None)], &[program("same")]),
+            Err(MediaError::InvalidConfiguration)
+        ));
+        let graph = Graph::mixed(
+            &source(),
+            &[output("youtube", 0, None)],
+            &[program("twitch")],
+        )
+        .unwrap();
+        assert_eq!(graph.routes[0].failure, None);
+        assert_eq!(
+            graph.routes[1].failure,
+            Some(MediaError::UnsupportedProfile)
+        );
+        assert_eq!(graph.profiles.len(), 1);
+        assert!(!graph.profiles[0].signal_bt709);
+    }
+
+    #[test]
+    fn program_audio_copy_encode_conflicts_are_isolated_in_both_orders() {
+        for encoded_first in [false, true] {
+            let program = |id, encoded| {
+                let mut audio = program_audio(0, 0);
+                if encoded {
+                    audio.encoding = Some(crate::AudioEncoding {
+                        channels: 2,
+                        bitrate_kbps: 160,
+                    });
+                }
+                program_output(
+                    id,
+                    vec![program_video(
+                        0,
+                        0,
+                        program_profile(Codec::H264, 256, 144),
+                        None,
+                    )],
+                    vec![audio],
+                )
+            };
+            let graph = Graph::mixed(
+                &program_source(),
+                &[output("ordinary", 0, None)],
+                &[
+                    program("first", encoded_first),
+                    program("conflict", !encoded_first),
+                ],
+            )
+            .unwrap();
+            assert_eq!(graph.routes[0].failure, None);
+            assert_eq!(graph.routes[1].failure, None);
+            assert_eq!(
+                graph.routes[2].failure,
+                Some(MediaError::UnsupportedProfile)
+            );
+            assert_eq!(
+                graph
+                    .profiles
+                    .iter()
+                    .any(|profile| !profile.audio_encoding.is_empty()),
+                encoded_first
+            );
+            if encoded_first {
+                assert_eq!(graph.routes[0].group, None);
+            }
+        }
+    }
+
+    #[test]
+    fn encoded_aac_reserves_mux_offset_before_the_flv_timestamp_boundary() {
+        let mut audio = program_audio(0, 0);
+        audio.encoding = Some(crate::AudioEncoding {
+            channels: 2,
+            bitrate_kbps: 160,
+        });
+        let graph = Graph::program(
+            &program_source(),
+            &[program_output(
+                "twitch",
+                vec![program_video(
+                    0,
+                    0,
+                    program_profile(Codec::H264, 256, 144),
+                    None,
+                )],
+                vec![audio],
+            )],
+        )
+        .unwrap();
+        let maximum = graph.profiles[0].maximum_input_timestamp_ms().unwrap();
+        assert_eq!(maximum, i64::from(i32::MAX) - 22 - 40);
+        assert_eq!(graph.routes[0].timestamp_offset_ms, 22);
+        let paths = [PathBuf::from("/private/example.sock")];
+        assert!(graph.arguments(&paths, 1, maximum).is_ok());
+        assert!(matches!(
+            graph.arguments(&paths, 1, maximum + 1),
+            Err(MediaError::InvalidMedia)
+        ));
+        let copied = Graph::observed(&source(), &[output("youtube", 0, None)]).unwrap();
+        assert_eq!(copied.profiles[0].maximum_input_timestamp_ms(), None);
+        assert_eq!(copied.routes[0].timestamp_offset_ms, 0);
+    }
     #[test]
     fn observed_hdr_missing_audio_and_unapproved_upscale_are_rejected() {
         let mut hdr = source();
@@ -1244,10 +1494,12 @@ mod tests {
                 video: vec![video(0), video(7)],
                 audio: vec![
                     ProgramAudio {
+                        encoding: None,
                         source_wire_track: 0,
                         destination_wire_track: 4,
                     },
                     ProgramAudio {
+                        encoding: None,
                         source_wire_track: 1,
                         destination_wire_track: 12,
                     },
@@ -1257,6 +1509,7 @@ mod tests {
                 target: output("duplicate", 0, None).target,
                 video: vec![video(0), video(0)],
                 audio: vec![ProgramAudio {
+                    encoding: None,
                     source_wire_track: 0,
                     destination_wire_track: 0,
                 }],
@@ -1265,6 +1518,7 @@ mod tests {
                 target: output("shared", 0, None).target,
                 video: vec![video(0)],
                 audio: vec![ProgramAudio {
+                    encoding: None,
                     source_wire_track: 1,
                     destination_wire_track: 0,
                 }],

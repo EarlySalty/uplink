@@ -36,7 +36,47 @@ async fn rejected_platform_publish_marks_the_entire_failed_session() {
     normal_audio_case(true, Some("live"), true).await;
 }
 
+#[tokio::test]
+#[ignore = "Benötigt isolierte PostgreSQL 16 und geprüften FFmpeg 8."]
+async fn production_twitch_without_generation_preserves_healthy_youtube() {
+    normal_case(true, None, false, Some(("11", 0)), None).await;
+}
+
+#[tokio::test]
+#[ignore = "Benötigt isolierte PostgreSQL 16 und geprüften FFmpeg 8."]
+async fn production_twitch_with_stale_generation_preserves_healthy_youtube() {
+    normal_case(true, None, false, Some(("11", 2)), None).await;
+}
+
+#[tokio::test]
+#[ignore = "Benötigt isolierte PostgreSQL 16 und geprüften FFmpeg 8."]
+async fn production_twitch_with_wrong_token_owner_preserves_healthy_youtube() {
+    normal_case(true, None, false, Some(("12", 3)), None).await;
+}
+
+#[tokio::test]
+#[ignore = "Benötigt isolierte PostgreSQL 16 und geprüften FFmpeg 8."]
+async fn malformed_layout_with_portrait_disabled_preserves_healthy_youtube() {
+    normal_case(true, None, false, None, Some(false)).await;
+}
+
+#[tokio::test]
+#[ignore = "Benötigt isolierte PostgreSQL 16 und geprüften FFmpeg 8."]
+async fn malformed_layout_with_portrait_enabled_stops_only_twitch() {
+    normal_case(true, None, false, Some(("11", 3)), Some(true)).await;
+}
+
 async fn normal_audio_case(single_audio: bool, twitch_mode: Option<&str>, all_failed: bool) {
+    normal_case(single_audio, twitch_mode, all_failed, None, None).await;
+}
+
+async fn normal_case(
+    single_audio: bool,
+    twitch_mode: Option<&str>,
+    all_failed: bool,
+    production: Option<(&'static str, i64)>,
+    malformed_layout: Option<bool>,
+) {
     use futures::FutureExt;
     use sha2::{Digest, Sha256};
     use uplink_ingest::{
@@ -65,6 +105,29 @@ async fn normal_audio_case(single_audio: bool, twitch_mode: Option<&str>, all_fa
         }
     }
     let (database, mut state) = fixture().await;
+    let broker_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let broker = if let Some((owner, _)) = production {
+        let calls = broker_calls.clone();
+        let app = axum::Router::new().route(
+            "/twitch/api/v2/internal/platform-token",
+            axum::routing::get(move |axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>, headers: axum::http::HeaderMap| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move {
+                    assert_eq!(query.get("streamer").map(String::as_str), Some("11"));
+                    assert_eq!(query.get("platform").map(String::as_str), Some("twitch"));
+                    assert_eq!(query.get("purpose").map(String::as_str), Some("publish"));
+                    assert!(headers.contains_key("X-Internal-Token"));
+                    axum::Json(serde_json::json!({"purpose":"publish","token_owner":owner,"platform_user_id":"11","scopes":["channel:read:stream_key"],"access_token":"synthetic-test","connection_generation":3}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        Some((address, handle))
+    } else {
+        None
+    };
     let certificates = tls::test_tls();
     let output = IngestServer::bind_loopback(
         0,
@@ -76,16 +139,25 @@ async fn normal_audio_case(single_audio: bool, twitch_mode: Option<&str>, all_fa
     .unwrap();
     let output_address = output.local_addr().unwrap();
     let config = &mut Arc::get_mut(&mut state).unwrap().config;
-    config.chat = None;
+    if let Some((address, _)) = &broker {
+        config.chat.as_mut().unwrap().bot_base_url = format!("http://{address}");
+    } else {
+        config.chat = None;
+    }
     config.media.work_directory = database.directory.join("media");
     let ca_path = database.directory.join("public-test-ca.pem");
     std::fs::write(&ca_path, &certificates.certificate_pem).unwrap();
     config.loopback_test_ca = Some(ca_path);
     config.platforms.retain(|platform| {
-        platform.name == healthy_platform || (twitch_missing && platform.name == "twitch")
+        platform.name == healthy_platform
+            || ((twitch_missing || production.is_some()) && platform.name == "twitch")
     });
     for policy in &mut config.platforms {
-        policy.allowed_hosts = vec!["localhost".into()];
+        policy.allowed_hosts = vec![if production.is_some() && policy.name == "twitch" {
+            "ingest.example".into()
+        } else {
+            "localhost".into()
+        }];
         policy.use_vod_audio = policy.name == "twitch" || !single_audio;
     }
     let valid = state
@@ -113,6 +185,17 @@ async fn normal_audio_case(single_audio: bool, twitch_mode: Option<&str>, all_fa
             .await
             .unwrap();
     }
+    if let Some((_, generation)) = production {
+        let key = state
+            .secrets
+            .encryption
+            .seal(OUTPUT_KEY.as_bytes(), "destination:11:twitch")
+            .unwrap();
+        state.store.query("INSERT INTO relay.destinations(streamer_id,platform,rtmp_url,stream_key_enc,enabled,width,height,fps,bitrate_kbps,twitch_audio_mode) VALUES(11,'twitch','rtmps://ingest.example/live',$1,true,256,144,25,500,'live')", &[&key]).await.unwrap();
+        if generation > 0 {
+            state.store.query("INSERT INTO relay.destination_fences(streamer_id,platform,generation,deleted) VALUES(11,'twitch',$1,false)", &[&generation]).await.unwrap();
+        }
+    }
     if let Some(mode) = twitch_mode {
         use tower::ServiceExt;
         let request = axum::http::Request::builder().method("PUT").uri("/v1/me/destinations")
@@ -126,6 +209,19 @@ async fn normal_audio_case(single_audio: bool, twitch_mode: Option<&str>, all_fa
                 .status(),
             axum::http::StatusCode::OK
         );
+    }
+    if let Some(enabled) = malformed_layout {
+        state
+            .store
+            .query(
+                "INSERT INTO relay.hochkant_layouts(streamer_id,revision,layout) VALUES(11,1,'{}')",
+                &[],
+            )
+            .await
+            .unwrap();
+        if enabled {
+            state.store.query("UPDATE relay.destinations SET hochkant_enabled=true,hochkant_width=144,hochkant_height=256 WHERE streamer_id=11 AND platform='twitch'", &[]).await.unwrap();
+        }
     }
     let coordinator = Arc::new(uplink_service::media::Coordinator::new(state.clone()).unwrap());
     let (stop, stopped) = tokio::sync::oneshot::channel();
@@ -204,6 +300,13 @@ async fn normal_audio_case(single_audio: bool, twitch_mode: Option<&str>, all_fa
                         assert!(twitch["active_audio_mode"].is_null());
                         assert_eq!(twitch["twitch_audio_mode"],"separate_vod");
                     }
+                    if let Some((owner, _)) = production {
+                        let twitch = status["destinations"].as_array().unwrap().iter().find(|item| item["platform"]=="twitch").unwrap();
+                        assert_eq!(twitch["output_state"],"failed");
+                        assert!(twitch["reason"].as_str().unwrap().contains(if malformed_layout == Some(true) {"Hochkantwahl"} else if owner == "11" {"Twitch-Verbindung"} else {"Kontoinhaber"}));
+                        assert!(twitch["active_profile"].is_null());
+                        assert_eq!(broker_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+                    }
                     let rejected = &status["destinations"][0];
                     assert_eq!(rejected["platform"],"kick");
                     assert_eq!(rejected["output_state"],"failed");
@@ -266,6 +369,10 @@ async fn normal_audio_case(single_audio: bool, twitch_mode: Option<&str>, all_fa
         let _ = runtime.await;
     }
     drop(state);
+    if let Some((_, handle)) = broker {
+        handle.abort();
+        let _ = handle.await;
+    }
     database.stop().await;
     assert!(
         matches!(result, Ok(Ok(()))),

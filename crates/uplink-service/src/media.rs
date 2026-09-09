@@ -2,14 +2,18 @@ use crate::{api::ServiceState, runtime::SessionProcessor};
 use std::sync::Arc;
 use uplink_ingest::{MediaEvent, rustls};
 use uplink_media::{
-    DesiredOutput, DesiredSessionSpec, DesiredVideo, EngineConfig, MediaEngine, PublishSecret,
-    PublishTarget,
+    DesiredOutput, DesiredVideo, EngineConfig, MediaEngine, PublishSecret, PublishTarget,
 };
 
 pub struct Coordinator {
     state: Arc<ServiceState>,
     engine: MediaEngine,
     tls: Arc<rustls::ClientConfig>,
+    engine_config: EngineConfig,
+    hardware: tokio::sync::OnceCell<
+        Result<uplink_media::platform::hardware::HardwareReport, uplink_media::MediaError>,
+    >,
+    broker: Option<crate::chat::BotBroker>,
 }
 impl Coordinator {
     pub fn new(state: Arc<ServiceState>) -> Result<Self, &'static str> {
@@ -27,13 +31,14 @@ impl Coordinator {
             std::fs::Permissions::from_mode(0o700),
         )
         .map_err(|_| "Medienverzeichnis ist nicht geschützt.")?;
-        let engine = MediaEngine::new(EngineConfig {
+        let engine_config = EngineConfig {
             ffmpeg: config.ffmpeg.clone(),
             ffprobe: config.ffprobe.clone(),
             work_directory: config.work_directory.clone(),
             limits: state.config.media_limits(),
-        })
-        .map_err(|_| "Medienkonfiguration ist ungültig.")?;
+        };
+        let engine = MediaEngine::new(engine_config.clone())
+            .map_err(|_| "Medienkonfiguration ist ungültig.")?;
         let mut roots =
             rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         if let Some(path) = &state.config.loopback_test_ca {
@@ -64,18 +69,159 @@ impl Coordinator {
         .map_err(|_| "TLS-Ausgang ist ungültig.")?
         .with_root_certificates(roots)
         .with_no_client_auth();
+        state.registry.configure_capacity(
+            config.enhanced.capacity_units,
+            config.enhanced.legacy_session_units,
+        )?;
+        let broker = state
+            .config
+            .chat
+            .as_ref()
+            .map(|chat| {
+                crate::chat::BotBroker::new(
+                    &chat.bot_base_url,
+                    crate::crypto::Secret::new(state.secrets.bot_internal.expose().to_vec()),
+                )
+            })
+            .transpose()?;
         Ok(Self {
+            engine_config,
+            hardware: tokio::sync::OnceCell::new(),
+            broker,
             state,
             engine,
             tls: Arc::new(tls),
         })
     }
-    fn output(
+    async fn twitch_output(
+        &self,
+        tenant: u64,
+        wunsch: Zielwunsch,
+        source: &uplink_media::SourceObservation,
+    ) -> Result<uplink_media::ProgramOutput, &'static str> {
+        let output = wunsch.output;
+        let granted = self
+            .broker
+            .as_ref()
+            .ok_or("Die Twitch-Kontoprüfung ist noch nicht eingerichtet.")?
+            .publish_grant(tenant)
+            .await
+            .map_err(|_| {
+                "Der Twitch-Zugang oder sein Kontoinhaber konnte nicht bestätigt werden. Twitch erneut verbinden."
+            })?;
+        pruefe_publish_generation(granted, wunsch.generation)?;
+        let wahl = if wunsch.hochkant.is_some() {
+            self.gespeicherte_hochkant_wahl(
+                i64::try_from(tenant).map_err(|_| "Nutzeridentität ist ungültig.")?,
+            )
+            .await?
+        } else {
+            None
+        };
+        let (ziel, layout) = match (wunsch.hochkant, wahl.as_ref()) {
+            (Some(ziel), Some(wahl)) => (Some(ziel), Some(wahl)),
+            (Some(_), None) => {
+                return Err(
+                    "Die Hochkantwahl ist eingeschaltet, aber ohne gespeicherte Bildgestaltung.",
+                );
+            }
+            (None, _) => (None, None),
+        };
+        let hochkant = match (ziel, layout) {
+            (Some((breite, hoehe)), Some(wahl)) => {
+                let composition =
+                    wahl.layout
+                        .kompiliere(source.width, source.height, breite, hoehe)?;
+                Some(crate::media_output::HochkantWahl {
+                    ziel: (breite, hoehe),
+                    composition,
+                    revision: uplink_core::LayoutRevision {
+                        id: wahl.layout_id,
+                        revision: wahl.revision,
+                    },
+                })
+            }
+            _ => None,
+        };
+        let preferences = crate::media_output::preferences(
+            source,
+            &output,
+            &self.state.config.media.enhanced,
+            ziel,
+        )?;
+        let hardware = self
+            .hardware
+            .get_or_init(|| uplink_media::platform::hardware::measure(&self.engine_config))
+            .await
+            .as_ref()
+            .map_err(|_| "Die Softwareencoder konnten auf diesem Server nicht bestätigt werden.")?;
+        let configuration = uplink_media::platform::twitch::GoLiveClient::new()
+            .map_err(|error| error.message())?
+            .configure(
+                &output.target.playpath,
+                hardware,
+                &preferences,
+                &output.target.allowed_hosts,
+            )
+            .await
+            .map_err(|error| error.message())?;
+        crate::media_output::twitch(
+            configuration,
+            output.live_audio_track,
+            output.vod_audio_track,
+            hochkant.as_ref(),
+            source,
+        )
+    }
+
+    async fn gespeicherte_hochkant_wahl(
+        &self,
+        tenant: i64,
+    ) -> Result<Option<GespeicherteWahl>, &'static str> {
+        let rows = self
+            .state
+            .store
+            .query(
+                "SELECT layout_id,revision,layout FROM relay.hochkant_layouts WHERE streamer_id=$1 ORDER BY revision DESC LIMIT 1",
+                &[&tenant],
+            )
+            .await
+            .map_err(|_| "Die gespeicherte Hochkantwahl ist nicht lesbar.")?;
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(None);
+        };
+        let layout_id = u64::try_from(
+            row.try_get::<_, i64>(0)
+                .map_err(|_| "Die gespeicherte Hochkantwahl ist unvollständig.")?,
+        )
+        .map_err(|_| "Die gespeicherte Hochkantwahl ist unvollständig.")?;
+        let revision = u64::try_from(
+            row.try_get::<_, i64>(1)
+                .map_err(|_| "Die gespeicherte Hochkantwahl ist unvollständig.")?,
+        )
+        .map_err(|_| "Die gespeicherte Hochkantwahl ist unvollständig.")?;
+        if layout_id == 0 || revision == 0 {
+            return Err("Die gespeicherte Hochkantwahl trägt keine gültige Revision.");
+        }
+        let roh: serde_json::Value = row
+            .try_get(2)
+            .map_err(|_| "Die gespeicherte Hochkantwahl ist unvollständig.")?;
+        let layout: crate::hochkant::HochkantLayout = serde_json::from_value(roh).map_err(
+            |_| "Die gespeicherte Hochkantwahl wird in dieser Version nicht verstanden.",
+        )?;
+        Ok(Some(GespeicherteWahl {
+            layout_id,
+            revision,
+            layout,
+        }))
+    }
+
+    fn zielwunsch(
         &self,
         row: &tokio_postgres::Row,
         tenant: i64,
         platform: String,
-    ) -> Result<DesiredOutput, &'static str> {
+    ) -> Result<Zielwunsch, &'static str> {
         let policy = self
             .state
             .config
@@ -118,31 +264,87 @@ impl Coordinator {
         } else {
             None
         };
-        Ok(DesiredOutput {
-            target: PublishTarget {
-                id: platform,
-                endpoint,
-                playpath: PublishSecret::new(secret.expose().to_vec())
-                    .map_err(|_| "Zielzugang ist ungültig.")?,
-                tls: Some(self.tls.clone()),
-                allowed_hosts: policy.allowed_hosts.clone(),
-                allow_loopback: self.state.config.loopback_test_ca.is_some()
-                    && self.state.config.ingest_bind.ip().is_loopback(),
-                allow_unencrypted: policy.allow_unencrypted,
+        let generation = row
+            .try_get::<_, i64>(8)
+            .map_err(|_| "Zielgeneration fehlt.")?;
+        let hochkant_enabled = row
+            .try_get::<_, Option<bool>>(9)
+            .map_err(|_| "Hochkantwahl fehlt.")?
+            .unwrap_or(false);
+        let hochkant = if hochkant_enabled {
+            let width =
+                positive(10).map_err(|_| "Die gespeicherte Hochkantbreite ist unvollständig.")?;
+            let height =
+                positive(11).map_err(|_| "Die gespeicherte Hochkanthöhe ist unvollständig.")?;
+            Some((width, height))
+        } else {
+            None
+        };
+        Ok(Zielwunsch {
+            generation,
+            hochkant,
+            output: DesiredOutput {
+                target: PublishTarget {
+                    id: platform,
+                    endpoint,
+                    playpath: PublishSecret::new(secret.expose().to_vec())
+                        .map_err(|_| "Zielzugang ist ungültig.")?,
+                    tls: Some(self.tls.clone()),
+                    allowed_hosts: policy.allowed_hosts.clone(),
+                    allow_loopback: self.state.config.loopback_test_ca.is_some()
+                        && self.state.config.ingest_bind.ip().is_loopback(),
+                    allow_unencrypted: policy.allow_unencrypted,
+                },
+                video: DesiredVideo {
+                    width: positive(3)?,
+                    height: positive(4)?,
+                    fps: uplink_core::FrameRate::new(positive(5)?, 1)
+                        .map_err(|_| "Bildrate ist ungültig.")?,
+                    bitrate_kbps: positive(6)?,
+                    codec: policy.video_codec,
+                },
+                live_audio_track: self.state.config.media.live_audio_track,
+                vod_audio_track,
+                layout: None,
             },
-            video: DesiredVideo {
-                width: positive(3)?,
-                height: positive(4)?,
-                fps: uplink_core::FrameRate::new(positive(5)?, 1)
-                    .map_err(|_| "Bildrate ist ungültig.")?,
-                bitrate_kbps: positive(6)?,
-                codec: policy.video_codec,
-            },
-            live_audio_track: self.state.config.media.live_audio_track,
-            vod_audio_track,
-            layout: None,
         })
     }
+}
+
+struct Zielwunsch {
+    output: DesiredOutput,
+    generation: i64,
+    hochkant: Option<(u32, u32)>,
+}
+
+struct GespeicherteWahl {
+    layout_id: u64,
+    revision: u64,
+    layout: crate::hochkant::HochkantLayout,
+}
+
+fn pruefe_publish_generation(granted: i64, expected: i64) -> Result<(), &'static str> {
+    if expected < 1 || granted != expected {
+        return Err(
+            "Der gespeicherte Twitch-Zugang stammt nicht aus der aktuellen Twitch-Verbindung. Twitch im Dashboard neu verbinden.",
+        );
+    }
+    Ok(())
+}
+
+fn lokales_testziel(config: &crate::config::Config, target: &PublishTarget) -> bool {
+    config.loopback_test_ca.is_some()
+        && config.ingest_bind.ip().is_loopback()
+        && target.allow_loopback
+        && reqwest::Url::parse(&target.endpoint).is_ok_and(|url| {
+            url.scheme() == "rtmps"
+                && url.host_str() == Some("localhost")
+                && url.username().is_empty()
+                && url.password().is_none()
+                && url.query().is_none()
+                && url.fragment().is_none()
+                && target.allowed_hosts == ["localhost"]
+        })
 }
 
 /// Nur der bekannte alte Twitch-Default wird auf den offiziellen sicheren
@@ -179,15 +381,15 @@ impl SessionProcessor for Coordinator {
             .ok_or("Sessionreservierung fehlt.")?;
         let tenant = i64::try_from(first.identity.session.tenant_id())
             .map_err(|_| "Nutzeridentität ist ungültig.")?;
-        let rows=self.state.store.query("SELECT platform,rtmp_url,stream_key_enc,width,height,fps,bitrate_kbps,twitch_audio_mode FROM relay.destinations WHERE streamer_id=$1 AND enabled=true ORDER BY platform",&[&tenant]).await?;
+        let rows=self.state.store.query("SELECT d.platform,d.rtmp_url,d.stream_key_enc,d.width,d.height,d.fps,d.bitrate_kbps,d.twitch_audio_mode,COALESCE(f.generation,0),d.hochkant_enabled,d.hochkant_width,d.hochkant_height FROM relay.destinations d LEFT JOIN relay.destination_fences f USING(streamer_id,platform) WHERE d.streamer_id=$1 AND d.enabled=true ORDER BY d.platform",&[&tenant]).await?;
         if rows.is_empty() {
             return Err("Kein Ausgabeziel ist aktiviert.");
         }
         let mut outputs = Vec::with_capacity(rows.len());
         for row in rows {
             let platform: String = row.try_get(0).map_err(|_| "Zieldaten sind ungültig.")?;
-            match self.output(&row, tenant, platform.clone()) {
-                Ok(output) => outputs.push(output),
+            match self.zielwunsch(&row, tenant, platform.clone()) {
+                Ok(wunsch) => outputs.push(wunsch),
                 Err(reason) => reservation.block_output(platform, reason),
             }
         }
@@ -198,13 +400,17 @@ impl SessionProcessor for Coordinator {
         if probe_dump_allowed(&self.state.config.media, first.identity.session.tenant_id()) {
             diagnostic.request_probe_dump();
         }
-        let started = self
+        let mut events = events;
+        let selected_audio = outputs
+            .iter()
+            .flat_map(|wunsch| {
+                let output = &wunsch.output;
+                std::iter::once(output.live_audio_track).chain(output.vod_audio_track)
+            })
+            .collect();
+        let prepared = self
             .engine
-            .prepare_and_start_diagnosed(
-                DesiredSessionSpec { first, outputs },
-                events,
-                &mut diagnostic,
-            )
+            .prepare_source_diagnosed(first, &mut events, &selected_audio, &mut diagnostic)
             .await;
         if let Some(bytes) = diagnostic.take_probe_dump() {
             let directory = self.state.config.media.work_directory.clone();
@@ -213,9 +419,75 @@ impl SessionProcessor for Coordinator {
                 .unwrap_or(crate::probe_dump::DumpStatus::WriteFailed);
             diagnostic.probe_dump_finished(status.code());
         }
-        let running = started.map_err(|error| {
+        let prepared = prepared.map_err(|error| {
             preparation_failure(&reservation, error, serde_json::json!(diagnostic))
         })?;
+        reservation.observation(
+            serde_json::to_value(prepared.observation())
+                .map_err(|_| "Eingangsmessung konnte nicht dargestellt werden.")?,
+        );
+        let mut programs = Vec::new();
+        let mut desired = Vec::new();
+        for wunsch in outputs {
+            let output = &wunsch.output;
+            let platform = output.target.id.clone();
+            if platform != "twitch" || lokales_testziel(&self.state.config, &output.target) {
+                desired.push(wunsch.output);
+                continue;
+            }
+            let ergebnis = {
+                let tenant_wert =
+                    u64::try_from(tenant).map_err(|_| "Nutzeridentität ist ungültig.")?;
+                self.twitch_output(tenant_wert, wunsch, prepared.observation())
+                    .await
+            };
+            match ergebnis {
+                Ok(program) => {
+                    if platform == "twitch" {
+                        let key =
+                            crate::media_output::capacity_key(prepared.observation(), &program);
+                        let units = self
+                            .state
+                            .config
+                            .media
+                            .enhanced
+                            .profiles
+                            .iter()
+                            .find(|profile| profile.key == key)
+                            .map(|profile| profile.units);
+                        let admitted = units.ok_or("Dieses Qualitätsprofil ist noch nicht durch eine Lastmessung freigegeben.").and_then(|units| reservation.reserve_profile_capacity(units));
+                        if let Err(reason) = admitted {
+                            reservation.media_diagnostic(
+                                serde_json::json!({"phase":"capacity", "profile_key":key}),
+                            );
+                            reservation.block_output(platform, reason);
+                            continue;
+                        }
+                        if let Some(video) =
+                            program.video.iter().find(|video| video.canvas_index == 1)
+                        {
+                            let layout = video.layout.as_ref().expect("Canvas 1 trägt Layout");
+                            reservation.freeze_layout(
+                                "twitch",
+                                layout.revision.id,
+                                layout.revision.revision,
+                            );
+                        }
+                    }
+                    programs.push(program);
+                }
+                Err(reason) => reservation.block_output(platform, reason),
+            }
+        }
+        if programs.is_empty() && desired.is_empty() {
+            return Err("Kein ausführbares Ausgabeziel ist verfügbar; siehe Zielstatus.");
+        }
+        let running = self
+            .engine
+            .start_prepared_mixed(prepared, desired, programs, events, &mut diagnostic)
+            .map_err(|error| {
+                preparation_failure(&reservation, error, serde_json::json!(diagnostic))
+            })?;
         if let Some(observation) = running.source_observation() {
             reservation.observation(
                 serde_json::to_value(observation)
@@ -324,5 +596,46 @@ mod tests {
         ] {
             assert_eq!(secure_default(platform, endpoint.into()), endpoint);
         }
+    }
+
+    #[test]
+    fn publish_verlangt_aktuelle_positive_generation() {
+        assert!(super::pruefe_publish_generation(3, 3).is_ok());
+        for (granted, expected) in [(2, 3), (4, 3), (3, 0), (3, -2)] {
+            let fehler = super::pruefe_publish_generation(granted, expected).unwrap_err();
+            assert!(fehler.contains("Twitch-Verbindung"));
+        }
+    }
+
+    #[test]
+    fn lokaler_key_pfad_braucht_test_ca_und_begrenztes_loopback_ziel() {
+        let mut config =
+            crate::config::Config::parse(include_str!("../../../config/uplink-beispiel.toml"))
+                .unwrap();
+        config.ingest_bind = "127.0.0.1:0".parse().unwrap();
+        config.chat = None;
+        let mut target = uplink_media::PublishTarget {
+            id: "twitch".into(),
+            endpoint: "rtmps://localhost/live".into(),
+            playpath: uplink_media::PublishSecret::new(b"synthetic".to_vec()).unwrap(),
+            tls: None,
+            allowed_hosts: vec!["localhost".into()],
+            allow_loopback: true,
+            allow_unencrypted: false,
+        };
+        assert!(!super::lokales_testziel(&config, &target));
+        config.loopback_test_ca = Some("/tmp/public-test-ca.pem".into());
+        assert!(super::lokales_testziel(&config, &target));
+        target.endpoint = "rtmps://ingest.example/live".into();
+        assert!(!super::lokales_testziel(&config, &target));
+        target.endpoint = "rtmps://localhost/live".into();
+        target.allowed_hosts.push("ingest.example".into());
+        assert!(!super::lokales_testziel(&config, &target));
+        target.allowed_hosts = vec!["localhost".into()];
+        target.allow_loopback = false;
+        assert!(!super::lokales_testziel(&config, &target));
+        target.allow_loopback = true;
+        config.ingest_bind = "0.0.0.0:443".parse().unwrap();
+        assert!(!super::lokales_testziel(&config, &target));
     }
 }

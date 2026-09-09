@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - name: Toolchain aus rust-toolchain.toml verwenden
@@ -23,8 +23,11 @@ jobs:
         run: cargo test --workspace --locked -j2
       - name: Steuerung gegen isoliertes PostgreSQL
         run: |
-          sudo apt-get update
-          sudo apt-get install -y postgresql-16 ffmpeg
+          set -eu
+          ubuntu_sources=/etc/apt/sources.list.d/ubuntu.sources
+          test -s "$ubuntu_sources"
+          sudo apt-get -o "Dir::Etc::sourcelist=$ubuntu_sources" -o Dir::Etc::sourceparts=- update
+          sudo apt-get -o "Dir::Etc::sourcelist=$ubuntu_sources" -o Dir::Etc::sourceparts=- install -y postgresql-16 ffmpeg
           cargo test -p uplink-service --test database --locked -j2 -- --ignored --test-threads=1
           cargo test -p uplink-service --test http_shutdown --locked -j2 -- --ignored --test-threads=1
           cargo test -p uplink-service --test lifecycle --locked -j2 -- --ignored --test-threads=1

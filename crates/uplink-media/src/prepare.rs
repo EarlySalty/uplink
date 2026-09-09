@@ -374,7 +374,7 @@ impl MediaEngine {
         .await
     }
 
-    async fn prepare_source_diagnosed(
+    pub async fn prepare_source_diagnosed(
         &self,
         first: MediaEvent,
         input: &mut mpsc::Receiver<MediaEvent>,
@@ -515,10 +515,62 @@ impl MediaEngine {
         })
     }
 }
-struct PreparedSource {
+pub struct PreparedSource {
     identity: TrackIdentity,
     prefix: VecDeque<MediaEvent>,
     observation: SourceObservation,
+}
+
+impl PreparedSource {
+    pub fn observation(&self) -> &SourceObservation {
+        &self.observation
+    }
+}
+
+impl MediaEngine {
+    pub fn start_prepared_program(
+        &self,
+        prepared: PreparedSource,
+        outputs: Vec<ProgramOutput>,
+        input: mpsc::Receiver<MediaEvent>,
+        diagnostic: &mut PreparationDiagnostic,
+    ) -> Result<RunningMedia> {
+        self.start_prepared_mixed(prepared, Vec::new(), outputs, input, diagnostic)
+    }
+
+    pub fn start_prepared_mixed(
+        &self,
+        prepared: PreparedSource,
+        desired: Vec<crate::DesiredOutput>,
+        outputs: Vec<ProgramOutput>,
+        input: mpsc::Receiver<MediaEvent>,
+        diagnostic: &mut PreparationDiagnostic,
+    ) -> Result<RunningMedia> {
+        diagnostic.phase = "graph";
+        let count = desired.len().saturating_add(outputs.len());
+        if count == 0 || count > self.config.limits.max_outputs {
+            return Err(MediaError::InvalidConfiguration);
+        }
+        let graph = Graph::mixed(&prepared.observation, &desired, &outputs)?;
+        let routes = desired
+            .into_iter()
+            .map(|output| output.target)
+            .chain(outputs.into_iter().map(|output| output.target))
+            .map(|target| TargetRoute {
+                output_id: target.id.clone(),
+                target,
+            })
+            .collect();
+        diagnostic.phase = "start_graph";
+        self.start_graph(
+            prepared.identity,
+            routes,
+            graph,
+            input,
+            prepared.prefix,
+            Some(prepared.observation),
+        )
+    }
 }
 
 #[cfg(test)]

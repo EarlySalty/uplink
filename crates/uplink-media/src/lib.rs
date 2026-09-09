@@ -17,7 +17,7 @@ use uplink_ingest::{MediaEvent, TrackIdentity, WireTrack};
 use zeroize::Zeroizing;
 
 pub use engine::{MediaEngine, MediaObserver, RunningMedia};
-pub use prepare::{MAX_PROBE_DUMP_BYTES, PreparationDiagnostic};
+pub use prepare::{MAX_PROBE_DUMP_BYTES, PreparationDiagnostic, PreparedSource};
 
 pub type Result<T> = std::result::Result<T, MediaError>;
 
@@ -270,7 +270,13 @@ pub struct ProgramVideo {
     pub layout: Option<LayoutSpec>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioEncoding {
+    pub channels: u8,
+    pub bitrate_kbps: u32,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProgramAudio {
+    pub encoding: Option<AudioEncoding>,
     pub source_wire_track: u8,
     pub destination_wire_track: u8,
 }
@@ -345,6 +351,7 @@ pub struct MediaStatus {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct OutputGraph {
+    pub timestamp_offset_ms: u32,
     pub id: String,
     pub profile_origin: &'static str,
     pub video: Vec<VideoProcessing>,
@@ -353,6 +360,10 @@ pub struct OutputGraph {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct VideoProcessing {
+    pub canvas_index: u8,
+    pub encoder: Option<&'static str>,
+    pub layout_id: Option<u64>,
+    pub layout_revision: Option<u64>,
     pub wire_track: u8,
     pub mode: &'static str,
     pub encode_group: Option<usize>,

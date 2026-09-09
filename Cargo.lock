@@ -2492,6 +2492,7 @@ dependencies = [
  "sha2 0.10.9",
  "tokio",
  "tokio-rustls",
+ "toml",
  "uplink-core",
  "uplink-ingest",
  "url",
