@@ -82,6 +82,7 @@ pub struct PreparationDiagnostic {
     probe: Vec<ProbeDiagnostic>,
     requested: Vec<RequestedDiagnostic>,
     ffprobe_exit_code: Option<i32>,
+    io_error_kind: Option<&'static str>,
     ffprobe_stderr_first_line: Option<&'static str>,
 }
 
@@ -515,6 +516,18 @@ fn sanitized_probe_line(bytes: &[u8]) -> Option<&'static str> {
     )
 }
 
+fn io_error_label(kind: std::io::ErrorKind) -> &'static str {
+    match kind {
+        std::io::ErrorKind::BrokenPipe => "broken_pipe",
+        std::io::ErrorKind::UnexpectedEof => "unexpected_eof",
+        std::io::ErrorKind::WriteZero => "write_zero",
+        std::io::ErrorKind::ConnectionReset => "connection_reset",
+        std::io::ErrorKind::Interrupted => "interrupted",
+        std::io::ErrorKind::TimedOut => "timed_out",
+        _ => "other",
+    }
+}
+
 async fn drain_probe_stderr(
     stderr: &mut tokio::process::ChildStderr,
     first: &mut Vec<u8>,
@@ -553,9 +566,14 @@ async fn probe(
     let mut stderr = child.stderr.take().ok_or(MediaError::ProcessFailed)?;
     let mut stderr_first = Vec::new();
     let mut exit_code = None;
+    let mut write_error_kind = None;
+    let mut read_error_kind = None;
     let operation = async {
         let write = async {
-            stdin.write_all(&bytes).await.map_err(|_| MediaError::Io)?;
+            stdin.write_all(&bytes).await.map_err(|error| {
+                write_error_kind = Some(io_error_label(error.kind()));
+                MediaError::Io
+            })?;
             drop(stdin);
             Ok::<_, MediaError>(())
         };
@@ -565,7 +583,10 @@ async fn probe(
                 .take(65537)
                 .read_to_end(&mut output)
                 .await
-                .map_err(|_| MediaError::Io)?;
+                .map_err(|error| {
+                    read_error_kind = Some(io_error_label(error.kind()));
+                    MediaError::Io
+                })?;
             if output.len() > 65536 {
                 return Err(MediaError::ResourceLimit);
             }
@@ -590,6 +611,7 @@ async fn probe(
         Ok(result) => result,
         Err(_) => Err(MediaError::StartTimeout),
     };
+    diagnostic.io_error_kind = write_error_kind.or(read_error_kind);
     diagnostic.ffprobe_exit_code = exit_code.or_else(|| {
         guard
             .child
@@ -604,6 +626,12 @@ async fn probe(
             Ok(document)
         }
         Err(reason) => {
+            if diagnostic.ffprobe_exit_code.is_none()
+                && let Some(child) = guard.child.as_mut()
+                && let Ok(Ok(status)) = timeout(Duration::from_millis(100), child.wait()).await
+            {
+                diagnostic.ffprobe_exit_code = status.code();
+            }
             guard.terminate().await?;
             let _ = timeout(
                 config.limits.shutdown_timeout,
@@ -780,6 +808,44 @@ mod tests {
         fps.streams[0].r_frame_rate = Some("0/0".into());
         assert!(observation(fps, &audio(), 0, 120, 15000, 1000).is_err());
     }
+    #[tokio::test]
+    async fn closed_probe_stdin_preserves_natural_exit_status_and_safe_stderr() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut random = [0u8; 8];
+        getrandom::fill(&mut random).unwrap();
+        let directory = std::path::PathBuf::from(format!(
+            "/tmp/uplink-probe-exit-{:016x}",
+            u64::from_ne_bytes(random)
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let executable = directory.join("probe");
+        std::fs::write(&executable, b"#!/bin/sh\nexec 0<&-\nprintf 'Invalid data found when processing input: synthetic-private-key\\n' >&2\n/usr/bin/sleep 0.03\nexit 42\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let config = EngineConfig {
+            ffmpeg: "/usr/bin/true".into(),
+            ffprobe: executable,
+            work_directory: directory.clone(),
+            limits: MediaLimits::default(),
+        };
+        let mut diagnostic = PreparationDiagnostic::default();
+        let result = probe(&config, vec![0; 4 * 1024 * 1024], &mut diagnostic).await;
+        std::fs::remove_dir_all(directory).unwrap();
+        assert!(matches!(result, Err(MediaError::Io)));
+        assert_eq!(
+            diagnostic.ffprobe_exit_code,
+            Some(42),
+            "Ein bereits abbrechender Probeprozess muss seinen natürlichen Exitstatus behalten"
+        );
+        assert_eq!(
+            diagnostic.ffprobe_stderr_first_line,
+            Some("Invalid data found when processing input")
+        );
+        assert_eq!(
+            serde_json::to_value(diagnostic).unwrap()["io_error_kind"],
+            "broken_pipe"
+        );
+    }
+
     #[tokio::test]
     async fn cancelled_probe_owner_kills_and_reaps_its_child() {
         let child = Command::new("/usr/bin/sleep")
