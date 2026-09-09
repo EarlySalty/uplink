@@ -481,6 +481,9 @@ impl Graph {
                         || u64::from(profile.width) * u64::from(profile.height)
                             > u64::from(source.width) * u64::from(source.height)
                         || profile.fps > source_fps
+                        || profile.fps
+                            > uplink_core::FrameRate::new(60, 1)
+                                .map_err(|_| MediaError::InvalidConfiguration)?
                         || profile.rate.target_kbps == 0
                         || profile.rate.target_kbps > 20_000
                         || profile.rate.max_kbps != profile.rate.target_kbps
@@ -858,7 +861,253 @@ impl EncodeProfile {
 mod tests {
     use super::*;
     use crate::{AudioObservation, DesiredVideo, PublishSecret, PublishTarget};
-    use uplink_core::FrameRate;
+    use uplink_core::{
+        Chroma, Color, ColorPrimaries, ColorRange, FrameRate, Gop, LayoutRevision, Matrix,
+        RateControl, Transfer,
+    };
+
+    fn program_source() -> SourceObservation {
+        let mut source = source();
+        source.color_primaries = Some("bt709".into());
+        source.color_transfer = Some("bt709".into());
+        source.color_matrix = Some("bt709".into());
+        source.color_range = Some("tv".into());
+        source
+    }
+    fn program_profile(codec: Codec, width: u32, height: u32) -> VideoProfile {
+        VideoProfile {
+            width,
+            height,
+            fps: FrameRate::new(25, 1).unwrap(),
+            codec,
+            codec_profile: if codec == Codec::H264 { "high" } else { "main" }.into(),
+            level: if codec == Codec::H264 { "4.2" } else { "5.1" }.into(),
+            bit_depth: 8,
+            chroma: Chroma::Yuv420,
+            color: Color {
+                primaries: ColorPrimaries::Bt709,
+                transfer: Transfer::Bt709,
+                matrix: Matrix::Bt709,
+                range: ColorRange::Limited,
+            },
+            rate: RateControl {
+                mode: RateMode::Cbr,
+                target_kbps: 384,
+                max_kbps: 384,
+                buffer_kbits: 768,
+            },
+            gop: Gop {
+                keyframe_interval_frames: 50,
+                closed: true,
+            },
+        }
+    }
+    fn program_video(
+        wire_track: u8,
+        canvas_index: u8,
+        profile: VideoProfile,
+        layout: Option<LayoutSpec>,
+    ) -> crate::ProgramVideo {
+        crate::ProgramVideo {
+            wire_track,
+            canvas_index,
+            profile,
+            layout,
+        }
+    }
+    fn program_audio(source: u8, destination: u8) -> crate::ProgramAudio {
+        crate::ProgramAudio {
+            source_wire_track: source,
+            destination_wire_track: destination,
+        }
+    }
+    fn program_output(
+        id: &str,
+        video: Vec<crate::ProgramVideo>,
+        audio: Vec<crate::ProgramAudio>,
+    ) -> crate::ProgramOutput {
+        crate::ProgramOutput {
+            target: output(id, 0, None).target,
+            video,
+            audio,
+        }
+    }
+    fn crop_layout(x: u32, y: u32, width: u32, height: u32) -> LayoutSpec {
+        LayoutSpec {
+            revision: LayoutRevision { id: 1, revision: 1 },
+            composition: Composition::Crop(Crop {
+                x,
+                y,
+                width,
+                height,
+            }),
+        }
+    }
+    #[test]
+    fn program_caps_output_frame_rate_like_the_single_track_path() {
+        let mut source = program_source();
+        source.fps_numerator = 120;
+        let mut over = program_profile(Codec::H264, 256, 144);
+        over.fps = FrameRate::new(120, 1).unwrap();
+        let graph = Graph::program(
+            &source,
+            &[program_output(
+                "too-fast",
+                vec![program_video(0, 0, over, None)],
+                vec![program_audio(0, 0)],
+            )],
+        )
+        .unwrap();
+        assert_eq!(
+            graph.routes[0].failure,
+            Some(MediaError::UnsupportedProfile),
+            "Der Mehrspurpfad braucht denselben Bildraten-Deckel wie der Einzelspurpfad"
+        );
+        assert!(graph.profiles.is_empty());
+        let mut at = program_profile(Codec::H264, 256, 144);
+        at.fps = FrameRate::new(60, 1).unwrap();
+        let graph = Graph::program(
+            &source,
+            &[program_output(
+                "ceiling",
+                vec![program_video(0, 0, at, None)],
+                vec![program_audio(0, 0)],
+            )],
+        )
+        .unwrap();
+        assert_eq!(graph.routes[0].failure, None);
+        assert_eq!(graph.profiles.len(), 1);
+    }
+    #[test]
+    fn program_enforces_canvas_and_wire_track_contract() {
+        let source = program_source();
+        let audio = vec![program_audio(0, 0)];
+        let graph = Graph::program(
+            &source,
+            &[program_output(
+                "canvas-without-layout",
+                vec![program_video(
+                    0,
+                    1,
+                    program_profile(Codec::H264, 256, 144),
+                    None,
+                )],
+                audio.clone(),
+            )],
+        )
+        .unwrap();
+        assert_eq!(
+            graph.routes[0].failure,
+            Some(MediaError::UnsupportedProfile),
+            "Canvas 1 ohne Layout bleibt abgewiesen"
+        );
+        let graph = Graph::program(
+            &source,
+            &[program_output(
+                "unknown-canvas",
+                vec![program_video(
+                    0,
+                    2,
+                    program_profile(Codec::H264, 256, 144),
+                    Some(crop_layout(0, 0, 180, 180)),
+                )],
+                audio.clone(),
+            )],
+        )
+        .unwrap();
+        assert_eq!(
+            graph.routes[0].failure,
+            Some(MediaError::UnsupportedProfile),
+            "Canvas jenseits 1 bleibt abgewiesen"
+        );
+        let graph = Graph::program(
+            &source,
+            &[program_output(
+                "split-canvas",
+                vec![
+                    program_video(0, 0, program_profile(Codec::H264, 256, 144), None),
+                    program_video(
+                        5,
+                        0,
+                        program_profile(Codec::Hevc, 144, 256),
+                        Some(crop_layout(0, 0, 180, 180)),
+                    ),
+                ],
+                audio.clone(),
+            )],
+        )
+        .unwrap();
+        assert_eq!(
+            graph.routes[0].failure,
+            Some(MediaError::InvalidConfiguration),
+            "Ein Canvas trägt genau ein Layout"
+        );
+        let graph = Graph::program(
+            &source,
+            &[program_output(
+                "duplicate-wire",
+                vec![
+                    program_video(0, 0, program_profile(Codec::H264, 256, 144), None),
+                    program_video(0, 1, program_profile(Codec::Hevc, 144, 256), None),
+                ],
+                audio.clone(),
+            )],
+        )
+        .unwrap();
+        assert_eq!(
+            graph.routes[0].failure,
+            Some(MediaError::UnsupportedProfile),
+            "Ein Video-Draht trägt genau eine Ausgabe"
+        );
+    }
+    #[test]
+    fn program_accepts_hevc_only_with_its_explicit_contract() {
+        let source = program_source();
+        let hevc = program_profile(Codec::Hevc, 144, 256);
+        let graph = Graph::program(
+            &source,
+            &[program_output(
+                "hevc",
+                vec![program_video(5, 0, hevc.clone(), None)],
+                vec![program_audio(0, 0)],
+            )],
+        )
+        .unwrap();
+        assert_eq!(graph.routes[0].failure, None);
+        assert_eq!(graph.profiles.len(), 1);
+        assert_eq!(graph.profiles[0].video.codec, Codec::Hevc);
+        assert!(graph.profiles[0].signal_bt709);
+        let mut wrong_profile = hevc.clone();
+        wrong_profile.codec_profile = "high".into();
+        let graph = Graph::program(
+            &source,
+            &[program_output(
+                "hevc-high",
+                vec![program_video(5, 0, wrong_profile, None)],
+                vec![program_audio(0, 0)],
+            )],
+        )
+        .unwrap();
+        assert_eq!(
+            graph.routes[0].failure,
+            Some(MediaError::UnsupportedProfile)
+        );
+        let mut rate_hq = hevc;
+        rate_hq.rate.mode = RateMode::HqCbr;
+        let graph = Graph::program(
+            &source,
+            &[program_output(
+                "hevc-hqcbr",
+                vec![program_video(5, 0, rate_hq, None)],
+                vec![program_audio(0, 0)],
+            )],
+        )
+        .unwrap();
+        assert_eq!(
+            graph.routes[0].failure,
+            Some(MediaError::UnsupportedProfile)
+        );
+    }
 
     fn source() -> SourceObservation {
         SourceObservation {
