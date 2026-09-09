@@ -190,6 +190,7 @@ async fn start_public(
                             layout: None,
                         }],
                         audio: vec![ProgramAudio {
+                            encoding: None,
                             source_wire_track: track,
                             destination_wire_track: 0,
                         }],

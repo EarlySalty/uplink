@@ -15,6 +15,7 @@ use uplink_ingest::{MediaKind, WireCodec, WireTrack};
 
 pub(crate) struct EncodeProfile {
     pub video: VideoProfile,
+    pub audio_encoding: Vec<(u8, crate::AudioEncoding)>,
     pub layout: Option<LayoutSpec>,
     /// Fehlende Farbmetadaten der Quelle bleiben unbekannt und werden nicht umetikettiert.
     pub signal_bt709: bool,
@@ -46,6 +47,24 @@ impl Graph {
                 .iter()
                 .map(|(group, wire)| crate::VideoProcessing {
                     wire_track: *wire,
+                    canvas_index: group
+                        .and_then(|group| self.profiles.get(group))
+                        .map_or(0, |p| u8::from(p.layout.is_some())),
+                    encoder: group.and_then(|group| self.profiles.get(group)).map(|p| {
+                        match p.video.codec {
+                            Codec::H264 => "libx264",
+                            Codec::Hevc => "libx265",
+                            Codec::Av1 => "libsvtav1",
+                        }
+                    }),
+                    layout_id: group
+                        .and_then(|group| self.profiles.get(group))
+                        .and_then(|p| p.layout.as_ref())
+                        .map(|l| l.revision.id),
+                    layout_revision: group
+                        .and_then(|group| self.profiles.get(group))
+                        .and_then(|p| p.layout.as_ref())
+                        .map(|l| l.revision.revision),
                     mode: if group.is_some() { "encode" } else { "copy" },
                     encode_group: *group,
                     profile: group.and_then(|group| self.profiles.get(group)).map(|p| {
@@ -161,6 +180,7 @@ impl Graph {
                 video: request.video.clone(),
                 layout,
                 signal_bt709: true,
+                audio_encoding: Vec::new(),
             });
             for id in &group.outputs {
                 output_groups.insert(id.as_str(), index);
@@ -374,6 +394,7 @@ impl Graph {
                             video,
                             layout: output.layout.clone(),
                             signal_bt709: false,
+                            audio_encoding: Vec::new(),
                         });
                         profiles.len() - 1
                     }
@@ -437,6 +458,7 @@ impl Graph {
         let source_fps = uplink_core::FrameRate::new(source.fps_numerator, source.fps_denominator)
             .map_err(|_| MediaError::InvalidMedia)?;
         let mut target_ids = HashSet::new();
+        let mut shared_audio = Vec::new();
         for output in outputs {
             if output.target.id.is_empty() || !target_ids.insert(&output.target.id) {
                 return Err(MediaError::InvalidConfiguration);
@@ -452,6 +474,7 @@ impl Graph {
                 }
                 let mut audio = Vec::new();
                 let mut audio_ids = HashSet::new();
+                let mut audio_encoding = Vec::new();
                 for route in &output.audio {
                     if !audio_ids.insert(route.destination_wire_track) {
                         return Err(MediaError::InvalidConfiguration);
@@ -464,7 +487,30 @@ impl Graph {
                         .input_audio
                         .get(&wire)
                         .ok_or(MediaError::MissingTrack)?;
+                    if let Some(encoding) = route.encoding {
+                        if !(1..=2).contains(&encoding.channels)
+                            || !(32..=320).contains(&encoding.bitrate_kbps)
+                        {
+                            return Err(MediaError::UnsupportedProfile);
+                        }
+                        if audio_encoding
+                            .iter()
+                            .any(|(index, prior)| *index == source && *prior != encoding)
+                        {
+                            return Err(MediaError::UnsupportedProfile);
+                        }
+                        if !audio_encoding.contains(&(source, encoding)) {
+                            audio_encoding.push((source, encoding));
+                        }
+                    }
                     audio.push((source, route.destination_wire_track));
+                }
+                if audio_encoding.iter().any(|(track, encoding)| {
+                    shared_audio
+                        .iter()
+                        .any(|(prior_track, prior)| prior_track == track && prior != encoding)
+                }) {
+                    return Err(MediaError::UnsupportedProfile);
                 }
                 let mut video = Vec::new();
                 let mut video_ids = HashSet::new();
@@ -523,11 +569,17 @@ impl Graph {
                                 video: profile.clone(),
                                 layout: request.layout.clone(),
                                 signal_bt709: true,
+                                audio_encoding: audio_encoding.clone(),
                             });
                             graph.profiles.len() - 1
                         }
                     };
                     video.push((Some(group), request.wire_track));
+                }
+                for encoding in audio_encoding {
+                    if !shared_audio.contains(&encoding) {
+                        shared_audio.push(encoding);
+                    }
                 }
                 Ok(Routing {
                     group: video[0].0,
@@ -548,6 +600,9 @@ impl Graph {
                     }
                 }
             });
+        }
+        for profile in &mut graph.profiles {
+            profile.audio_encoding = shared_audio.clone();
         }
         Ok(graph)
     }
@@ -611,6 +666,18 @@ impl Graph {
                 "-c:a".into(),
                 "copy".into(),
             ]);
+            for (track, encoding) in &profile.audio_encoding {
+                args.extend([
+                    format!("-c:a:{track}").into(),
+                    "aac".into(),
+                    format!("-b:a:{track}").into(),
+                    format!("{}k", encoding.bitrate_kbps).into(),
+                    format!("-ac:a:{track}").into(),
+                    encoding.channels.to_string().into(),
+                    format!("-ar:a:{track}").into(),
+                    "48000".into(),
+                ]);
+            }
             profile.encoder_args(&mut args, threads);
             args.extend([
                 "-f".into(),
@@ -917,6 +984,7 @@ mod tests {
     }
     fn program_audio(source: u8, destination: u8) -> crate::ProgramAudio {
         crate::ProgramAudio {
+            encoding: None,
             source_wire_track: source,
             destination_wire_track: destination,
         }
@@ -1244,10 +1312,12 @@ mod tests {
                 video: vec![video(0), video(7)],
                 audio: vec![
                     ProgramAudio {
+                        encoding: None,
                         source_wire_track: 0,
                         destination_wire_track: 4,
                     },
                     ProgramAudio {
+                        encoding: None,
                         source_wire_track: 1,
                         destination_wire_track: 12,
                     },
@@ -1257,6 +1327,7 @@ mod tests {
                 target: output("duplicate", 0, None).target,
                 video: vec![video(0), video(0)],
                 audio: vec![ProgramAudio {
+                    encoding: None,
                     source_wire_track: 0,
                     destination_wire_track: 0,
                 }],
@@ -1265,6 +1336,7 @@ mod tests {
                 target: output("shared", 0, None).target,
                 video: vec![video(0)],
                 audio: vec![ProgramAudio {
+                    encoding: None,
                     source_wire_track: 1,
                     destination_wire_track: 0,
                 }],

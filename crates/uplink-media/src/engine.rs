@@ -872,8 +872,10 @@ mod tests {
 
     #[tokio::test]
     async fn video_backpressure_isolates_only_the_stalled_sink() {
-        let mut stalled_limits = MediaLimits::default();
-        stalled_limits.queue_events = 1;
+        let stalled_limits = MediaLimits {
+            queue_events: 1,
+            ..MediaLimits::default()
+        };
         let stalled =
             RunningPusher::spawn(stopped_endpoint("stalled").await, stalled_limits).unwrap();
         let healthy =

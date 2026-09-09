@@ -374,7 +374,7 @@ impl MediaEngine {
         .await
     }
 
-    async fn prepare_source_diagnosed(
+    pub async fn prepare_source_diagnosed(
         &self,
         first: MediaEvent,
         input: &mut mpsc::Receiver<MediaEvent>,
@@ -515,10 +515,48 @@ impl MediaEngine {
         })
     }
 }
-struct PreparedSource {
+pub struct PreparedSource {
     identity: TrackIdentity,
     prefix: VecDeque<MediaEvent>,
     observation: SourceObservation,
+}
+
+impl PreparedSource {
+    pub fn observation(&self) -> &SourceObservation {
+        &self.observation
+    }
+}
+
+impl MediaEngine {
+    pub fn start_prepared_program(
+        &self,
+        prepared: PreparedSource,
+        outputs: Vec<ProgramOutput>,
+        input: mpsc::Receiver<MediaEvent>,
+        diagnostic: &mut PreparationDiagnostic,
+    ) -> Result<RunningMedia> {
+        diagnostic.phase = "graph";
+        if outputs.is_empty() || outputs.len() > self.config.limits.max_outputs {
+            return Err(MediaError::InvalidConfiguration);
+        }
+        let graph = Graph::program(&prepared.observation, &outputs)?;
+        let routes = outputs
+            .into_iter()
+            .map(|output| TargetRoute {
+                output_id: output.target.id.clone(),
+                target: output.target,
+            })
+            .collect();
+        diagnostic.phase = "start_graph";
+        self.start_graph(
+            prepared.identity,
+            routes,
+            graph,
+            input,
+            prepared.prefix,
+            Some(prepared.observation),
+        )
+    }
 }
 
 #[cfg(test)]

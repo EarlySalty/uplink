@@ -188,10 +188,12 @@ pub(super) async fn run(ffmpeg: &std::path::Path, ffprobe: &std::path::Path) -> 
             ],
             audio: vec![
                 ProgramAudio {
+                    encoding: None,
                     source_wire_track: 0,
                     destination_wire_track: 2,
                 },
                 ProgramAudio {
+                    encoding: None,
                     source_wire_track: 1,
                     destination_wire_track: 9,
                 },
@@ -206,6 +208,7 @@ pub(super) async fn run(ffmpeg: &std::path::Path, ffprobe: &std::path::Path) -> 
                 layout: None,
             }],
             audio: vec![ProgramAudio {
+                encoding: None,
                 source_wire_track: 1,
                 destination_wire_track: 0,
             }],
@@ -219,6 +222,7 @@ pub(super) async fn run(ffmpeg: &std::path::Path, ffprobe: &std::path::Path) -> 
                 layout: None,
             }],
             audio: vec![ProgramAudio {
+                encoding: None,
                 source_wire_track: 12,
                 destination_wire_track: 0,
             }],

@@ -336,10 +336,12 @@ fn mehrspur_video() -> Vec<ProgramVideo> {
 fn mehrspur_audio() -> Vec<ProgramAudio> {
     vec![
         ProgramAudio {
+            encoding: None,
             source_wire_track: 0,
             destination_wire_track: 2,
         },
         ProgramAudio {
+            encoding: None,
             source_wire_track: 1,
             destination_wire_track: 9,
         },
@@ -456,6 +458,7 @@ async fn mixed_codec_program_output_preserves_headers_tracks_and_timebase() {
                             layout: None,
                         }],
                         audio: vec![ProgramAudio {
+                            encoding: None,
                             source_wire_track: 1,
                             destination_wire_track: 0,
                         }],
@@ -684,8 +687,8 @@ async fn explicit_stop_releases_multitrack_resources() {
     }
     let (links_server, links_ziel) = server_und_ziel("links").await;
     let (rechts_server, rechts_ziel) = server_und_ziel("rechts").await;
-    let mut links = erfasse(links_server);
-    let mut rechts = erfasse(rechts_server);
+    let links = erfasse(links_server);
+    let rechts = erfasse(rechts_server);
     let lauf = EngineLauf::starten();
     let running = lauf
         .engine
