@@ -684,8 +684,8 @@ async fn explicit_stop_releases_multitrack_resources() {
     }
     let (links_server, links_ziel) = server_und_ziel("links").await;
     let (rechts_server, rechts_ziel) = server_und_ziel("rechts").await;
-    let mut links = erfasse(links_server);
-    let mut rechts = erfasse(rechts_server);
+    let links = erfasse(links_server);
+    let rechts = erfasse(rechts_server);
     let lauf = EngineLauf::starten();
     let running = lauf
         .engine
