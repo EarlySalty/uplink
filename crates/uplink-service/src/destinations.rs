@@ -1,5 +1,22 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TwitchOutputMode {
+    #[default]
+    Single,
+    Enhanced,
+}
+
+impl TwitchOutputMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Single => "single",
+            Self::Enhanced => "enhanced",
+        }
+    }
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
