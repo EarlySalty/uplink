@@ -856,4 +856,83 @@ mod tests {
         .await
         .expect("früher Eingangsfehler muss ohne Worker-/Ausgangsstart abschließen");
     }
+
+    async fn stopped_endpoint(name: &'static str) -> PublishTarget {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let mut target = target(name, port);
+        target.endpoint = format!("rtmp://localhost:{port}/live");
+        target.allow_unencrypted = true;
+        target
+    }
+
+    #[tokio::test]
+    async fn video_backpressure_isolates_only_the_stalled_sink() {
+        let stalled_limits = MediaLimits {
+            queue_events: 1,
+            ..MediaLimits::default()
+        };
+        let stalled =
+            RunningPusher::spawn(stopped_endpoint("stalled").await, stalled_limits).unwrap();
+        let healthy =
+            RunningPusher::spawn(stopped_endpoint("healthy").await, MediaLimits::default())
+                .unwrap();
+        let sinks = Arc::new(Mutex::new(vec![
+            Sink {
+                pusher: Some(stalled),
+                routing: Routing {
+                    group: Some(0),
+                    video: vec![(Some(0), 0)],
+                    audio: Vec::new(),
+                    failure: None,
+                },
+                failure: None,
+            },
+            Sink {
+                pusher: Some(healthy),
+                routing: Routing {
+                    group: Some(0),
+                    video: vec![(Some(0), 3)],
+                    audio: Vec::new(),
+                    failure: None,
+                },
+                failure: None,
+            },
+        ]));
+        let body: Arc<[u8]> = Arc::from(&b"\x17\x01\x00\x00\x00"[..]);
+        let limits = MediaLimits::default();
+        distribute(
+            Arc::new(FlvTag::new(9, 0, body.clone(), 64).unwrap()),
+            Some(0),
+            &sinks,
+            &limits,
+        );
+        assert!(sinks.lock().unwrap()[0].failure.is_none());
+        distribute(
+            Arc::new(FlvTag::new(9, 40, body, 64).unwrap()),
+            Some(0),
+            &sinks,
+            &limits,
+        );
+        assert_eq!(
+            sinks.lock().unwrap()[0].failure,
+            Some(MediaError::Backpressure),
+            "Ein volles Ziel meldet Rückdruck als eigenen Fehler"
+        );
+        distribute(
+            Arc::new(FlvTag::new(9, 80, Arc::from(&b"\x17\x01\x00\x00\x00"[..]), 64).unwrap()),
+            Some(0),
+            &sinks,
+            &limits,
+        );
+        assert_eq!(
+            sinks.lock().unwrap()[1].failure,
+            None,
+            "Der Rückdruck eines Ziels darf das gesunde Ziel nicht treffen"
+        );
+    }
 }
