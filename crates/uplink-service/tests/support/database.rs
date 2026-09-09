@@ -86,6 +86,8 @@ pub(crate) async fn fixture() -> (Database, Arc<ServiceState>) {
         "CREATE TABLE relay.sessions(id bigserial PRIMARY KEY,streamer_id bigint NOT NULL,started_at timestamptz NOT NULL,ended_at timestamptz,ingest_protocol text NOT NULL,ingest_codec text,profile_json jsonb NOT NULL,end_reason text)",
         include_str!("../../../../db/migrations/20260908_destination_fences.sql"),
         include_str!("../../../../db/migrations/20260908_twitch_audio_mode.sql"),
+        include_str!("../../../../db/migrations/20260909_hochkant_layouts.sql"),
+        include_str!("../../../../db/migrations/20260909_hochkant_destinations.sql"),
     ] {
         store.query(sql, &[]).await.unwrap();
     }
@@ -112,7 +114,7 @@ pub(crate) async fn fixture() -> (Database, Arc<ServiceState>) {
             api: Secret::new(b"synthetic-api".to_vec()),
             admin: Secret::new(vec![]),
             database: Secret::new(vec![]),
-            bot_internal: Secret::new(vec![]),
+            bot_internal: Secret::new(b"synthetic-bot-internal".to_vec()),
             encryption,
             tls_material: None,
         }),
