@@ -381,11 +381,14 @@ impl<T> Task<T> {
     fn neu(task: JoinHandle<T>) -> Self {
         Self(Some(task))
     }
-    async fn fertig(mut self) -> T {
-        timeout(FRIST, self.0.take().unwrap())
+    async fn fertig(&mut self) -> T {
+        let task = self.0.as_mut().expect("Task fehlt bei der Auswertung");
+        let ergebnis = timeout(FRIST, task)
             .await
             .expect("Task überschritt die Frist")
-            .expect("Task wurde abgebrochen")
+            .expect("Task wurde abgebrochen");
+        let _ = self.0.take();
+        ergebnis
     }
 }
 impl<T> Drop for Task<T> {
@@ -430,8 +433,8 @@ async fn mixed_codec_program_output_preserves_headers_tracks_and_timebase() {
     drop(send);
     let (multi_server, multi_ziel) = server_und_ziel("multi").await;
     let (shared_server, shared_ziel) = server_und_ziel("shared").await;
-    let multi = erfasse(multi_server);
-    let shared = erfasse(shared_server);
+    let mut multi = erfasse(multi_server);
+    let mut shared = erfasse(shared_server);
     let lauf = EngineLauf::starten();
     let running = lauf
         .engine
@@ -586,7 +589,7 @@ async fn dead_target_does_not_stop_healthy_multitrack_target() {
     drop(send);
     let (tot_server, tot_ziel) = server_und_ziel("totes-ziel").await;
     let (gesund_server, gesund_ziel) = server_und_ziel("gesundes-ziel").await;
-    let tot = Task::neu(tokio::spawn(async move {
+    let mut tot = Task::neu(tokio::spawn(async move {
         let mut verbindung = tot_server.accept().await.unwrap();
         let mut bilder = 0;
         while let Some(event) = verbindung.next().await {
@@ -601,7 +604,7 @@ async fn dead_target_does_not_stop_healthy_multitrack_target() {
         }
         bilder
     }));
-    let gesund = erfasse(gesund_server);
+    let mut gesund = erfasse(gesund_server);
     let lauf = EngineLauf::starten();
     let running = lauf
         .engine
@@ -681,8 +684,8 @@ async fn explicit_stop_releases_multitrack_resources() {
     }
     let (links_server, links_ziel) = server_und_ziel("links").await;
     let (rechts_server, rechts_ziel) = server_und_ziel("rechts").await;
-    let links = erfasse(links_server);
-    let rechts = erfasse(rechts_server);
+    let mut links = erfasse(links_server);
+    let mut rechts = erfasse(rechts_server);
     let lauf = EngineLauf::starten();
     let running = lauf
         .engine
@@ -740,7 +743,7 @@ async fn explicit_stop_releases_multitrack_resources() {
             "Jedes Ziel endet beim Stopp als abgebrochen"
         );
     }
-    for ziel in [links, rechts] {
+    for mut ziel in [links, rechts] {
         let capture = timeout(Duration::from_secs(5), ziel.fertig())
             .await
             .expect("Zielaufnahme endet nach dem Stopp nicht");
