@@ -12,6 +12,7 @@ use uplink_media::{
 };
 
 pub struct HochkantWahl {
+    pub ziel: (u32, u32),
     pub composition: Composition,
     pub revision: LayoutRevision,
 }
@@ -227,6 +228,11 @@ pub fn twitch(
         )?;
         let layout = if item.canvas_index == 1 {
             let wahl = hochkant.expect("Canvas 1 nur mit Hochkantwahl");
+            if (item.width, item.height) != wahl.ziel {
+                return Err(
+                    "Twitch hat für die gewählte Hochkantfassung zusätzlich Stufen in einer anderen Größe angeboten; Bildgestaltung und Zielgröße passen nicht zusammen.",
+                );
+            }
             Some(
                 compile_portrait(
                     source.width,
@@ -395,6 +401,7 @@ mod tests {
 
     fn hochkant_wahl() -> HochkantWahl {
         HochkantWahl {
+            ziel: (1080, 1920),
             composition: Composition::Crop(Crop {
                 x: 96,
                 y: 54,
@@ -403,6 +410,21 @@ mod tests {
             }),
             revision: uplink_core::LayoutRevision { id: 7, revision: 3 },
         }
+    }
+
+    #[test]
+    fn hochkantstufe_in_fremder_groesse_wird_offen_abgewiesen() {
+        let fehler = match twitch(
+            konfiguration(vec![stufe(0, 0, 1280, 720), stufe(1, 1, 720, 1280)]),
+            0,
+            None,
+            Some(&hochkant_wahl()),
+            &quelle(),
+        ) {
+            Err(fehler) => fehler,
+            Ok(_) => panic!("Eine Hochkantstufe in fremder Größe wird abgewiesen"),
+        };
+        assert!(fehler.contains("Zielgröße"));
     }
 
     #[test]

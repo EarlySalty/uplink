@@ -565,6 +565,7 @@ async fn destinations(
             crate::media_status::active_profiles(sessions.first(), &platform, output_state);
         let active_revision = sessions
             .first()
+            .filter(|session| session.active)
             .and_then(|session| session.frozen_layouts.get(&platform))
             .and_then(|wahl| wahl["revision"].as_u64());
         let hochkant_enabled: bool = row.try_get(9).unwrap_or(false);

@@ -126,6 +126,7 @@ impl Coordinator {
                     wahl.layout
                         .kompiliere(source.width, source.height, breite, hoehe)?;
                 Some(crate::media_output::HochkantWahl {
+                    ziel: (breite, hoehe),
                     composition,
                     revision: uplink_core::LayoutRevision {
                         id: wahl.layout_id,
@@ -424,16 +425,6 @@ impl SessionProcessor for Coordinator {
             match ergebnis {
                 Ok(program) => {
                     if platform == "twitch" {
-                        if let Some(video) =
-                            program.video.iter().find(|video| video.canvas_index == 1)
-                        {
-                            let layout = video.layout.as_ref().expect("Canvas 1 trägt Layout");
-                            reservation.freeze_layout(
-                                "twitch",
-                                layout.revision.id,
-                                layout.revision.revision,
-                            );
-                        }
                         let key =
                             crate::media_output::capacity_key(prepared.observation(), &program);
                         let units = self
@@ -452,6 +443,16 @@ impl SessionProcessor for Coordinator {
                             );
                             reservation.block_output(platform, reason);
                             continue;
+                        }
+                        if let Some(video) =
+                            program.video.iter().find(|video| video.canvas_index == 1)
+                        {
+                            let layout = video.layout.as_ref().expect("Canvas 1 trägt Layout");
+                            reservation.freeze_layout(
+                                "twitch",
+                                layout.revision.id,
+                                layout.revision.revision,
+                            );
                         }
                     }
                     programs.push(program);
