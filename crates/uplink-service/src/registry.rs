@@ -15,6 +15,7 @@ struct State {
     total: usize,
     per_tenant: usize,
     recent: VecDeque<(u64, SessionStatus)>,
+    output_blocks: VecDeque<(u64, String, &'static str, std::time::Instant)>,
 }
 #[derive(Clone, serde::Serialize)]
 pub struct SessionStatus {
@@ -27,6 +28,7 @@ pub struct SessionStatus {
     pub error: Option<&'static str>,
     pub ingest_end_reason: Option<String>,
     pub blocked_outputs: std::collections::BTreeMap<String, &'static str>,
+    pub output_notices: std::collections::BTreeMap<String, &'static str>,
     pub outputs: Option<serde_json::Value>,
     pub source_observation: Option<serde_json::Value>,
     pub frozen_layouts: serde_json::Value,
@@ -78,6 +80,7 @@ impl Registry {
             total,
             per_tenant,
             recent: VecDeque::new(),
+            output_blocks: VecDeque::new(),
         }))))
     }
     pub fn configure_capacity(&self, limit: u32, legacy_units: u32) -> Result<(), &'static str> {
@@ -131,6 +134,7 @@ impl Registry {
                     error: None,
                     ingest_end_reason: None,
                     blocked_outputs: std::collections::BTreeMap::new(),
+                    output_notices: std::collections::BTreeMap::new(),
                     outputs: None,
                     source_observation: None,
                     frozen_layouts: serde_json::Value::Null,
@@ -257,8 +261,54 @@ impl Reservation {
         });
     }
     pub fn block_output(&self, platform: String, message: &'static str) {
+        if self.record_output_block(&platform, message, std::time::Instant::now()) {
+            let platform = match platform.as_str() {
+                "twitch" | "youtube" | "kick" | "tiktok" => platform.as_str(),
+                _ => "unbekannt",
+            };
+            eprintln!(
+                "Uplink-Ausgabe blockiert: streamer_id={} platform={} Grund={}",
+                self.tenant, platform, message
+            );
+        }
+    }
+    fn record_output_block(
+        &self,
+        platform: &str,
+        message: &'static str,
+        now: std::time::Instant,
+    ) -> bool {
+        let Some(registry) = self.registry.upgrade() else {
+            return false;
+        };
+        let mut state = registry.lock().unwrap_or_else(|error| error.into_inner());
+        let Some((_, status)) = state.active.get_mut(&self.id) else {
+            return false;
+        };
+        status.blocked_outputs.insert(platform.to_owned(), message);
+        state.output_blocks.retain(|(_, _, _, seen)| {
+            now.saturating_duration_since(*seen) < std::time::Duration::from_secs(300)
+        });
+        let repeated = state
+            .output_blocks
+            .iter()
+            .any(|(tenant, target, reason, _)| {
+                *tenant == self.tenant && target == platform && *reason == message
+            });
+        state
+            .output_blocks
+            .retain(|(tenant, target, _, _)| *tenant != self.tenant || target != platform);
+        state
+            .output_blocks
+            .push_back((self.tenant, platform.to_owned(), message, now));
+        while state.output_blocks.len() > 1024 {
+            state.output_blocks.pop_front();
+        }
+        !repeated
+    }
+    pub fn output_notice(&self, platform: String, message: &'static str) {
         self.update(|state| {
-            state.blocked_outputs.insert(platform, message);
+            state.output_notices.insert(platform, message);
         });
     }
     pub fn fail(&self, message: &'static str) {
@@ -399,6 +449,49 @@ impl Drop for Reservation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn output_block_journal_is_debounced_across_reconnects_and_bounded() {
+        let registry = Registry::new(2, 1).unwrap();
+        let now = std::time::Instant::now();
+        for attempt in 0..12 {
+            let reservation = registry.reserve(538636411).unwrap();
+            assert_eq!(
+                reservation.record_output_block("twitch", "Profil fehlt.", now),
+                attempt == 0
+            );
+            assert_eq!(
+                registry.status(538636411)[0].blocked_outputs["twitch"],
+                "Profil fehlt."
+            );
+        }
+        let reservation = registry.reserve(538636411).unwrap();
+        assert!(reservation.record_output_block("twitch", "Kapazität fehlt.", now));
+        assert!(reservation.record_output_block("youtube", "Kapazität fehlt.", now));
+        assert!(reservation.record_output_block(
+            "twitch",
+            "Kapazität fehlt.",
+            now + std::time::Duration::from_secs(301)
+        ));
+        drop(reservation);
+        for tenant in 1..=1100 {
+            let reservation = registry.reserve(tenant).unwrap();
+            assert!(reservation.record_output_block("twitch", "Profil fehlt.", now));
+        }
+        assert_eq!(registry.0.lock().unwrap().output_blocks.len(), 1024);
+    }
+
+    #[test]
+    fn media_updates_preserve_unmeasured_output_notice() {
+        let registry = Registry::new(1, 1).unwrap();
+        let reservation = registry.reserve(11).unwrap();
+        reservation.output_notice("twitch".into(), "Leiter ist nicht lastgemessen.");
+        reservation.media_status(serde_json::json!({"outputs":[]}));
+        assert_eq!(
+            registry.status(11)[0].output_notices["twitch"],
+            "Leiter ist nicht lastgemessen."
+        );
+    }
 
     #[test]
     fn eingefrorene_layoutrevision_erscheint_je_plattform_im_status() {

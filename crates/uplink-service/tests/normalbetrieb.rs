@@ -20,6 +20,12 @@ async fn normal_single_aac_live_mode_reaches_twitch_compatible_output() {
 
 #[tokio::test]
 #[ignore = "Benötigt isolierte PostgreSQL 16 und geprüften FFmpeg 8."]
+async fn twitch_without_enhanced_profiles_sends_desired_output_and_stays_alive() {
+    normal_case_mode(true, Some("live"), false, None, None, true).await;
+}
+
+#[tokio::test]
+#[ignore = "Benötigt isolierte PostgreSQL 16 und geprüften FFmpeg 8."]
 async fn missing_separate_vod_audio_stops_only_twitch() {
     normal_audio_case(true, Some("separate_vod"), false).await;
 }
@@ -38,7 +44,7 @@ async fn rejected_platform_publish_marks_the_entire_failed_session() {
 
 #[tokio::test]
 #[ignore = "Benötigt isolierte PostgreSQL 16 und geprüften FFmpeg 8."]
-async fn production_twitch_without_generation_preserves_healthy_youtube() {
+async fn production_twitch_with_profile_zero_capacity_and_no_generation_stays_blocked() {
     normal_case(true, None, false, Some(("11", 0)), None).await;
 }
 
@@ -70,12 +76,98 @@ async fn normal_audio_case(single_audio: bool, twitch_mode: Option<&str>, all_fa
     normal_case(single_audio, twitch_mode, all_failed, None, None).await;
 }
 
+async fn av1_bt709_fixture(ffmpeg: &std::path::Path) -> Vec<u8> {
+    use std::process::Stdio;
+    use tokio::io::AsyncWriteExt;
+    let mut child = tokio::process::Command::new(ffmpeg)
+        .args([
+            "-nostdin",
+            "-v",
+            "error",
+            "-f",
+            "flv",
+            "-i",
+            "pipe:0",
+            "-map",
+            "0",
+            "-c:a",
+            "copy",
+            "-c:v",
+            "libsvtav1",
+            "-flags",
+            "+global_header",
+            "-preset",
+            "11",
+            "-svtav1-params",
+            "lp=2",
+            "-crf",
+            "35",
+            "-b:v",
+            "0",
+            "-color_primaries",
+            "bt709",
+            "-color_trc",
+            "bt709",
+            "-colorspace",
+            "bt709",
+            "-color_range",
+            "tv",
+            "-f",
+            "flv",
+            "-flvflags",
+            "no_metadata+no_duration_filesize",
+            "pipe:1",
+        ])
+        .env_clear()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let write = tokio::spawn(async move {
+        stdin
+            .write_all(include_bytes!(
+                "../../../experiments/scuffle-probe/fixtures/av1.flv"
+            ))
+            .await
+            .unwrap();
+    });
+    let output = tokio::time::timeout(Duration::from_secs(10), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    write.await.unwrap();
+    assert!(output.status.success());
+    output.stdout
+}
+
 async fn normal_case(
     single_audio: bool,
     twitch_mode: Option<&str>,
     all_failed: bool,
     production: Option<(&'static str, i64)>,
     malformed_layout: Option<bool>,
+) {
+    normal_case_mode(
+        single_audio,
+        twitch_mode,
+        all_failed,
+        production,
+        malformed_layout,
+        false,
+    )
+    .await;
+}
+
+async fn normal_case_mode(
+    single_audio: bool,
+    twitch_mode: Option<&str>,
+    all_failed: bool,
+    production: Option<(&'static str, i64)>,
+    malformed_layout: Option<bool>,
+    unmeasured_twitch: bool,
 ) {
     use futures::FutureExt;
     use sha2::{Digest, Sha256};
@@ -148,6 +240,13 @@ async fn normal_case(
     let ca_path = database.directory.join("public-test-ca.pem");
     std::fs::write(&ca_path, &certificates.certificate_pem).unwrap();
     config.loopback_test_ca = Some(ca_path);
+    if let Some((_, generation)) = production {
+        config.media.enhanced.capacity_units = if generation == 0 { 0 } else { 2 };
+        config.media.enhanced.profiles = vec![uplink_service::config::CapacityProfile {
+            key: "synthetic-measured-profile".into(),
+            units: 1,
+        }];
+    }
     config.platforms.retain(|platform| {
         platform.name == healthy_platform
             || ((twitch_missing || production.is_some()) && platform.name == "twitch")
@@ -158,6 +257,9 @@ async fn normal_case(
         } else {
             "localhost".into()
         }];
+        if unmeasured_twitch && policy.name == "twitch" {
+            policy.allowed_hosts.push("ingest.example".into());
+        }
         policy.use_vod_audio = policy.name == "twitch" || !single_audio;
     }
     let valid = state
@@ -268,7 +370,14 @@ async fn normal_case(
     });
     let result = std::panic::AssertUnwindSafe(async {
         let producer = RunningPusher::start(PublishTarget { id:"synthetic-obs".into(), endpoint:format!("rtmps://localhost:{}/live",input.port()), playpath:PublishSecret::new(b"rsr_00000000000000000000000000000000".to_vec()).unwrap(), tls:Some(certificates.client.clone()), allowed_hosts:vec!["localhost".into()], allow_loopback:true, allow_unencrypted:false }, MediaLimits::default()).await.unwrap();
-        let mut source = FlvReader::new(&include_bytes!("../../../experiments/scuffle-probe/fixtures/h264.flv")[..], 65536);
+        let av1_fixture;
+        let source_bytes = if unmeasured_twitch {
+            av1_fixture = av1_bt709_fixture(&state.config.media.ffmpeg).await;
+            av1_fixture.as_slice()
+        } else {
+            &include_bytes!("../../../experiments/scuffle-probe/fixtures/h264.flv")[..]
+        };
+        let mut source = FlvReader::new(source_bytes, 65536);
         while let Some(tag) = source.next().await.unwrap() {
             if single_audio && tag.audio_track().unwrap() == Some(1) { continue; }
             producer.try_send(Arc::new(tag)).unwrap();
@@ -292,6 +401,10 @@ async fn normal_case(
                     assert_eq!(healthy["publication_confirmed"],false);
                     if healthy_platform == "twitch" {
                         assert_eq!(healthy["active_audio_mode"],twitch_mode.unwrap());
+                    }
+                    if unmeasured_twitch {
+                        assert!(healthy["reason"].as_str().unwrap().contains("Leiter ist nicht lastgemessen"));
+                        assert_eq!(broker_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
                     }
                     if twitch_missing {
                         let twitch = status["destinations"].as_array().unwrap().iter().find(|item| item["platform"]=="twitch").unwrap();
@@ -317,6 +430,13 @@ async fn normal_case(
                 tokio::time::sleep(Duration::from_millis(30)).await;
             }
         }).await.expect("Gesunder Ausgang muss rechtzeitig Medien liefern");
+        if unmeasured_twitch {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let session = state.registry.status(11);
+            assert!(session[0].active);
+            assert!(session[0].error.is_none());
+            assert!(!receiving.is_finished());
+        }
         let me:serde_json::Value=http.get(format!("http://{api}/v1/me?streamer_id=11")).header("X-Relay-Auth","synthetic-api").send().await.unwrap().json().await.unwrap();
         assert_eq!(me["session"]["source_observation"]["width"],320);
         assert_eq!(me["session"]["source_observation"]["height"],180);
@@ -335,7 +455,11 @@ async fn normal_case(
         producer.finish().await.unwrap();
         let (video, audio, _report) = tokio::time::timeout(Duration::from_secs(15), &mut receiving).await.unwrap().unwrap();
         assert_eq!(video,if all_failed { 0 } else { 50 });
-        let reference:serde_json::Value=serde_json::from_str(include_str!("../../../experiments/scuffle-probe/fixtures/h264.ffprobe.json")).unwrap();
+        let reference:serde_json::Value=serde_json::from_str(if unmeasured_twitch {
+            include_str!("../../../experiments/scuffle-probe/fixtures/av1.ffprobe.json")
+        } else {
+            include_str!("../../../experiments/scuffle-probe/fixtures/h264.ffprobe.json")
+        }).unwrap();
         assert_eq!(audio.len(),if all_failed {0} else if single_audio {1} else {2},"Keine erfundene VOD-Ersatzspur");
         for wire in 0..if all_failed {0} else if single_audio {1u8} else {2} {
             let expected:Vec<_>=reference["packets"].as_array().unwrap().iter().filter(|packet| packet["stream_index"]==u64::from(wire)+1).map(|packet|(packet["dts"].as_u64().unwrap() as u32,packet["data_hash"].as_str().unwrap().to_owned())).collect();

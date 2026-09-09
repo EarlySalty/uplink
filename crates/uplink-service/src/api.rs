@@ -633,7 +633,7 @@ fn output_status(
                 .and_then(|o| o["received_events"].as_u64())
                 .is_some_and(|events| events > 0)
             {
-                ("sending", None)
+                ("sending", session.output_notices.get(platform).copied())
             } else {
                 (
                     "starting",
@@ -641,7 +641,9 @@ fn output_status(
                 )
             }
         }
-        Some(value) if value == "starting" && session.active => ("starting", None),
+        Some(value) if value == "starting" && session.active => {
+            ("starting", session.output_notices.get(platform).copied())
+        }
         _ if session.error.is_some() => ("failed", session.error),
         _ if !session.active => (
             "finished",
