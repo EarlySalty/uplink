@@ -18,23 +18,39 @@ pub struct ServiceAuthorizer {
     reservations: Mutex<HashMap<AuthorizedSession, Arc<Reservation>>>,
     recorder: SessionRecorder,
 }
+#[derive(Clone)]
 struct SessionRecorder {
-    sender: mpsc::Sender<(SessionCompletion, tokio::sync::OwnedSemaphorePermit)>,
+    tasks: Arc<Mutex<JoinSet<()>>>,
+    store: Arc<crate::store::Store>,
     slots: Arc<tokio::sync::Semaphore>,
     capacity: u32,
     failed: Arc<AtomicBool>,
 }
 impl SessionRecorder {
     fn new(state: &ServiceState) -> Self {
-        let (sender, mut receiver) = mpsc::channel::<(
-            SessionCompletion,
-            tokio::sync::OwnedSemaphorePermit,
-        )>(state.config.max_sessions);
-        let store = state.store.clone();
-        let failed = Arc::new(AtomicBool::new(false));
-        let worker_failed = failed.clone();
-        tokio::spawn(async move {
-            while let Some((record, _permit)) = receiver.recv().await {
+        Self {
+            tasks: Arc::new(Mutex::new(JoinSet::new())),
+            store: state.store.clone(),
+            slots: Arc::new(tokio::sync::Semaphore::new(state.config.max_sessions)),
+            capacity: state.config.max_sessions as u32,
+            failed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+    fn joined(&self, result: Result<(), tokio::task::JoinError>) {
+        if result.is_err() {
+            self.failed.store(true, Ordering::Release);
+            eprintln!("Uplink-Abschlussaufgabe wurde vor ihrem bestätigten Ende abgebrochen.");
+        }
+    }
+    fn record(&self, record: SessionCompletion, permit: tokio::sync::OwnedSemaphorePermit) {
+        let mut tasks = self.tasks.lock().unwrap_or_else(|error| error.into_inner());
+        while let Some(result) = tasks.try_join_next() {
+            self.joined(result);
+        }
+        let store = self.store.clone();
+        let worker_failed = self.failed.clone();
+        tasks.spawn(async move {
+                let _permit = permit;
                 let streamer_id = i64::try_from(record.streamer_id);
                 let started_at = record.ended_at.checked_sub(record.duration);
                 let result = match (streamer_id, started_at) {
@@ -51,23 +67,29 @@ impl SessionRecorder {
                         record.streamer_id
                     );
                 }
-            }
         });
-        Self {
-            sender,
-            slots: Arc::new(tokio::sync::Semaphore::new(state.config.max_sessions)),
-            capacity: state.config.max_sessions as u32,
-            failed,
-        }
     }
     async fn drained(&self) -> Result<(), &'static str> {
-        let _idle = tokio::time::timeout(
-            crate::store::CLEANUP_GRACE * 2 + std::time::Duration::from_secs(20),
+        let deadline = tokio::time::Instant::now()
+            + crate::store::QUERY_LIMIT * 2
+            + crate::store::CLEANUP_GRACE * 2
+            + std::time::Duration::from_secs(1);
+        let _idle = tokio::time::timeout_at(
+            deadline,
             self.slots.clone().acquire_many_owned(self.capacity),
         )
         .await
         .map_err(|_| "Streamabschlüsse konnten nicht rechtzeitig gespeichert werden.")?
         .map_err(|_| "Streamabschluss ist nicht verfügbar.")?;
+        let mut tasks =
+            std::mem::take(&mut *self.tasks.lock().unwrap_or_else(|error| error.into_inner()));
+        tokio::time::timeout_at(deadline, async {
+            while let Some(result) = tasks.join_next().await {
+                self.joined(result);
+            }
+        })
+        .await
+        .map_err(|_| "Streamabschlussaufgaben konnten nicht rechtzeitig beendet werden.")?;
         if self.failed.load(Ordering::Acquire) {
             Err("Mindestens ein Streamabschluss konnte nicht gespeichert werden.")
         } else {
@@ -109,15 +131,11 @@ impl Authorizer for ServiceAuthorizer {
             return Err(());
         }
         let mut reservation = self.state.registry.reserve(tenant).map_err(|_| ())?;
-        let sender = self.recorder.sender.clone();
-        let failed = self.recorder.failed.clone();
+        let recorder = self.recorder.clone();
         reservation.on_completion(move |record| {
             eprintln!("Uplink-Eingang beendet: streamer_id={} duration_ms={} source_tracks={} EndReason={}",
                 record.streamer_id, record.duration.as_millis(), record.source_tracks, record.end_reason);
-            if let Err(error) = sender.try_send((record, permit)) {
-                failed.store(true, Ordering::Release);
-                eprintln!("Uplink-Abschluss konnte nicht gespeichert werden: streamer_id={} error=Speicherung ist nicht verfügbar.", error.into_inner().0.streamer_id);
-            }
+            recorder.record(record, permit);
         });
         let reservation = Arc::new(reservation);
         let session = AuthorizedSession::new(tenant, reservation.id()).map_err(|_| ())?;
@@ -178,6 +196,14 @@ pub async fn serve_with_ready<P: SessionProcessor>(
     ready: Option<tokio::sync::oneshot::Sender<(std::net::SocketAddr, std::net::SocketAddr)>>,
 ) -> Result<(), &'static str> {
     let authorizer = Arc::new(ServiceAuthorizer::new(state.clone()));
+    let media_limits = state.config.media_limits();
+    let coordinator_grace = media_limits.startup_timeout * 3
+        + media_limits.write_timeout
+        + media_limits.shutdown_timeout * (media_limits.max_encode_groups as u32 + 6)
+        + crate::store::QUERY_LIMIT
+        + crate::store::CLEANUP_GRACE
+        + std::time::Duration::from_secs(1);
+    let tasks_grace = coordinator_grace + std::time::Duration::from_secs(1);
     let http_shutdown_grace = std::time::Duration::from_secs(state.config.request_timeout_seconds)
         + crate::store::CLEANUP_GRACE
         + std::time::Duration::from_secs(1);
@@ -274,7 +300,7 @@ pub async fn serve_with_ready<P: SessionProcessor>(
                             _=media_stopped.changed()=>{
                                 connection.stop_consumer();
                                 drop(sender);
-                                match tokio::time::timeout(std::time::Duration::from_secs(8),processing).await {
+                                match tokio::time::timeout(coordinator_grace,processing).await {
                                     Ok(Err(error)) => reservation.fail(error),
                                     Err(_) => reservation.fail("Medienausgabe konnte beim Dienststopp nicht rechtzeitig schließen."),
                                     Ok(Ok(())) => {}
@@ -285,7 +311,7 @@ pub async fn serve_with_ready<P: SessionProcessor>(
                             event = connection.next() => {
                                 let Some(event) = event else {
                                     drop(sender);
-                                    match tokio::time::timeout(std::time::Duration::from_secs(8),processing).await {
+                                    match tokio::time::timeout(coordinator_grace,processing).await {
                                         Ok(Err(error)) => reservation.fail(error),
                                         Err(_) => reservation.fail("Medienausgabe konnte nach dem Eingangsende nicht rechtzeitig schließen."),
                                         Ok(Ok(())) => {}
@@ -300,7 +326,7 @@ pub async fn serve_with_ready<P: SessionProcessor>(
                                     };
                                     connection.stop_consumer();
                                     drop(sender);
-                                    match tokio::time::timeout(std::time::Duration::from_secs(8),processing).await {
+                                    match tokio::time::timeout(coordinator_grace,processing).await {
                                         Ok(Err(error)) => reservation.fail(error),
                                         _ => reservation.fail(fallback),
                                     }
@@ -317,7 +343,7 @@ pub async fn serve_with_ready<P: SessionProcessor>(
         }
     }
     let _ = stop_media.send(true);
-    let drained = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    let drained = tokio::time::timeout(tasks_grace, async {
         while tasks.join_next().await.is_some() {}
     })
     .await

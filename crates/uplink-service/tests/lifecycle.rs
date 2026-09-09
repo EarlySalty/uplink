@@ -24,7 +24,18 @@ impl uplink_service::runtime::SessionProcessor for RejectOutput {
 async fn completed_connections(
     write_failure: bool,
 ) -> (Vec<serde_json::Value>, Result<(), &'static str>) {
+    completed_connections_with_delay(write_failure, false).await
+}
+
+async fn completed_connections_with_delay(
+    write_failure: bool,
+    delayed_inserts: bool,
+) -> (Vec<serde_json::Value>, Result<(), &'static str>) {
     let (database, state) = database::fixture().await;
+    if delayed_inserts {
+        state.store.query("CREATE FUNCTION relay.delayed_session() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN PERFORM pg_sleep(9); RETURN NEW; END'", &[]).await.unwrap();
+        state.store.query("CREATE TRIGGER delayed_session BEFORE INSERT ON relay.sessions FOR EACH ROW EXECUTE FUNCTION relay.delayed_session()", &[]).await.unwrap();
+    }
     if write_failure {
         state
             .store
@@ -371,6 +382,7 @@ struct DelayedCleanup {
     ready: tokio::sync::Notify,
     complete: tokio::sync::Notify,
     keep_receiver: bool,
+    delay: Duration,
 }
 impl uplink_service::runtime::SessionProcessor for DelayedCleanup {
     async fn process(
@@ -391,6 +403,7 @@ impl uplink_service::runtime::SessionProcessor for DelayedCleanup {
             .unwrap();
         self.ready.notify_one();
         self.complete.notified().await;
+        tokio::time::sleep(self.delay).await;
         reservation
             .media_diagnostic(serde_json::json!({"phase":"prepare_cleanup","error":"ProbeFailed"}));
         drop(receiver);
@@ -407,6 +420,7 @@ async fn delayed_coordinator_case(keep_receiver: bool) {
         ready: tokio::sync::Notify::new(),
         complete: tokio::sync::Notify::new(),
         keep_receiver,
+        delay: Duration::ZERO,
     });
     let service = tokio::spawn(uplink_service::runtime::serve_with_ready(
         state.clone(),
@@ -488,4 +502,100 @@ async fn closed_receiver_preserves_delayed_coordinator_error_and_diagnostic() {
 #[ignore = "Benötigt isoliertes PostgreSQL 16 und TLS."]
 async fn full_receiver_preserves_delayed_coordinator_error_and_diagnostic() {
     delayed_coordinator_case(true).await;
+}
+
+async fn long_cleanup_case(shutdown: bool) {
+    let (database, state) = database::fixture().await;
+    let certificates = tls::test_tls();
+    let (ready, bound) = tokio::sync::oneshot::channel();
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let processor = Arc::new(DelayedCleanup {
+        ready: tokio::sync::Notify::new(),
+        complete: tokio::sync::Notify::new(),
+        keep_receiver: false,
+        delay: Duration::from_secs(11),
+    });
+    let service = tokio::spawn(uplink_service::runtime::serve_with_ready(
+        state.clone(),
+        certificates.server,
+        processor.clone(),
+        async {
+            let _ = stopped.await;
+        },
+        Some(ready),
+    ));
+    let (_, address) = bound.await.unwrap();
+    let socket = tokio::net::TcpStream::connect(address).await.unwrap();
+    let mut peer = tokio_rustls::TlsConnector::from(certificates.client)
+        .connect("localhost".try_into().unwrap(), socket)
+        .await
+        .unwrap();
+    rtmp::publish(&mut peer, "rsr_00000000000000000000000000000000").await;
+    rtmp::message(&mut peer, 8, 1, &[0xaf, 0, 0x11, 0x90]).await;
+    tokio::time::timeout(Duration::from_secs(3), processor.ready.notified())
+        .await
+        .unwrap();
+    if !shutdown {
+        rtmp::stop(&mut peer).await;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while state.registry.status(11)[0].ingest_end_reason.is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+    processor.complete.notify_one();
+    stop.send(()).unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(15), service)
+        .await
+        .unwrap()
+        .unwrap();
+    let status = state.registry.status(11)[0].clone();
+    let rows = state
+        .store
+        .query(
+            "SELECT profile_json FROM relay.sessions WHERE streamer_id=11",
+            &[],
+        )
+        .await
+        .unwrap();
+    drop(peer);
+    drop(state);
+    database.stop().await;
+    assert_eq!(
+        status.error,
+        Some("Die Medienprüfung ist nach dem Aufräumen fehlgeschlagen."),
+        "Zulässiger Medienabschluss wurde vor seiner endgültigen Diagnose gekappt"
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].get::<_, serde_json::Value>(0)["media_diagnostic"]["error"],
+        "ProbeFailed"
+    );
+    result.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "Benötigt isoliertes PostgreSQL 16, TLS und elf Sekunden echtes Mediencleanup."]
+async fn eof_preserves_coordinator_cleanup_beyond_eight_seconds() {
+    long_cleanup_case(false).await;
+}
+
+#[tokio::test]
+#[ignore = "Benötigt isoliertes PostgreSQL 16, TLS und elf Sekunden echtes Mediencleanup."]
+async fn shutdown_preserves_coordinator_cleanup_beyond_eight_seconds() {
+    long_cleanup_case(true).await;
+}
+
+#[tokio::test]
+#[ignore = "Benötigt isoliertes PostgreSQL 16, TLS und drei verzögerte Abschlussinserts."]
+async fn shutdown_drains_all_three_slow_session_inserts() {
+    let (rows, stopped) = completed_connections_with_delay(false, true).await;
+    assert_eq!(
+        rows.len(),
+        3,
+        "Der Dienststopp muss alle drei wartenden Abschlussinserts einsammeln"
+    );
+    stopped.unwrap();
 }

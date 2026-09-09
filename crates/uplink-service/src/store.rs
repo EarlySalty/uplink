@@ -7,7 +7,7 @@ use tokio_postgres::{NoTls, Row, types::ToSql};
 
 tokio::task_local! { pub static REQUEST_DEADLINE: Instant; }
 pub const CLEANUP_GRACE: Duration = Duration::from_secs(2);
-const QUERY_LIMIT: Duration = Duration::from_secs(10);
+pub(crate) const QUERY_LIMIT: Duration = Duration::from_secs(10);
 
 pub(crate) struct CheckedStatement<'a> {
     pub sql: &'a str,
