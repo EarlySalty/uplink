@@ -194,11 +194,18 @@ impl SessionProcessor for Coordinator {
         if outputs.is_empty() {
             return Err("Kein sicheres Ausgabeziel ist verfügbar; siehe Zielstatus.");
         }
+        let mut diagnostic = uplink_media::PreparationDiagnostic::default();
         let running = self
             .engine
-            .prepare_and_start(DesiredSessionSpec { first, outputs }, events)
+            .prepare_and_start_diagnosed(
+                DesiredSessionSpec { first, outputs },
+                events,
+                &mut diagnostic,
+            )
             .await
-            .map_err(|_| "Medienprofil konnte nicht sicher vorbereitet werden.")?;
+            .map_err(|error| {
+                preparation_failure(&reservation, error, serde_json::json!(diagnostic))
+            })?;
         if let Some(observation) = running.source_observation() {
             reservation.observation(
                 serde_json::to_value(observation)
@@ -219,7 +226,11 @@ impl SessionProcessor for Coordinator {
             serde_json::to_value(&report.status)
                 .map_err(|_| "Ausgangsstatus konnte nicht dargestellt werden.")?,
         );
-        if report.error.is_some() {
+        if let Some(error) = report.error {
+            let mut diagnostic = serde_json::json!(diagnostic);
+            diagnostic["phase"] = serde_json::json!("media_output");
+            diagnostic["error"] = serde_json::json!(error);
+            reservation.media_diagnostic(diagnostic);
             return Err("Medienausgabe wurde mit Fehler beendet.");
         }
         if report.status.outputs.is_empty()
@@ -235,8 +246,44 @@ impl SessionProcessor for Coordinator {
     }
 }
 
+fn preparation_failure(
+    reservation: &crate::registry::Reservation,
+    error: uplink_media::MediaError,
+    diagnostic: serde_json::Value,
+) -> &'static str {
+    let mut diagnostic = diagnostic;
+    diagnostic["error"] = serde_json::json!(error);
+    reservation.media_diagnostic(diagnostic);
+    "Medienprofil konnte nicht sicher vorbereitet werden."
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn preparation_failure_keeps_concrete_media_error_in_internal_completion() {
+        let registry = crate::registry::Registry::new(1, 1).unwrap();
+        let mut reservation = registry.reserve(538636411).unwrap();
+        let completion = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured = completion.clone();
+        reservation.on_completion(move |value| *captured.lock().unwrap() = Some(value));
+        let user_message = super::preparation_failure(
+            &reservation,
+            uplink_media::MediaError::UnsupportedProfile,
+            serde_json::json!({"phase":"graph"}),
+        );
+        assert_eq!(
+            user_message,
+            "Medienprofil konnte nicht sicher vorbereitet werden."
+        );
+        drop(reservation);
+        let captured = completion.lock().unwrap();
+        let diagnostic = &captured.as_ref().unwrap().profile["media_diagnostic"];
+        assert_eq!(
+            diagnostic["error"], "unsupported_profile",
+            "Die konkrete MediaError-Variante muss den Coordinator überleben"
+        );
+        assert_eq!(diagnostic["phase"], "graph");
+    }
     use super::secure_default;
     #[test]
     fn only_known_twitch_default_uses_the_official_tls_endpoint() {

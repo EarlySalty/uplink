@@ -16,6 +16,7 @@ use uplink_ingest::{MediaEvent, TrackIdentity, WireTrack};
 use zeroize::Zeroizing;
 
 pub use engine::{MediaEngine, MediaObserver, RunningMedia};
+pub use prepare::PreparationDiagnostic;
 
 pub type Result<T> = std::result::Result<T, MediaError>;
 
