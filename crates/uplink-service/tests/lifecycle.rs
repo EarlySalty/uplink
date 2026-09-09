@@ -255,3 +255,114 @@ fn session_end_writes_one_safe_journal_line_with_coordinator_reason() {
     assert!(!stderr.contains("rsr_"));
     assert!(!stderr.contains("playpath"));
 }
+
+#[tokio::test]
+#[ignore = "Benötigt isoliertes PostgreSQL 16 und TLS."]
+async fn occupied_database_capacity_delays_completion_without_losing_it() {
+    let (database, state) = database::fixture().await;
+    let certificates = tls::test_tls();
+    let (ready, bound) = tokio::sync::oneshot::channel();
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let mut service = tokio::spawn(uplink_service::runtime::serve_with_ready(
+        state.clone(),
+        certificates.server,
+        Arc::new(RejectOutput),
+        async {
+            let _ = stopped.await;
+        },
+        Some(ready),
+    ));
+    let (_, address) = bound.await.unwrap();
+    let socket = tokio::net::TcpStream::connect(address).await.unwrap();
+    let mut peer = tokio_rustls::TlsConnector::from(certificates.client)
+        .connect("localhost".try_into().unwrap(), socket)
+        .await
+        .unwrap();
+    rtmp::publish(&mut peer, "rsr_00000000000000000000000000000000").await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while state.registry.active_count() == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let (observer, driver) = tokio_postgres::Config::new()
+        .host(database.directory.to_str().unwrap())
+        .user("uplink_test")
+        .dbname("postgres")
+        .connect(tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    let driver = tokio::spawn(driver);
+    observer
+        .query("SELECT pg_advisory_lock(819246)", &[])
+        .await
+        .unwrap();
+    let mut busy = tokio::task::JoinSet::new();
+    for _ in 0..4 {
+        let store = state.store.clone();
+        busy.spawn(async move {
+            store
+                .query("SELECT pg_advisory_xact_lock(819246)", &[])
+                .await
+        });
+    }
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let count: i64 = observer.query_one("SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() AND wait_event='advisory'", &[]).await.unwrap().get(0);
+            if count == 4 { break; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+    rtmp::stop(&mut peer).await;
+    let mut reply = Vec::new();
+    let _ = tokio::time::timeout(
+        Duration::from_secs(3),
+        (&mut peer).take(16 * 1024).read_to_end(&mut reply),
+    )
+    .await
+    .unwrap();
+    stop.send(()).unwrap();
+    let early = tokio::time::timeout(Duration::from_millis(150), &mut service).await;
+    observer
+        .query("SELECT pg_advisory_unlock(819246)", &[])
+        .await
+        .unwrap();
+    while let Some(result) = busy.join_next().await {
+        result.unwrap().unwrap();
+    }
+    let (waited, result) = match early {
+        Ok(result) => (false, result.unwrap()),
+        Err(_) => (
+            true,
+            tokio::time::timeout(Duration::from_secs(3), service)
+                .await
+                .unwrap()
+                .unwrap(),
+        ),
+    };
+    let rows = state
+        .store
+        .query(
+            "SELECT end_reason FROM relay.sessions WHERE streamer_id=11",
+            &[],
+        )
+        .await
+        .unwrap();
+    drop(observer);
+    driver.await.unwrap().unwrap();
+    drop(peer);
+    drop(state);
+    database.stop().await;
+    assert_eq!(
+        rows.len(),
+        1,
+        "Belegte Store-Kapazität darf den einzigen Sessionabschluss nicht verwerfen"
+    );
+    assert_eq!(rows[0].get::<_, String>(0), "ExplicitStop");
+    assert!(
+        waited,
+        "Dienststopp muss auf den noch ausstehenden Abschluss warten"
+    );
+    result.unwrap();
+}

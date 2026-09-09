@@ -92,6 +92,29 @@ impl Store {
     ) -> Result<Vec<Row>, &'static str> {
         self.query_with_retention(sql, params, None).await
     }
+    pub(crate) async fn query_completion(
+        &self,
+        sql: &str,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> Result<Vec<Row>, &'static str> {
+        let slot = timeout_at(
+            Instant::now() + QUERY_LIMIT + CLEANUP_GRACE,
+            self.slots.clone().acquire_owned(),
+        )
+        .await
+        .map_err(|_| "Datenbankkapazität für den Streamabschluss wurde nicht rechtzeitig frei.")?
+        .map_err(|_| "Datenbank ist nicht verfügbar.")?;
+        self.query_statements_reserved(
+            &[CheckedStatement {
+                sql,
+                expected_rows: None,
+            }],
+            params,
+            None,
+            slot,
+        )
+        .await
+    }
     pub(crate) async fn query_with_retention(
         &self,
         sql: &str,
@@ -130,6 +153,16 @@ impl Store {
             .clone()
             .try_acquire_owned()
             .map_err(|_| "Datenbank ist ausgelastet.")?;
+        self.query_statements_reserved(statements, params, retention, slot)
+            .await
+    }
+    async fn query_statements_reserved(
+        &self,
+        statements: &[CheckedStatement<'_>],
+        params: &[&(dyn ToSql + Sync)],
+        retention: Option<Arc<dyn std::any::Any + Send + Sync>>,
+        slot: tokio::sync::OwnedSemaphorePermit,
+    ) -> Result<Vec<Row>, &'static str> {
         let deadline = REQUEST_DEADLINE
             .try_with(|value| *value)
             .unwrap_or_else(|_| Instant::now() + QUERY_LIMIT)

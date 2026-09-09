@@ -19,15 +19,17 @@ pub struct ServiceAuthorizer {
     recorder: SessionRecorder,
 }
 struct SessionRecorder {
-    sender: mpsc::UnboundedSender<(SessionCompletion, tokio::sync::OwnedSemaphorePermit)>,
+    sender: mpsc::Sender<(SessionCompletion, tokio::sync::OwnedSemaphorePermit)>,
     slots: Arc<tokio::sync::Semaphore>,
     capacity: u32,
     failed: Arc<AtomicBool>,
 }
 impl SessionRecorder {
     fn new(state: &ServiceState) -> Self {
-        let (sender, mut receiver) =
-            mpsc::unbounded_channel::<(SessionCompletion, tokio::sync::OwnedSemaphorePermit)>();
+        let (sender, mut receiver) = mpsc::channel::<(
+            SessionCompletion,
+            tokio::sync::OwnedSemaphorePermit,
+        )>(state.config.max_sessions);
         let store = state.store.clone();
         let failed = Arc::new(AtomicBool::new(false));
         let worker_failed = failed.clone();
@@ -36,7 +38,7 @@ impl SessionRecorder {
                 let streamer_id = i64::try_from(record.streamer_id);
                 let started_at = record.ended_at.checked_sub(record.duration);
                 let result = match (streamer_id, started_at) {
-                    (Ok(streamer_id), Some(started_at)) => store.query(
+                    (Ok(streamer_id), Some(started_at)) => store.query_completion(
                         "INSERT INTO relay.sessions(streamer_id,started_at,ended_at,ingest_protocol,profile_json,end_reason) VALUES($1,$2,$3,'rtmps',$4,$5)",
                         &[&streamer_id, &started_at, &record.ended_at, &record.profile, &record.end_reason],
                     ).await.map(|_| ()),
@@ -60,7 +62,7 @@ impl SessionRecorder {
     }
     async fn drained(&self) -> Result<(), &'static str> {
         let _idle = tokio::time::timeout(
-            crate::store::CLEANUP_GRACE + std::time::Duration::from_secs(10),
+            crate::store::CLEANUP_GRACE * 2 + std::time::Duration::from_secs(20),
             self.slots.clone().acquire_many_owned(self.capacity),
         )
         .await
@@ -112,9 +114,9 @@ impl Authorizer for ServiceAuthorizer {
         reservation.on_completion(move |record| {
             eprintln!("Uplink-Eingang beendet: streamer_id={} duration_ms={} source_tracks={} EndReason={}",
                 record.streamer_id, record.duration.as_millis(), record.source_tracks, record.end_reason);
-            if let Err(error) = sender.send((record, permit)) {
+            if let Err(error) = sender.try_send((record, permit)) {
                 failed.store(true, Ordering::Release);
-                eprintln!("Uplink-Abschluss konnte nicht gespeichert werden: streamer_id={} error=Speicherung ist nicht verfügbar.", error.0.0.streamer_id);
+                eprintln!("Uplink-Abschluss konnte nicht gespeichert werden: streamer_id={} error=Speicherung ist nicht verfügbar.", error.into_inner().0.streamer_id);
             }
         });
         let reservation = Arc::new(reservation);
@@ -295,8 +297,8 @@ pub async fn serve_with_ready<P: SessionProcessor>(
         tasks.abort_all();
         while tasks.join_next().await.is_some() {}
     }
-    let recorded = authorizer.recorder.drained().await;
     let _ = stop.send(());
+    let recorded = authorizer.recorder.drained().await;
     if let Some(hub) = &chat {
         hub.shutdown().await;
     }
