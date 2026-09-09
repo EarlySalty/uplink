@@ -114,7 +114,7 @@ impl BotBroker {
         }
         Ok((status, body))
     }
-    pub async fn publish_grant(&self, id: u64) -> Result<(), BrokerError> {
+    pub async fn publish_grant(&self, id: u64) -> Result<i64, BrokerError> {
         let (status, body) = self
             .get(
                 id,
@@ -233,7 +233,7 @@ impl PlatformBroker for BotBroker {
     }
 }
 
-fn validate_publish_grant(id: u64, body: &[u8]) -> Result<(), BrokerError> {
+fn validate_publish_grant(id: u64, body: &[u8]) -> Result<i64, BrokerError> {
     #[derive(serde::Deserialize)]
     struct PublishGrant<'a> {
         purpose: &'a str,
@@ -241,6 +241,7 @@ fn validate_publish_grant(id: u64, body: &[u8]) -> Result<(), BrokerError> {
         platform_user_id: &'a str,
         scopes: Vec<&'a str>,
         access_token: &'a str,
+        connection_generation: i64,
     }
     let grant: PublishGrant<'_> =
         serde_json::from_slice(body).map_err(|_| BrokerError::AccessUnconfirmed)?;
@@ -252,10 +253,11 @@ fn validate_publish_grant(id: u64, body: &[u8]) -> Result<(), BrokerError> {
         || grant.access_token.len() > 8192
         || grant.scopes.len() > 128
         || !grant.scopes.contains(&"channel:read:stream_key")
+        || grant.connection_generation < 1
     {
         return Err(BrokerError::Unauthorized);
     }
-    Ok(())
+    Ok(grant.connection_generation)
 }
 
 #[cfg(test)]
@@ -263,9 +265,18 @@ mod publish_tests {
     use super::*;
     #[test]
     fn publish_requires_explicit_purpose_owner_and_scope() {
-        let valid = serde_json::json!({"purpose":"publish","token_owner":"11","platform_user_id":"11","scopes":["channel:read:stream_key"],"access_token":"synthetic-test"});
-        assert!(validate_publish_grant(11, &serde_json::to_vec(&valid).unwrap()).is_ok());
-        for field in ["purpose", "token_owner", "platform_user_id", "scopes"] {
+        let valid = serde_json::json!({"purpose":"publish","token_owner":"11","platform_user_id":"11","scopes":["channel:read:stream_key"],"access_token":"synthetic-test","connection_generation":3});
+        assert_eq!(
+            validate_publish_grant(11, &serde_json::to_vec(&valid).unwrap()).unwrap(),
+            3
+        );
+        for field in [
+            "purpose",
+            "token_owner",
+            "platform_user_id",
+            "scopes",
+            "connection_generation",
+        ] {
             let mut invalid = valid.clone();
             invalid.as_object_mut().unwrap().remove(field);
             assert!(validate_publish_grant(11, &serde_json::to_vec(&invalid).unwrap()).is_err());
@@ -274,5 +285,21 @@ mod publish_tests {
         let mut wrong = valid;
         wrong["token_owner"] = serde_json::json!("12");
         assert!(validate_publish_grant(11, &serde_json::to_vec(&wrong).unwrap()).is_err());
+    }
+
+    #[test]
+    fn publish_requires_positive_connection_generation() {
+        let mut grant = serde_json::json!({"purpose":"publish","token_owner":"11","platform_user_id":"11","scopes":["channel:read:stream_key"],"access_token":"synthetic-test","connection_generation":1});
+        assert_eq!(
+            validate_publish_grant(11, &serde_json::to_vec(&grant).unwrap()).unwrap(),
+            1
+        );
+        for generation in [0, -4] {
+            grant["connection_generation"] = serde_json::json!(generation);
+            assert!(validate_publish_grant(11, &serde_json::to_vec(&grant).unwrap()).is_err());
+        }
+        let mut no_scope = grant;
+        no_scope["scopes"] = serde_json::json!(["chat:read"]);
+        assert!(validate_publish_grant(11, &serde_json::to_vec(&no_scope).unwrap()).is_err());
     }
 }

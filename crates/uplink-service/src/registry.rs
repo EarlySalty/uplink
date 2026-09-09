@@ -29,6 +29,7 @@ pub struct SessionStatus {
     pub blocked_outputs: std::collections::BTreeMap<String, &'static str>,
     pub outputs: Option<serde_json::Value>,
     pub source_observation: Option<serde_json::Value>,
+    pub frozen_layouts: serde_json::Value,
 }
 pub struct Reservation {
     id: u64,
@@ -132,6 +133,7 @@ impl Registry {
                     blocked_outputs: std::collections::BTreeMap::new(),
                     outputs: None,
                     source_observation: None,
+                    frozen_layouts: serde_json::Value::Null,
                 },
             ),
         );
@@ -278,6 +280,20 @@ impl Reservation {
     pub fn observation(&self, observation: serde_json::Value) {
         self.update(|state| state.source_observation = Some(observation));
     }
+    pub fn freeze_layout(&self, platform: &str, layout_id: u64, revision: u64) {
+        self.update(|state| {
+            let eintrag = serde_json::json!({"layout_id":layout_id,"revision":revision});
+            match &mut state.frozen_layouts {
+                serde_json::Value::Null => {
+                    state.frozen_layouts = serde_json::json!({platform: eintrag});
+                }
+                map @ serde_json::Value::Object(_) => {
+                    map[platform] = eintrag;
+                }
+                _ => {}
+            }
+        });
+    }
     fn update(&self, change: impl FnOnce(&mut SessionStatus)) {
         if let Some(registry) = self.registry.upgrade() {
             let mut state = registry.lock().unwrap_or_else(|e| e.into_inner());
@@ -377,5 +393,32 @@ impl Drop for Reservation {
                 completion(record);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn eingefrorene_layoutrevision_erscheint_je_plattform_im_status() {
+        let registry = Registry::new(2, 1).unwrap();
+        let reservation = registry.reserve(31).unwrap();
+        reservation.freeze_layout("twitch", 7, 3);
+        let status = registry.status(31);
+        assert_eq!(
+            status.first().unwrap().frozen_layouts["twitch"]["revision"],
+            3
+        );
+        assert_eq!(
+            status.first().unwrap().frozen_layouts["twitch"]["layout_id"],
+            7
+        );
+        reservation.freeze_layout("twitch", 8, 4);
+        let status = registry.status(31);
+        assert_eq!(
+            status.first().unwrap().frozen_layouts["twitch"]["revision"],
+            4
+        );
     }
 }

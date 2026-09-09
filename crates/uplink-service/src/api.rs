@@ -525,7 +525,19 @@ async fn destinations(
     Query(query): Query<TenantQuery>,
 ) -> ApiResult {
     authorize(&state, &headers, query.streamer_id)?;
-    let rows = state.store.query("SELECT d.platform,d.rtmp_url,d.enabled,d.width,d.height,d.fps,d.bitrate_kbps,COALESCE(f.generation,0),d.twitch_audio_mode FROM relay.destinations d LEFT JOIN relay.destination_fences f USING(streamer_id,platform) WHERE d.streamer_id=$1 ORDER BY d.platform", &[&query.streamer_id]).await.map_err(|e|failure(StatusCode::SERVICE_UNAVAILABLE,e))?;
+    let rows = state.store.query("SELECT d.platform,d.rtmp_url,d.enabled,d.width,d.height,d.fps,d.bitrate_kbps,COALESCE(f.generation,0),d.twitch_audio_mode,d.hochkant_enabled,d.hochkant_width,d.hochkant_height FROM relay.destinations d LEFT JOIN relay.destination_fences f USING(streamer_id,platform) WHERE d.streamer_id=$1 ORDER BY d.platform", &[&query.streamer_id]).await.map_err(|e|failure(StatusCode::SERVICE_UNAVAILABLE,e))?;
+    let hochkant_revision = state
+        .store
+        .query(
+            "SELECT COALESCE(MAX(revision),0) FROM relay.hochkant_layouts WHERE streamer_id=$1",
+            &[&query.streamer_id],
+        )
+        .await
+        .map_err(|e| failure(StatusCode::SERVICE_UNAVAILABLE, e))?;
+    let requested_revision = hochkant_revision
+        .first()
+        .and_then(|row| row.try_get::<_, i64>(0).ok())
+        .unwrap_or(0);
     let mut outputs = Vec::with_capacity(rows.len());
     let sessions = state.registry.status(query.streamer_id as u64);
     for row in rows {
@@ -549,6 +561,13 @@ async fn destinations(
         let (output_state, reason) = output_status(sessions.first(), &platform, blocked);
         let active_profile =
             crate::media_status::active_profile(sessions.first(), &platform, output_state);
+        let active_profiles =
+            crate::media_status::active_profiles(sessions.first(), &platform, output_state);
+        let active_revision = sessions
+            .first()
+            .and_then(|session| session.frozen_layouts.get(&platform))
+            .and_then(|wahl| wahl["revision"].as_u64());
+        let hochkant_enabled: bool = row.try_get(9).unwrap_or(false);
         let requested_audio: Option<String> = row.try_get(8).map_err(|_| invalid())?;
         let effective_audio = if platform == "twitch" {
             requested_audio.as_deref().or_else(|| {
@@ -570,7 +589,7 @@ async fn destinations(
         };
         let active_audio =
             crate::media_status::active_audio_mode(sessions.first(), &platform, output_state);
-        outputs.push(json!({"platform":platform,"connection_generation":row.try_get::<_,i64>(7).map_err(|_|invalid())?,"rtmp_url":if blocked {""} else {endpoint.as_str()},"enabled":row.try_get::<_,bool>(2).map_err(|_|invalid())?,"blocked":blocked,"error":endpoint_error,"requested":{"width":row.try_get::<_,Option<i32>>(3).map_err(|_|invalid())?,"height":row.try_get::<_,Option<i32>>(4).map_err(|_|invalid())?,"fps":row.try_get::<_,Option<i32>>(5).map_err(|_|invalid())?,"bitrate_kbps":row.try_get::<_,Option<i32>>(6).map_err(|_|invalid())?},"active_profile":active_profile,"twitch_audio_mode":requested_audio,"effective_audio_mode":effective_audio,"active_audio_mode":active_audio,"output_state":output_state,"reason":reason,"publication_confirmed":false}));
+        outputs.push(json!({"platform":platform,"connection_generation":row.try_get::<_,i64>(7).map_err(|_|invalid())?,"rtmp_url":if blocked {""} else {endpoint.as_str()},"enabled":row.try_get::<_,bool>(2).map_err(|_|invalid())?,"blocked":blocked,"error":endpoint_error,"requested":{"width":row.try_get::<_,Option<i32>>(3).map_err(|_|invalid())?,"height":row.try_get::<_,Option<i32>>(4).map_err(|_|invalid())?,"fps":row.try_get::<_,Option<i32>>(5).map_err(|_|invalid())?,"bitrate_kbps":row.try_get::<_,Option<i32>>(6).map_err(|_|invalid())?},"active_profile":active_profile,"active_profiles":active_profiles,"hochkant":{"enabled":hochkant_enabled,"width":row.try_get::<_,Option<i32>>(10).map_err(|_|invalid())?,"height":row.try_get::<_,Option<i32>>(11).map_err(|_|invalid())?,"requested_revision":requested_revision,"active_revision":active_revision},"twitch_audio_mode":requested_audio,"effective_audio_mode":effective_audio,"active_audio_mode":active_audio,"output_state":output_state,"reason":reason,"publication_confirmed":false}));
     }
     Ok(Json(json!({"destinations": outputs})))
 }
