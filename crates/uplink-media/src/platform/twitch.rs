@@ -55,6 +55,95 @@ impl fmt::Display for GoLiveError {
 impl std::error::Error for GoLiveError {}
 type Result<T> = std::result::Result<T, GoLiveError>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoLiveEncoder {
+    ObsX264,
+    JimNvenc,
+    ObsNvencH264Tex,
+    JimHevcNvenc,
+    ObsNvencHevcTex,
+    JimAv1Nvenc,
+    ObsNvencAv1Tex,
+    H264TextureAmf,
+    H265TextureAmf,
+    Av1TextureAmf,
+    ObsQsv11V2,
+    ObsQsv11Hevc,
+    ObsQsv11Av1,
+    FfmpegVaapi,
+    FfmpegHevcVaapi,
+    FfmpegAv1Vaapi,
+}
+impl GoLiveEncoder {
+    pub fn audited(name: &str) -> Option<Self> {
+        Some(match name {
+            "obs_x264" => Self::ObsX264,
+            "jim_nvenc" => Self::JimNvenc,
+            "obs_nvenc_h264_tex" => Self::ObsNvencH264Tex,
+            "jim_hevc_nvenc" => Self::JimHevcNvenc,
+            "obs_nvenc_hevc_tex" => Self::ObsNvencHevcTex,
+            "jim_av1_nvenc" => Self::JimAv1Nvenc,
+            "obs_nvenc_av1_tex" => Self::ObsNvencAv1Tex,
+            "h264_texture_amf" => Self::H264TextureAmf,
+            "h265_texture_amf" => Self::H265TextureAmf,
+            "av1_texture_amf" => Self::Av1TextureAmf,
+            "obs_qsv11_v2" => Self::ObsQsv11V2,
+            "obs_qsv11_hevc" => Self::ObsQsv11Hevc,
+            "obs_qsv11_av1" => Self::ObsQsv11Av1,
+            "ffmpeg_vaapi" => Self::FfmpegVaapi,
+            "ffmpeg_hevc_vaapi" => Self::FfmpegHevcVaapi,
+            "ffmpeg_av1_vaapi" => Self::FfmpegAv1Vaapi,
+            _ => return None,
+        })
+    }
+    pub fn audited_name(self) -> &'static str {
+        match self {
+            Self::ObsX264 => "obs_x264",
+            Self::JimNvenc => "jim_nvenc",
+            Self::ObsNvencH264Tex => "obs_nvenc_h264_tex",
+            Self::JimHevcNvenc => "jim_hevc_nvenc",
+            Self::ObsNvencHevcTex => "obs_nvenc_hevc_tex",
+            Self::JimAv1Nvenc => "jim_av1_nvenc",
+            Self::ObsNvencAv1Tex => "obs_nvenc_av1_tex",
+            Self::H264TextureAmf => "h264_texture_amf",
+            Self::H265TextureAmf => "h265_texture_amf",
+            Self::Av1TextureAmf => "av1_texture_amf",
+            Self::ObsQsv11V2 => "obs_qsv11_v2",
+            Self::ObsQsv11Hevc => "obs_qsv11_hevc",
+            Self::ObsQsv11Av1 => "obs_qsv11_av1",
+            Self::FfmpegVaapi => "ffmpeg_vaapi",
+            Self::FfmpegHevcVaapi => "ffmpeg_hevc_vaapi",
+            Self::FfmpegAv1Vaapi => "ffmpeg_av1_vaapi",
+        }
+    }
+    pub fn codec(self) -> Codec {
+        match self {
+            Self::ObsX264
+            | Self::JimNvenc
+            | Self::ObsNvencH264Tex
+            | Self::H264TextureAmf
+            | Self::ObsQsv11V2
+            | Self::FfmpegVaapi => Codec::H264,
+            Self::JimHevcNvenc
+            | Self::ObsNvencHevcTex
+            | Self::H265TextureAmf
+            | Self::ObsQsv11Hevc
+            | Self::FfmpegHevcVaapi => Codec::Hevc,
+            Self::JimAv1Nvenc
+            | Self::ObsNvencAv1Tex
+            | Self::Av1TextureAmf
+            | Self::ObsQsv11Av1
+            | Self::FfmpegAv1Vaapi => Codec::Av1,
+        }
+    }
+    pub fn executable_encoder(self) -> Option<&'static str> {
+        match self {
+            Self::ObsX264 => Some("libx264"),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Rational {
     pub numerator: u32,
@@ -153,6 +242,7 @@ pub struct TwitchConfiguration {
     pub target: PublishTarget,
     pub video: Vec<VideoConfiguration>,
     pub audio: Vec<AudioConfiguration>,
+    pub encoders: Vec<GoLiveEncoder>,
 }
 impl fmt::Debug for TwitchConfiguration {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -160,6 +250,7 @@ impl fmt::Debug for TwitchConfiguration {
             .field("target", &self.target)
             .field("video_tracks", &self.video.len())
             .field("audio_tracks", &self.audio.len())
+            .field("encoders", &self.encoders)
             .finish()
     }
 }
@@ -347,25 +438,8 @@ fn inspect_configuration(bytes: &[u8], http_status: u16) -> Result<GoLiveProbe> 
         .encoder_configurations
         .iter()
         .map(|v| VideoProbe {
-            encoder: match v.encoder {
-                "obs_x264" => "obs_x264",
-                "jim_nvenc" => "jim_nvenc",
-                "obs_nvenc_h264_tex" => "obs_nvenc_h264_tex",
-                "jim_hevc_nvenc" => "jim_hevc_nvenc",
-                "obs_nvenc_hevc_tex" => "obs_nvenc_hevc_tex",
-                "jim_av1_nvenc" => "jim_av1_nvenc",
-                "obs_nvenc_av1_tex" => "obs_nvenc_av1_tex",
-                "h264_texture_amf" => "h264_texture_amf",
-                "h265_texture_amf" => "h265_texture_amf",
-                "av1_texture_amf" => "av1_texture_amf",
-                "obs_qsv11_v2" => "obs_qsv11_v2",
-                "obs_qsv11_hevc" => "obs_qsv11_hevc",
-                "obs_qsv11_av1" => "obs_qsv11_av1",
-                "ffmpeg_vaapi" => "ffmpeg_vaapi",
-                "ffmpeg_hevc_vaapi" => "ffmpeg_hevc_vaapi",
-                "ffmpeg_av1_vaapi" => "ffmpeg_av1_vaapi",
-                _ => "unknown",
-            },
+            encoder: GoLiveEncoder::audited(v.encoder)
+                .map_or("unknown", GoLiveEncoder::audited_name),
             width: v.width,
             height: v.height,
             canvas_index: v.canvas_index,
@@ -601,7 +675,6 @@ struct RawVideo<'a> {
     settings: RawVideoSettings<'a>,
 }
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct RawVideoSettings<'a> {
     rate_control: &'a str,
     bitrate: u32,
@@ -627,7 +700,6 @@ struct RawAudio<'a> {
     settings: RawAudioSettings,
 }
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct RawAudioSettings {
     bitrate: u32,
 }
@@ -666,6 +738,7 @@ fn parse_configuration(
         return Err(GoLiveError::InvalidResponse);
     }
     let mut video = Vec::new();
+    let mut encoders = Vec::new();
     let mut bitrate = 0u64;
     for (index, v) in raw.encoder_configurations.iter().enumerate() {
         let canvas = preferences
@@ -686,10 +759,9 @@ fn parse_configuration(
         {
             return Err(GoLiveError::InvalidResponse);
         }
-        // Only this concrete OBS-to-FFmpeg encoder translation is currently proven.
-        // An NVENC/QSV/AMF request must never be silently run as a software substitute.
-        if v.encoder != "obs_x264"
-            || !codecs.contains(&Codec::H264)
+        let audited = GoLiveEncoder::audited(v.encoder).ok_or(GoLiveError::UnsupportedEncoder)?;
+        if audited.executable_encoder().is_none()
+            || !codecs.contains(&audited.codec())
             || v.settings.rate_control != "CBR"
             || v.settings.bitrate == 0
             || v.settings.bitrate > 20_000
@@ -707,13 +779,14 @@ fn parse_configuration(
             return Err(GoLiveError::UnsupportedEncoder);
         }
         bitrate += u64::from(v.settings.bitrate);
+        encoders.push(audited);
         video.push(VideoConfiguration {
             wire_track: index as u8,
             canvas_index: v.canvas_index,
             width: v.width,
             height: v.height,
             framerate: fps,
-            codec: Codec::H264,
+            codec: audited.codec(),
             bitrate_kbps: v.settings.bitrate,
             keyframe_seconds: v.settings.keyint_sec,
             profile: v.settings.profile.into(),
@@ -825,287 +898,9 @@ fn parse_configuration(
         },
         video,
         audio,
+        encoders,
     })
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn diagnostic_status_emits_only_fixed_terms_never_raw_html() {
-        let terms = status_terms(Some("<b>Unsupported GPU</b> sensitive-sentinel"));
-        assert_eq!(terms, vec!["gpu", "unsupported"]);
-        assert!(!format!("{terms:?}").contains("sensitive-sentinel"));
-        assert!(status_terms(None).is_empty());
-        assert!(status_terms(Some("sensitive-sentinel")).is_empty());
-    }
-    fn preferences() -> Preferences {
-        Preferences {
-            maximum_aggregate_bitrate: 8_000,
-            maximum_video_tracks: 3,
-            vod_track_audio: true,
-            audio_samples_per_sec: 48000,
-            audio_channels: 2,
-            audio_max_buffering_ms: 200,
-            audio_fixed_buffering: true,
-            canvases: vec![Canvas {
-                width: 2560,
-                height: 1440,
-                canvas_width: 2560,
-                canvas_height: 1440,
-                framerate: Rational {
-                    numerator: 60,
-                    denominator: 1,
-                },
-            }],
-        }
-    }
-    fn response() -> Vec<u8> {
-        br#"{"meta":{"service":"IVS","schema_version":"2025-01-25","config_id":"synthetic-config"},"status":{"result":"success"},"ingest_endpoints":[{"protocol":"RTMPS","url_template":"rtmps://test.example/app/{stream_key}","authentication":"synthetic-temporary"}],"encoder_configurations":[{"type":"obs_x264","width":1920,"height":1080,"framerate":{"numerator":60,"denominator":1},"canvas_index":0,"settings":{"rate_control":"CBR","bitrate":6000,"keyint_sec":2,"profile":"high","bf":0}}],"audio_configurations":{"live":[{"codec":"aac","track_id":0,"channels":2,"settings":{"bitrate":160}}],"vod":[{"codec":"aac","track_id":1,"channels":2,"settings":{"bitrate":160}}]}}"#.to_vec()
-    }
-    #[test]
-    fn configuration_preserves_temporary_auth_roles_and_private_debug() {
-        let value = parse_configuration(
-            &response(),
-            &preferences(),
-            &PublishSecret::new(b"synthetic-original?bandwidthtest=true".to_vec()).unwrap(),
-            &["test.example".into()],
-            &[Codec::H264],
-        )
-        .unwrap();
-        assert_eq!(value.video[0].wire_track, 0);
-        assert_eq!(value.audio[0].role, AudioRole::Live);
-        assert_eq!(value.audio[1].role, AudioRole::Vod);
-        assert_eq!(
-            value.target.playpath.expose_for_pipe(),
-            b"synthetic-temporary?bandwidthtest=true&clientConfigId=synthetic-config"
-        );
-        let debug = format!("{value:?}");
-        for secret in [
-            "synthetic-temporary",
-            "synthetic-original",
-            "synthetic-config",
-            "test.example",
-        ] {
-            assert!(!debug.contains(secret));
-        }
-    }
-
-    #[test]
-    fn temporary_authentication_keeps_its_own_query() {
-        let bytes = String::from_utf8(response())
-            .unwrap()
-            .replace(
-                "synthetic-temporary\"",
-                "synthetic-temporary?temporary=one%2Btwo&flag=active\"",
-            )
-            .replace("/{stream_key}\"", "/{stream_key}?endpoint=yes\"");
-        let configuration = parse_configuration(
-            bytes.as_bytes(),
-            &preferences(),
-            &PublishSecret::new(b"synthetic-original?old=discarded&bandwidthtest=true".to_vec())
-                .unwrap(),
-            &["test.example".into()],
-            &[Codec::H264],
-        )
-        .unwrap();
-        let path = std::str::from_utf8(configuration.target.playpath.expose_for_pipe()).unwrap();
-        assert!(path.contains("temporary=one%2Btwo"));
-        assert!(path.contains("flag=active"));
-        assert!(path.contains("endpoint=yes"));
-        assert!(path.contains("bandwidthtest=true"));
-        assert!(path.contains("old=discarded"));
-        assert!(path.ends_with("clientConfigId=synthetic-config"));
-    }
-
-    #[test]
-    fn conflicting_or_reserved_temporary_auth_queries_are_rejected() {
-        for suffix in ["?bandwidthtest=false", "?clientConfigId=foreign"] {
-            let bytes = String::from_utf8(response()).unwrap().replace(
-                "synthetic-temporary\"",
-                &format!("synthetic-temporary{suffix}\""),
-            );
-            assert_eq!(
-                parse_configuration(
-                    bytes.as_bytes(),
-                    &preferences(),
-                    &PublishSecret::new(b"synthetic-original?bandwidthtest=true".to_vec()).unwrap(),
-                    &["test.example".into()],
-                    &[Codec::H264],
-                )
-                .unwrap_err(),
-                GoLiveError::InvalidResponse
-            );
-        }
-    }
-
-    #[test]
-    fn probe_error_messages_keep_distinct_static_causes() {
-        let errors = [
-            GoLiveError::InvalidRequest,
-            GoLiveError::Transport,
-            GoLiveError::ResponseTooLarge,
-            GoLiveError::InvalidResponse,
-        ];
-        let messages: std::collections::HashSet<_> =
-            errors.iter().map(|error| error.message()).collect();
-        assert_eq!(messages.len(), errors.len());
-        for error in errors {
-            assert_eq!(error.to_string(), error.message());
-        }
-    }
-
-    #[test]
-    fn configure_advertises_only_the_proven_encoder_translation() {
-        use super::super::hardware::EncoderProbe;
-        let probes = vec![
-            EncoderProbe {
-                codec: Codec::H264,
-                encoder: "libx264".into(),
-                initialized: true,
-            },
-            EncoderProbe {
-                codec: Codec::Hevc,
-                encoder: "libx265".into(),
-                initialized: true,
-            },
-            EncoderProbe {
-                codec: Codec::Av1,
-                encoder: "libsvtav1".into(),
-                initialized: true,
-            },
-        ];
-        assert_eq!(configurable_codecs(&probes), vec![Codec::H264]);
-        assert!(configurable_codecs(&probes[1..]).is_empty());
-    }
-    #[test]
-    fn malformed_unsupported_or_foreign_config_is_not_publishable() {
-        let cases = [
-            (
-                "\"track_id\":1",
-                "\"track_id\":17",
-                GoLiveError::UnsupportedAudioMapping,
-            ),
-            (
-                "\"canvas_index\":0",
-                "\"canvas_index\":1",
-                GoLiveError::InvalidResponse,
-            ),
-            ("obs_x264", "jim_nvenc", GoLiveError::UnsupportedEncoder),
-            ("test.example", "localhost", GoLiveError::EndpointRejected),
-            (
-                "\"success\"",
-                "\"warning\"",
-                GoLiveError::WarningNeedsDecision,
-            ),
-            ("\"success\"", "\"error\"", GoLiveError::AccountRejected),
-            (
-                "\"rate_control\":\"CBR\"",
-                "\"rate_control\":\"CQP\"",
-                GoLiveError::UnsupportedEncoder,
-            ),
-            ("\"bf\":0", "\"bf\":2", GoLiveError::UnsupportedEncoder),
-        ];
-        for (from, to, expected) in cases {
-            let bytes = String::from_utf8(response()).unwrap().replace(from, to);
-            let error = parse_configuration(
-                bytes.as_bytes(),
-                &preferences(),
-                &PublishSecret::new(b"public-test".to_vec()).unwrap(),
-                &["test.example".into()],
-                &[Codec::H264],
-            )
-            .unwrap_err();
-            assert_eq!(error, expected, "case {from}");
-        }
-    }
-
-    #[test]
-    fn safe_probe_report_never_echoes_untrusted_response_text() {
-        let response = String::from_utf8(response())
-            .unwrap()
-            .replace("obs_x264", "secret-reflected-as-encoder")
-            .replace(
-                "\"result\":\"success\"",
-                "\"result\":\"success\",\"html_en_us\":\"secret-reflected-as-html\"",
-            );
-        let probe = inspect_configuration(response.as_bytes(), 200).unwrap();
-        assert_eq!(probe.video[0].encoder, "unknown");
-        assert_eq!(probe.live_audio_tracks, 1);
-        assert_eq!(probe.vod_audio_tracks, 1);
-        let json = serde_json::to_string(&probe).unwrap();
-        assert!(!json.contains("secret-reflected"));
-        assert!(!json.contains("synthetic-"));
-        assert!(!json.contains("test.example"));
-    }
-
-    #[test]
-    fn request_uses_measured_capabilities_and_real_client_identity() {
-        let capabilities = RequestCapabilities {
-            gpu: None,
-            gaming_features: None,
-            cpu: Cpu {
-                physical_cores: 4,
-                logical_cores: 8,
-                name: Some("Measured".into()),
-                speed: None,
-            },
-            memory: Memory {
-                total: 1024,
-                free: 512,
-            },
-            system: System {
-                name: "Linux".into(),
-                version: "measured".into(),
-                release: "measured".into(),
-                revision: "measured".into(),
-                bits: 64,
-                arm: false,
-            },
-        };
-        let authentication = PublishSecret::new(b"synthetic-authentication".to_vec()).unwrap();
-        let bytes = request_body(
-            &authentication,
-            &capabilities,
-            &preferences(),
-            &[Codec::H264, Codec::Hevc],
-        )
-        .unwrap();
-        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(value["client"]["name"], "uplink");
-        assert_eq!(
-            value["client"]["supported_codecs"],
-            serde_json::json!(["h264", "h265"])
-        );
-        assert_eq!(value["capabilities"]["cpu"]["physical_cores"], 4);
-        assert!(value["capabilities"]["gpu"].is_null());
-        assert!(value["preferences"].get("composition_gpu_index").is_none());
-        assert_eq!(value["authentication"], "synthetic-authentication");
-        assert_eq!(value["schema_version"], SCHEMA);
-    }
-
-    #[tokio::test]
-    async fn response_reader_rejects_redirects_oversize_and_interrupted_bodies() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        for (wire,expected) in [
-            ("HTTP/1.1 302 Found\r\nContent-Length: 0\r\nLocation: https://secret.example/path\r\n\r\n".to_owned(),GoLiveError::HttpRejected),
-            (format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",MAX_RESPONSE+1),GoLiveError::ResponseTooLarge),
-            ("HTTP/1.1 200 OK\r\nContent-Length: 200\r\n\r\nsecret-reflected".to_owned(),GoLiveError::Transport),
-        ] {
-            let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let address=listener.local_addr().unwrap();
-            let server=tokio::spawn(async move {
-                let (mut socket,_)=listener.accept().await.unwrap();
-                let mut request=[0;1024];assert!(socket.read(&mut request).await.unwrap()>0);
-                socket.write_all(wire.as_bytes()).await.unwrap();
-            });
-            let client=reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none())
-                .timeout(Duration::from_secs(1)).build().unwrap();
-            let response=client.get(format!("http://{address}")).send().await.unwrap();
-            let error=read_response(response).await.unwrap_err();
-            assert_eq!(error,expected);
-            assert!(!format!("{error:?} {error}").contains("secret"));
-            server.await.unwrap();
-        }
-    }
-}
+mod tests;
