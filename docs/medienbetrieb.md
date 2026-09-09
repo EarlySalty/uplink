@@ -36,7 +36,7 @@ Protokollgrundlagen: [Enhanced RTMP V2](https://veovera.org/docs/enhanced/enhanc
 
 ## Einmaliger Probe-Dump für ein freigegebenes Konto
 
-Der optionale normale Configwert `media.probe_dump_streamer_id` aktiviert die Diagnose ausschließlich für die bereits authentifizierte Twitch-ID dieses Kontos. Ohne diesen Wert ist die Aufzeichnung aus. Es werden keine anderen Konten erfasst, keine Schlüssel verändert und keine zusätzlichen Plattformausgänge gestartet.
+Der optionale normale Configwert `media.probe_dump_streamer_id` aktiviert die Diagnose ausschließlich für die bereits authentifizierte Twitch-ID dieses Kontos. Ohne diesen Wert ist die Aufzeichnung aus. `media.work_directory` muss ein absoluter Pfad sein und darf keine Gruppenrechte oder Rechte für andere Nutzer besitzen, beispielsweise mit Verzeichnismodus 0700. Andernfalls wird kein Dump geschrieben und die private Diagnose meldet `unsafe_directory`. Es werden keine anderen Konten erfasst, keine Schlüssel verändert und keine zusätzlichen Plattformausgänge gestartet.
 
 Bei einer fehlgeschlagenen Probe ohne auswertbares Ergebnis oder bei tatsächlich null erkannten Streams wird der vollständige bereits erzeugte FLV-Vorlauf unter `media.work_directory/obs-probe-dump/input.flv` abgelegt. Maximal 16 MiB sind erlaubt; größere Vorläufe werden vollständig übersprungen und privat als `too_large` gemeldet. `probe_result_available=false` bedeutet, dass noch kein Probe-Ergebnis ausgewertet wurde; `probe_streams=0` allein beweist dann keine leere Streamliste. Der Rewrap und das bisherige Fehlerverhalten bleiben unverändert.
 
