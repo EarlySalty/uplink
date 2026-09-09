@@ -195,17 +195,27 @@ impl SessionProcessor for Coordinator {
             return Err("Kein sicheres Ausgabeziel ist verfügbar; siehe Zielstatus.");
         }
         let mut diagnostic = uplink_media::PreparationDiagnostic::default();
-        let running = self
+        if probe_dump_allowed(&self.state.config.media, first.identity.session.tenant_id()) {
+            diagnostic.request_probe_dump();
+        }
+        let started = self
             .engine
             .prepare_and_start_diagnosed(
                 DesiredSessionSpec { first, outputs },
                 events,
                 &mut diagnostic,
             )
-            .await
-            .map_err(|error| {
-                preparation_failure(&reservation, error, serde_json::json!(diagnostic))
-            })?;
+            .await;
+        if let Some(bytes) = diagnostic.take_probe_dump() {
+            let directory = self.state.config.media.work_directory.clone();
+            let status = crate::probe_dump::spawn(reservation.clone(), directory, bytes)
+                .await
+                .unwrap_or(crate::probe_dump::DumpStatus::WriteFailed);
+            diagnostic.probe_dump_finished(status.code());
+        }
+        let running = started.map_err(|error| {
+            preparation_failure(&reservation, error, serde_json::json!(diagnostic))
+        })?;
         if let Some(observation) = running.source_observation() {
             reservation.observation(
                 serde_json::to_value(observation)
@@ -246,6 +256,10 @@ impl SessionProcessor for Coordinator {
     }
 }
 
+fn probe_dump_allowed(config: &crate::config::MediaConfig, authenticated_tenant: u64) -> bool {
+    config.probe_dump_streamer_id == Some(authenticated_tenant)
+}
+
 fn preparation_failure(
     reservation: &crate::registry::Reservation,
     error: uplink_media::MediaError,
@@ -259,6 +273,18 @@ fn preparation_failure(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dump_scope_requires_explicit_config_and_matching_authenticated_tenant() {
+        let mut config =
+            crate::config::Config::parse(include_str!("../../../config/uplink-beispiel.toml"))
+                .unwrap();
+        assert!(!super::probe_dump_allowed(&config.media, 538636411));
+        config.media.probe_dump_streamer_id = Some(538636411);
+        assert!(super::probe_dump_allowed(&config.media, 538636411));
+        assert!(!super::probe_dump_allowed(&config.media, 1186925760));
+        assert!(!super::probe_dump_allowed(&config.media, 0));
+    }
+
     #[test]
     fn preparation_failure_keeps_concrete_media_error_in_internal_completion() {
         let registry = crate::registry::Registry::new(1, 1).unwrap();

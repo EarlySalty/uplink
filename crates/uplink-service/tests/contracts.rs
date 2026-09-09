@@ -238,3 +238,34 @@ fn encrypted_destination_is_bound_to_tenant_and_platform() {
     assert!(key.open(&sealed, "destination:11:kick").is_err());
     assert!(key.open(&sealed[..13], "destination:11:twitch").is_err());
 }
+
+#[test]
+fn probe_dump_scope_is_optional_and_rejects_invalid_account_ids() {
+    let mut config: toml::Value =
+        toml::from_str(include_str!("../../../config/uplink-beispiel.toml")).unwrap();
+    assert_eq!(
+        Config::parse(&toml::to_string(&config).unwrap())
+            .unwrap()
+            .media
+            .probe_dump_streamer_id,
+        None
+    );
+    for id in [0, -1] {
+        config["media"]
+            .as_table_mut()
+            .unwrap()
+            .insert("probe_dump_streamer_id".into(), toml::Value::Integer(id));
+        assert!(Config::parse(&toml::to_string(&config).unwrap()).is_err());
+    }
+    config["media"].as_table_mut().unwrap().insert(
+        "probe_dump_streamer_id".into(),
+        toml::Value::Integer(538636411),
+    );
+    assert_eq!(
+        Config::parse(&toml::to_string(&config).unwrap())
+            .unwrap()
+            .media
+            .probe_dump_streamer_id,
+        Some(538636411)
+    );
+}

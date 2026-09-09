@@ -13,3 +13,5 @@ pub mod secrets;
 pub mod store;
 mod test_ingest;
 pub mod tls_reload;
+
+mod probe_dump;

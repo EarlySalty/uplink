@@ -75,8 +75,17 @@ struct ProbeStream {
     color_range: Option<String>,
 }
 
+pub const MAX_PROBE_DUMP_BYTES: usize = 16 * 1024 * 1024;
+
 #[derive(Default, serde::Serialize)]
 pub struct PreparationDiagnostic {
+    probe_result_available: bool,
+    probe_dump_status: Option<&'static str>,
+    probe_dump_bytes: Option<usize>,
+    #[serde(skip)]
+    probe_dump_requested: bool,
+    #[serde(skip)]
+    probe_dump: Option<Vec<u8>>,
     phase: &'static str,
     probe_streams: usize,
     probe: Vec<ProbeDiagnostic>,
@@ -126,7 +135,29 @@ fn diagnostic_label(value: Option<&str>, allowed: &[&'static str]) -> Option<&'s
 }
 
 impl PreparationDiagnostic {
+    pub fn request_probe_dump(&mut self) {
+        self.probe_dump_requested = true;
+    }
+    pub fn take_probe_dump(&mut self) -> Option<Vec<u8>> {
+        self.probe_dump.take()
+    }
+    pub fn probe_dump_finished(&mut self, status: &'static str) {
+        self.probe_dump_status = Some(status);
+    }
+    fn retain_probe_dump(&mut self, bytes: Vec<u8>) {
+        if !self.probe_dump_requested || self.probe_streams != 0 {
+            return;
+        }
+        self.probe_dump_bytes = Some(bytes.len());
+        if bytes.len() > MAX_PROBE_DUMP_BYTES {
+            self.probe_dump_status = Some("too_large");
+        } else {
+            self.probe_dump_status = Some("pending_write");
+            self.probe_dump = Some(bytes);
+        }
+    }
     fn probe(&mut self, document: &ProbeDocument) {
+        self.probe_result_available = true;
         self.probe_streams = document.streams.len();
         self.probe = document
             .streams
@@ -231,7 +262,11 @@ impl MediaEngine {
         mut input: mpsc::Receiver<MediaEvent>,
         diagnostic: &mut PreparationDiagnostic,
     ) -> Result<RunningMedia> {
-        *diagnostic = PreparationDiagnostic::default();
+        let probe_dump_requested = diagnostic.probe_dump_requested;
+        *diagnostic = PreparationDiagnostic {
+            probe_dump_requested,
+            ..PreparationDiagnostic::default()
+        };
         diagnostic.phase = "configuration";
         diagnostic.requested = spec
             .outputs
@@ -461,8 +496,12 @@ impl MediaEngine {
             }
         }
         diagnostic.phase = "probe";
-        let measured = probe(&self.config, flv, diagnostic).await?;
-        diagnostic.probe(&measured);
+        let measured = probe(&self.config, &flv, diagnostic).await;
+        if let Ok(document) = &measured {
+            diagnostic.probe(document);
+        }
+        diagnostic.retain_probe_dump(flv);
+        let measured = measured?;
         diagnostic.phase = "observation";
         let observation = observation(measured, &audio, video[0].wire_id, events, bytes, duration)?;
         let identity = TrackIdentity {
@@ -547,7 +586,7 @@ async fn drain_probe_stderr(
 
 async fn probe(
     config: &EngineConfig,
-    bytes: Vec<u8>,
+    bytes: &[u8],
     diagnostic: &mut PreparationDiagnostic,
 ) -> Result<ProbeDocument> {
     let child=Command::new(&config.ffprobe)
@@ -570,7 +609,7 @@ async fn probe(
     let mut read_error_kind = None;
     let operation = async {
         let write = async {
-            stdin.write_all(&bytes).await.map_err(|error| {
+            stdin.write_all(bytes).await.map_err(|error| {
                 write_error_kind = Some(io_error_label(error.kind()));
                 MediaError::Io
             })?;
@@ -746,6 +785,53 @@ mod tests {
         ]
     }
     #[test]
+    fn probe_dump_trigger_distinguishes_missing_result_empty_result_and_streams() {
+        for (requested, available, streams, expected) in [
+            (false, false, 0, false),
+            (true, false, 0, true),
+            (true, true, 0, true),
+            (true, true, 1, false),
+        ] {
+            let mut diagnostic = PreparationDiagnostic::default();
+            if requested {
+                diagnostic.request_probe_dump();
+            }
+            if available {
+                diagnostic.probe(&ProbeDocument {
+                    streams: if streams == 0 {
+                        vec![]
+                    } else {
+                        document().streams
+                    },
+                });
+            }
+            let bytes = b"private-media-payload".to_vec();
+            diagnostic.retain_probe_dump(bytes.clone());
+            let value = serde_json::to_value(&diagnostic).unwrap();
+            assert_eq!(value["probe_result_available"], available);
+            assert!(!value.to_string().contains("private-media-payload"));
+            assert!(value.get("probe_dump").is_none());
+            assert!(value.get("probe_dump_requested").is_none());
+            assert_eq!(diagnostic.take_probe_dump(), expected.then_some(bytes));
+        }
+    }
+
+    #[test]
+    fn probe_dump_buffer_never_truncates_or_copies_the_owned_capture() {
+        let mut diagnostic = PreparationDiagnostic::default();
+        diagnostic.request_probe_dump();
+        diagnostic.retain_probe_dump(vec![0; MAX_PROBE_DUMP_BYTES + 1]);
+        assert!(diagnostic.take_probe_dump().is_none());
+        assert_eq!(diagnostic.probe_dump_status, Some("too_large"));
+        let bytes = vec![9; MAX_PROBE_DUMP_BYTES];
+        let address = bytes.as_ptr();
+        diagnostic.retain_probe_dump(bytes);
+        let captured = diagnostic.take_probe_dump().unwrap();
+        assert_eq!(captured.as_ptr(), address);
+        assert_eq!(captured.len(), MAX_PROBE_DUMP_BYTES);
+    }
+
+    #[test]
     fn diagnostic_probe_fields_are_bounded_and_never_copy_untrusted_text() {
         let mut document = document();
         document.streams[0].color_space = Some("gbr".into());
@@ -828,7 +914,7 @@ mod tests {
             limits: MediaLimits::default(),
         };
         let mut diagnostic = PreparationDiagnostic::default();
-        let result = probe(&config, vec![0; 4 * 1024 * 1024], &mut diagnostic).await;
+        let result = probe(&config, &vec![0; 4 * 1024 * 1024], &mut diagnostic).await;
         std::fs::remove_dir_all(directory).unwrap();
         assert!(matches!(result, Err(MediaError::Io)));
         assert_eq!(

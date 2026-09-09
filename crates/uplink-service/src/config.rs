@@ -50,6 +50,8 @@ pub struct TestIngestConfig {
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MediaConfig {
+    #[serde(default)]
+    pub probe_dump_streamer_id: Option<u64>,
     pub ffmpeg: std::path::PathBuf,
     pub ffprobe: std::path::PathBuf,
     pub work_directory: std::path::PathBuf,
@@ -227,6 +229,10 @@ impl Config {
             || config.media.max_queued_events > 4096
             || config.media.max_tracks == 0
             || config.media.max_tracks > 32
+            || config
+                .media
+                .probe_dump_streamer_id
+                .is_some_and(|id| id == 0 || id > i64::MAX as u64)
             || config.media.vod_audio_track == Some(config.media.live_audio_track)
         {
             return Err("Mediengrenzen oder Audiozuordnung sind ungültig.");
