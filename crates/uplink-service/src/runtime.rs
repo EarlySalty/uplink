@@ -15,9 +15,31 @@ use uplink_ingest::{AuthorizedSession, Authorizer, IngestServer, MediaEvent};
 
 pub struct ServiceAuthorizer {
     state: Arc<ServiceState>,
-    reservations: Mutex<HashMap<AuthorizedSession, Arc<Reservation>>>,
+    reservations: Mutex<HashMap<AuthorizedSession, ActiveReservation>>,
     recorder: SessionRecorder,
 }
+struct ActiveReservation {
+    reservation: Arc<Reservation>,
+    ingest_report: Arc<Mutex<Option<uplink_ingest::SessionReport>>>,
+}
+
+fn ingest_completion_diagnostic(
+    reason: uplink_ingest::EndReason,
+    timestamp_clamps: u64,
+    timestamp_rejection: Option<uplink_ingest::TimestampDiagnostic>,
+    timestamp_tail: &std::collections::VecDeque<uplink_ingest::TimestampDiagnostic>,
+) -> String {
+    let ending = match reason {
+        uplink_ingest::EndReason::ExplicitStop | uplink_ingest::EndReason::PeerClosed => {
+            "Streamer hat beendet"
+        }
+        _ => "Eingang beendet",
+    };
+    format!(
+        " Abschluss={ending}; timestamp_clamps={timestamp_clamps} timestamp_rejection={timestamp_rejection:?} timestamp_tail={timestamp_tail:?}"
+    )
+}
+
 #[derive(Clone)]
 struct SessionRecorder {
     tasks: Arc<Mutex<JoinSet<()>>>,
@@ -107,7 +129,11 @@ impl ServiceAuthorizer {
         }
     }
     pub fn reservation(&self, session: AuthorizedSession) -> Option<Arc<Reservation>> {
-        self.reservations.lock().ok()?.get(&session).cloned()
+        self.reservations
+            .lock()
+            .ok()?
+            .get(&session)
+            .map(|active| active.reservation.clone())
     }
 }
 impl Authorizer for ServiceAuthorizer {
@@ -132,17 +158,35 @@ impl Authorizer for ServiceAuthorizer {
         }
         let mut reservation = self.state.registry.reserve(tenant).map_err(|_| ())?;
         let recorder = self.recorder.clone();
+        let ingest_report = Arc::new(Mutex::new(None));
+        let completion_report = ingest_report.clone();
         reservation.on_completion(move |record| {
-            eprintln!("Uplink-Eingang beendet: streamer_id={} duration_ms={} source_tracks={} EndReason={}",
-                record.streamer_id, record.duration.as_millis(), record.source_tracks, record.end_reason);
+            let diagnostic = completion_report
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_ref()
+                .map(|report: &uplink_ingest::SessionReport| {
+                    ingest_completion_diagnostic(
+                        report.reason,
+                        report.timestamp_clamps,
+                        report.timestamp_rejection,
+                        &report.timestamp_tail,
+                    )
+                })
+                .unwrap_or_default();
+            eprintln!("Uplink-Eingang beendet: streamer_id={} duration_ms={} source_tracks={} EndReason={}{}",
+                record.streamer_id, record.duration.as_millis(), record.source_tracks, record.end_reason, diagnostic);
             recorder.record(record, permit);
         });
         let reservation = Arc::new(reservation);
         let session = AuthorizedSession::new(tenant, reservation.id()).map_err(|_| ())?;
-        self.reservations
-            .lock()
-            .map_err(|_| ())?
-            .insert(session, reservation);
+        self.reservations.lock().map_err(|_| ())?.insert(
+            session,
+            ActiveReservation {
+                reservation,
+                ingest_report,
+            },
+        );
         if let Some(hub) = &self.state.chat {
             let _ = hub.set_active(tenant, true);
         }
@@ -154,8 +198,17 @@ impl Authorizer for ServiceAuthorizer {
         }
     }
     fn completed(&self, session: AuthorizedSession, report: &uplink_ingest::SessionReport) {
-        if let Some(reservation) = self.reservation(session) {
-            reservation.ingest_report(report);
+        if let Some(active) = self
+            .reservations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&session)
+        {
+            *active
+                .ingest_report
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = Some(report.clone());
+            active.reservation.ingest_report(report);
         }
         if let Some(hub) = &self.state.chat {
             let _ = hub.set_active(session.tenant_id(), false);
@@ -363,6 +416,61 @@ pub async fn serve_with_ready<P: SessionProcessor>(
             http.abort();
             let _ = http.await;
             Err("Steuerung konnte nicht sauber beendet werden.")
+        }
+    }
+}
+
+#[cfg(test)]
+mod timestamp_diagnostic_tests {
+    use super::*;
+    use uplink_ingest::{
+        EndReason, EventKind, MediaError, MediaKind, TimestampDiagnostic, WireTrack,
+    };
+
+    #[test]
+    fn completion_line_keeps_full_numeric_packet_diagnostic_and_distinguishes_stops() {
+        let diagnostic = TimestampDiagnostic {
+            track: WireTrack {
+                kind: MediaKind::Video,
+                wire_id: 7,
+            },
+            event_kind: EventKind::Frame,
+            last_dts_ms: Some(10000),
+            new_dts_ms: 5000,
+            delta_ms: 5000,
+            session_duration_ms: 29548,
+            path: "server.rs",
+        };
+        let tail = [diagnostic].into();
+        let line = ingest_completion_diagnostic(
+            EndReason::MediaRejected(MediaError::TimestampRegression),
+            50,
+            Some(diagnostic),
+            &tail,
+        );
+        for expected in [
+            "kind: Video",
+            "wire_id: 7",
+            "last_dts_ms: Some(10000)",
+            "new_dts_ms: 5000",
+            "delta_ms: 5000",
+            "session_duration_ms: 29548",
+            "server.rs",
+            "timestamp_clamps=50",
+            "timestamp_tail=",
+            "timestamp_rejection=Some",
+        ] {
+            assert!(
+                line.contains(expected),
+                "fehlendes Abschlussfeld {expected}: {line}"
+            );
+        }
+        assert!(!line.contains("Streamer hat beendet"));
+        for reason in [EndReason::ExplicitStop, EndReason::PeerClosed] {
+            assert!(
+                ingest_completion_diagnostic(reason, 0, None, &tail)
+                    .contains("Streamer hat beendet")
+            );
         }
     }
 }

@@ -106,6 +106,14 @@ async fn publish(peer: &mut Peer) {
 }
 
 async fn collect(tags: &[Tag], limits: IngestLimits) -> (Vec<MediaEvent>, SessionReport) {
+    collect_ending(tags, limits, Some("deleteStream")).await
+}
+
+async fn collect_ending(
+    tags: &[Tag],
+    limits: IngestLimits,
+    ending: Option<&str>,
+) -> (Vec<MediaEvent>, SessionReport) {
     timeout(Duration::from_secs(5), async {
         let certificates = tls::test_tls();
         assert!(
@@ -138,11 +146,26 @@ async fn collect(tags: &[Tag], limits: IngestLimits) -> (Vec<MediaEvent>, Sessio
                 break;
             }
         }
-        let mut end = amf_string("deleteStream");
-        end.extend(amf_number(0.0));
-        end.push(5);
-        end.extend(amf_number(1.0));
-        let _ = send(&mut peer, 20, 0, 1, &end).await;
+        if let Some(ending) = ending {
+            let mut end = amf_string(ending);
+            end.extend(amf_number(0.0));
+            end.push(5);
+            if ending == "deleteStream" {
+                end.extend(amf_number(1.0));
+            } else {
+                end.extend(amf_string("transport-vector"));
+            }
+            let _ = send(
+                &mut peer,
+                20,
+                0,
+                if ending == "FCUnpublish" { 0 } else { 1 },
+                &end,
+            )
+            .await;
+        } else {
+            peer.shutdown().await.unwrap();
+        }
         let mut events = Vec::new();
         while let Some(event) = incoming.next().await {
             events.push(event);
@@ -306,19 +329,33 @@ async fn default_enhanced_and_legacy_avc_share_the_same_video_track_zero() {
 
 #[tokio::test]
 async fn sequence_end_and_timestamp_regression_apply_only_to_the_selected_track() {
-    for last in [video(b"hvc1", 3, 7, 9, &[1]), video(b"hvc1", 2, 7, 9, &[])] {
-        let (_, report) = collect(
-            &[
-                video(b"hvc1", 0, 7, 0, &[1]),
-                video(b"hvc1", 3, 7, 10, &[2]),
-                last,
-            ],
-            IngestLimits::local_probe(),
-        )
-        .await;
-        assert_eq!(
-            report.reason,
-            EndReason::MediaRejected(MediaError::TimestampRegression)
+    let (_, report) = collect(
+        &[
+            video(b"hvc1", 0, 7, 0, &[1]),
+            video(b"hvc1", 3, 7, 10_000, &[2]),
+            video(b"hvc1", 3, 7, 5_000, &[1]),
+        ],
+        IngestLimits::local_probe(),
+    )
+    .await;
+    assert_eq!(
+        report.reason,
+        EndReason::MediaRejected(MediaError::TimestampRegression)
+    );
+    let diagnostic = format!("{report:?}");
+    for expected in [
+        "kind: Video",
+        "wire_id: 7",
+        "last_dts_ms: Some(10000)",
+        "new_dts_ms: 5000",
+        "delta_ms: 5000",
+        "session_duration_ms:",
+        "server.rs",
+        "event_kind: Frame",
+    ] {
+        assert!(
+            diagnostic.contains(expected),
+            "fehlende Diagnose {expected}: {diagnostic}"
         );
     }
     let (events, report) = collect(
@@ -409,5 +446,139 @@ async fn malformed_multivideo_is_rejected_without_publishing_an_event() {
         assert!(matches!(report.reason, EndReason::MediaRejected(_)));
         assert!(events.is_empty());
         assert_eq!(report.track_count, 0);
+    }
+}
+
+#[tokio::test]
+async fn timestamp_regression_small_frames_remain_monotone_and_keep_cts() {
+    for delta in [1, 2000] {
+        let tags = [
+            video(b"hvc1", 0, 7, 0, &[1]),
+            audio(1, 0, 0),
+            video(b"hvc1", 1, 7, 3000, &[0, 0, 137, 1]),
+            video(b"hvc1", 1, 7, 3000 - delta, &[0, 0, 137, 2]),
+            audio(1, 1, 1),
+            video(b"hvc1", 1, 7, 3001, &[0, 0, 137, 3]),
+        ];
+        let (events, report) = collect(&tags, IngestLimits::local_probe()).await;
+        assert_eq!(report.reason, EndReason::ExplicitStop);
+        assert_eq!(events.len(), tags.len());
+        assert_eq!((events[3].dts_ms, events[3].pts_ms), (3000, 3137));
+        assert_eq!(events[4].dts_ms, 1);
+        assert_eq!(events[5].dts_ms, 3001);
+    }
+}
+
+#[tokio::test]
+async fn timestamp_regression_clamp_limit_is_fifty_per_session() {
+    for count in [50, 51] {
+        let mut tags = vec![
+            audio(0, 0, 0),
+            audio(1, 0, 0),
+            audio(0, 1, 100),
+            audio(1, 1, 100),
+        ];
+        for index in 0..count {
+            tags.push(audio((index % 2) as u8, 1, 99));
+        }
+        let (events, report) = collect(&tags, IngestLimits::local_probe()).await;
+        assert_eq!(events.len(), 4 + count.min(50));
+        assert_eq!(report.timestamp_clamps, count.min(50) as u64);
+        assert_eq!(report.timestamp_tail.len(), 8);
+        assert_eq!(
+            report.reason,
+            if count == 50 {
+                EndReason::ExplicitStop
+            } else {
+                EndReason::MediaRejected(MediaError::TimestampRegression)
+            }
+        );
+    }
+}
+
+#[tokio::test]
+async fn timestamp_regression_obs_sequence_end_keeps_streamer_stop_reason() {
+    for fourcc in [b"hvc1", b"av01", b"avc1"] {
+        let tags = [
+            video(fourcc, 0, 7, 0, &[1]),
+            video(fourcc, 3, 7, 29_548, &[1]),
+            video(fourcc, 2, 7, 0, &[]),
+        ];
+        let (events, report) = collect(&tags, IngestLimits::local_probe()).await;
+        assert_eq!(report.reason, EndReason::ExplicitStop);
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[2].dts_ms, 29_548);
+        let diagnostic = format!("{report:?}");
+        for expected in [
+            "event_kind: SequenceEnd",
+            "last_dts_ms: Some(29548)",
+            "new_dts_ms: 0",
+            "delta_ms: 29548",
+            "wire_id: 7",
+        ] {
+            assert!(
+                diagnostic.contains(expected),
+                "fehlende Schlussdiagnose {expected}: {diagnostic}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn timestamp_regression_boundary_and_stop_cannot_hide_frame_rejection() {
+    for delta in [2001, 5000] {
+        for ending in [Some("deleteStream"), Some("FCUnpublish"), None] {
+            let tags = [
+                audio(1, 0, 0),
+                audio(1, 1, 10000),
+                audio(1, 1, 10000 - delta),
+            ];
+            let (events, report) = collect_ending(&tags, IngestLimits::local_probe(), ending).await;
+            assert_eq!(
+                report.reason,
+                EndReason::MediaRejected(MediaError::TimestampRegression)
+            );
+            assert_eq!(events.len(), 2);
+            let diagnostic = report.timestamp_rejection.unwrap();
+            assert_eq!(
+                diagnostic.track,
+                WireTrack {
+                    kind: MediaKind::Audio,
+                    wire_id: 1
+                }
+            );
+            assert_eq!(diagnostic.last_dts_ms, Some(10000));
+            assert_eq!(diagnostic.new_dts_ms, 10000 - delta);
+            assert_eq!(diagnostic.delta_ms, delta);
+            assert_eq!(diagnostic.path, "server.rs");
+            assert!(diagnostic.session_duration_ms <= report.duration.as_millis());
+        }
+    }
+}
+
+#[tokio::test]
+async fn timestamp_regression_sequence_end_then_each_streamer_stop() {
+    for ending in [Some("deleteStream"), Some("FCUnpublish"), None] {
+        let tags = [
+            video(b"av01", 0, 0, 0, &[1]),
+            video(b"av01", 3, 0, 29548, &[1]),
+            video(b"av01", 2, 0, 0, &[]),
+        ];
+        let (events, report) = collect_ending(&tags, IngestLimits::local_probe(), ending).await;
+        assert_eq!(
+            report.reason,
+            if ending.is_some() {
+                EndReason::ExplicitStop
+            } else {
+                EndReason::PeerClosed
+            }
+        );
+        assert_eq!(events.len(), 3);
+        assert_eq!(report.timestamp_clamps, 0);
+        assert!(report.timestamp_rejection.is_none());
+        assert_eq!(
+            report.timestamp_tail.back().unwrap().event_kind,
+            EventKind::SequenceEnd
+        );
     }
 }

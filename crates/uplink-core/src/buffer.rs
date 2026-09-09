@@ -1,6 +1,10 @@
 use crate::SessionScope;
 use std::{collections::VecDeque, time::Duration};
 
+const TIMESTAMP_TOLERANCE_MS: u64 = 2_000;
+const TIMESTAMP_CLAMP_LIMIT: usize = 50;
+const TIMESTAMP_CLAMP_WINDOW: Duration = Duration::from_secs(60);
+
 #[derive(Debug, Clone, Copy)]
 pub struct BufferLimits {
     pub max_bytes: usize,
@@ -41,7 +45,6 @@ pub struct PopResult {
 
 /// Begrenzte FIFO für bereits komprimierte Pakete EINER Sessiongeneration/Spur.
 /// Kein GOP-Cache, Jitter-Regler, Decoder oder persistenter Delay-Speicher.
-/// Der Aufrufer liefert monotone Ankunftszeit; DTS darf gleich bleiben, nie sinken.
 /// Ablauf wird bei Zugriff entfernt und als Verlust gezählt; der Caller muss
 /// nach Verlust einen gültigen Decoder-Einstieg organisieren.
 pub struct PacketBuffer {
@@ -53,6 +56,7 @@ pub struct PacketBuffer {
     last_now: Duration,
     last_dts: Option<u64>,
     expired_total: u64,
+    timestamp_clamps: VecDeque<Duration>,
 }
 
 impl PacketBuffer {
@@ -77,6 +81,7 @@ impl PacketBuffer {
             last_now: Duration::ZERO,
             last_dts: None,
             expired_total: 0,
+            timestamp_clamps: VecDeque::new(),
         })
     }
 
@@ -112,7 +117,7 @@ impl PacketBuffer {
         Ok(expired)
     }
 
-    pub fn push(&mut self, packet: Packet, now: Duration) -> Result<PushResult, BufferError> {
+    pub fn push(&mut self, mut packet: Packet, now: Duration) -> Result<PushResult, BufferError> {
         if packet.scope != self.scope {
             return Err(BufferError::WrongScope);
         }
@@ -125,17 +130,35 @@ impl PacketBuffer {
         if packet.payload.len() > self.limits.max_bytes {
             return Err(BufferError::PacketTooLarge);
         }
-        if self
+        if now < self.last_now {
+            return Err(BufferError::ClockRegression);
+        }
+        let regression = self
             .last_dts
-            .is_some_and(|last| packet.decode_timestamp_ms < last)
-        {
-            return Err(BufferError::TimestampRegression);
+            .filter(|last| packet.decode_timestamp_ms < *last);
+        if let Some(last) = regression {
+            while self
+                .timestamp_clamps
+                .front()
+                .is_some_and(|at| now - *at >= TIMESTAMP_CLAMP_WINDOW)
+            {
+                self.timestamp_clamps.pop_front();
+            }
+            if last - packet.decode_timestamp_ms > TIMESTAMP_TOLERANCE_MS
+                || self.timestamp_clamps.len() >= TIMESTAMP_CLAMP_LIMIT
+            {
+                return Err(BufferError::TimestampRegression);
+            }
+            packet.decode_timestamp_ms = last;
         }
         let expired_packets = self.expire(now)?;
         if self.packets.len() >= self.limits.max_packets
             || packet.payload.len() > self.limits.max_bytes - self.bytes
         {
             return Err(BufferError::Full);
+        }
+        if regression.is_some() {
+            self.timestamp_clamps.push_back(now);
         }
         self.last_dts = Some(packet.decode_timestamp_ms);
         self.bytes += packet.payload.len();

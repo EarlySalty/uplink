@@ -6,7 +6,7 @@ use scuffle_rtmp::session::server::{
 };
 use std::{
     any::Any,
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     future::Future,
     net::{Ipv4Addr, SocketAddr},
     num::NonZeroU64,
@@ -112,6 +112,43 @@ pub enum EndReason {
     TaskFailed,
 }
 
+const TIMESTAMP_TOLERANCE_MS: u32 = 2_000;
+const TIMESTAMP_CLAMP_LIMIT: usize = 50;
+const TIMESTAMP_CLAMP_WINDOW: Duration = Duration::from_secs(60);
+const TIMESTAMP_TRACE_LIMIT: usize = 8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimestampDiagnostic {
+    pub track: WireTrack,
+    pub event_kind: EventKind,
+    pub last_dts_ms: Option<u32>,
+    pub new_dts_ms: u32,
+    pub delta_ms: u32,
+    pub session_duration_ms: u128,
+    pub path: &'static str,
+}
+
+#[derive(Default)]
+struct TimestampClamps {
+    recent: VecDeque<Instant>,
+}
+impl TimestampClamps {
+    fn admit(&mut self, now: Instant) -> bool {
+        while self
+            .recent
+            .front()
+            .is_some_and(|at| now.duration_since(*at) >= TIMESTAMP_CLAMP_WINDOW)
+        {
+            self.recent.pop_front();
+        }
+        if self.recent.len() >= TIMESTAMP_CLAMP_LIMIT {
+            return false;
+        }
+        self.recent.push_back(now);
+        true
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionReport {
     pub reason: EndReason,
@@ -124,6 +161,9 @@ pub struct SessionReport {
     pub max_queued_bytes: usize,
     pub track_count: usize,
     pub ignored_amf_messages: u64,
+    pub timestamp_clamps: u64,
+    pub timestamp_rejection: Option<TimestampDiagnostic>,
+    pub timestamp_tail: VecDeque<TimestampDiagnostic>,
 }
 
 /// Ausschließlich empfangene Wire-Metadaten, kein vollständiges Planner-Profil.
@@ -326,6 +366,9 @@ impl<A: Authorizer> IngestServer<A> {
             max_queued_bytes: 0,
             track_count: 0,
             ignored_amf_messages: 0,
+            timestamp_clamps: 0,
+            timestamp_rejection: None,
+            timestamp_tail: VecDeque::new(),
         }));
         let task = tokio::spawn(run_connection(
             socket,
@@ -414,6 +457,9 @@ struct Handler<A: Authorizer> {
     completion_session: Arc<Mutex<Option<AuthorizedSession>>>,
     generation: ConnectionGeneration,
     tracks: HashMap<WireTrack, TrackState>,
+    started: Instant,
+    timestamp_clamps: TimestampClamps,
+    timestamp_tail: VecDeque<TimestampDiagnostic>,
     limits: IngestLimits,
     sender: mpsc::Sender<MediaEvent>,
     budget: Arc<Semaphore>,
@@ -462,7 +508,12 @@ struct Activity {
 }
 impl<A: Authorizer> Handler<A> {
     fn reject(&mut self, reason: EndReason) -> ServerSessionError {
-        self.report.lock().unwrap_or_else(|e| e.into_inner()).reason = reason;
+        let mut report = self
+            .report
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        report.reason = reason;
+        report.timestamp_tail = self.timestamp_tail.clone();
         ServerSessionError::HandlerRejected
     }
     fn media(
@@ -484,6 +535,22 @@ impl<A: Authorizer> Handler<A> {
         let parsed = inspect(kind, &data, timestamp, self.limits.max_header_bytes)
             .map_err(|error| self.reject(EndReason::MediaRejected(error)))?;
         let mut track = self.tracks.get(&parsed.track).copied();
+        let diagnostic = TimestampDiagnostic {
+            track: parsed.track,
+            event_kind: parsed.event_kind,
+            last_dts_ms: track.and_then(|state| state.last_dts),
+            new_dts_ms: timestamp,
+            delta_ms: track
+                .and_then(|state| state.last_dts)
+                .map_or(0, |last| last.saturating_sub(timestamp)),
+            session_duration_ms: self.started.elapsed().as_millis(),
+            path: "server.rs",
+        };
+        if self.timestamp_tail.len() == TIMESTAMP_TRACE_LIMIT {
+            self.timestamp_tail.pop_front();
+        }
+        self.timestamp_tail.push_back(diagnostic);
+        let mut corrected_timestamp = timestamp;
         if track.is_none()
             && matches!(
                 parsed.event_kind,
@@ -534,12 +601,35 @@ impl<A: Authorizer> Handler<A> {
                         self.reject(EndReason::MediaRejected(MediaError::FrameBeforeHeader))
                     );
                 }
-                if state.last_dts.is_some_and(|last| timestamp < last) {
-                    return Err(
-                        self.reject(EndReason::MediaRejected(MediaError::TimestampRegression))
-                    );
+                if let Some(last) = state.last_dts.filter(|last| timestamp < *last) {
+                    if parsed.event_kind != EventKind::SequenceEnd {
+                        if last - timestamp > TIMESTAMP_TOLERANCE_MS
+                            || !self.timestamp_clamps.admit(Instant::now())
+                        {
+                            self.report
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner())
+                                .timestamp_rejection = Some(diagnostic);
+                            return Err(self.reject(EndReason::MediaRejected(
+                                MediaError::TimestampRegression,
+                            )));
+                        }
+                        let mut report = self
+                            .report
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner());
+                        report.timestamp_clamps = report.timestamp_clamps.saturating_add(1);
+                        if report.timestamp_clamps == 1 {
+                            eprintln!(
+                                "Uplink-Zeitstempel geklemmt: streamer_id={} session_id={} warning_count=1 timestamp_clamps=1 Diagnose={diagnostic:?}",
+                                session.tenant_id(),
+                                session.session_id()
+                            );
+                        }
+                    }
+                    corrected_timestamp = last;
                 }
-                state.last_dts = Some(timestamp);
+                state.last_dts = Some(corrected_timestamp);
                 state.ended = parsed.event_kind == EventKind::SequenceEnd;
             }
         }
@@ -565,8 +655,8 @@ impl<A: Authorizer> Handler<A> {
             },
             event_kind: parsed.event_kind,
             codec: parsed.codec,
-            dts_ms: timestamp,
-            pts_ms: parsed.pts_ms,
+            dts_ms: corrected_timestamp,
+            pts_ms: parsed.pts_ms + i64::from(corrected_timestamp - timestamp),
             configuration_revision: track.map_or(0, |track| track.revision),
             body: data.as_ref().into(),
             payload: parsed.payload,
@@ -585,6 +675,7 @@ impl<A: Authorizer> Handler<A> {
             self.tracks.insert(parsed.track, track);
         }
         let mut report = self.report.lock().unwrap_or_else(|e| e.into_inner());
+        report.timestamp_tail = self.timestamp_tail.clone();
         report.received_events += 1;
         report.received_bytes += size as u64;
         report.track_count = self.tracks.len();
@@ -672,9 +763,18 @@ impl<A: Authorizer> SessionHandler for Handler<A> {
     }
     async fn on_unknown_command(
         &mut self,
-        _: u32,
-        _: scuffle_rtmp::command_messages::UnknownCommand<'_>,
+        stream_id: u32,
+        command: scuffle_rtmp::command_messages::UnknownCommand<'_>,
     ) -> Result<(), ServerSessionError> {
+        if command.command_name.as_str() == "FCUnpublish" {
+            let Some((authorized_stream, _)) = self.session else {
+                return Err(self.reject(EndReason::AuthorizationRejected));
+            };
+            if stream_id != 0 && stream_id != authorized_stream {
+                return Err(self.reject(EndReason::AuthorizationRejected));
+            }
+            return self.on_unpublish(authorized_stream).await;
+        }
         Ok(())
     }
 }
@@ -721,6 +821,9 @@ async fn run_connection<A: Authorizer>(
                 completion_session: completion.session.clone(),
                 generation,
                 tracks: HashMap::new(),
+                started: completion.started,
+                timestamp_clamps: TimestampClamps::default(),
+                timestamp_tail: VecDeque::new(),
                 budget: Arc::new(Semaphore::new(limits.max_queued_bytes)),
                 sender,
                 status,
@@ -799,6 +902,9 @@ mod tests {
             max_queued_bytes: 0,
             track_count: 0,
             ignored_amf_messages: 0,
+            timestamp_clamps: 0,
+            timestamp_rejection: None,
+            timestamp_tail: VecDeque::new(),
         }));
         let budget = Arc::new(Semaphore::new(limits.max_queued_bytes));
         let (sender, mut receiver) = mpsc::channel(1);
@@ -813,6 +919,9 @@ mod tests {
             completion_session: Arc::new(Mutex::new(None)),
             generation,
             tracks: HashMap::new(),
+            started: Instant::now(),
+            timestamp_clamps: TimestampClamps::default(),
+            timestamp_tail: VecDeque::new(),
             limits: limits.clone(),
             sender,
             budget: budget.clone(),
@@ -839,5 +948,19 @@ mod tests {
         drop(guard);
         producer.join().unwrap().unwrap();
         assert_eq!(report.lock().unwrap().max_queued_bytes, 4);
+    }
+    #[test]
+    fn timestamp_clamp_window_is_sliding_bounded_and_expires_at_sixty_seconds() {
+        let mut clamps = TimestampClamps::default();
+        let start = Instant::now();
+        for index in 0..50 {
+            assert!(clamps.admit(start + Duration::from_secs(index)));
+        }
+        assert!(!clamps.admit(start + Duration::from_millis(59_999)));
+        assert_eq!(clamps.recent.len(), 50);
+        assert!(clamps.admit(start + Duration::from_secs(60)));
+        assert!(!clamps.admit(start + Duration::from_secs(60)));
+        assert!(clamps.admit(start + Duration::from_secs(61)));
+        assert_eq!(clamps.recent.len(), 50);
     }
 }
