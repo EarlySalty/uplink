@@ -83,6 +83,20 @@ Nach dem Hotfixcommit wird dessen exakter SHA dort detached ausgecheckt und die 
   --repo /home/nathanael/.worktrees/uplink-hotfix-kein-ziel-gate --base main --head HEAD
 ```
 
-Commit-/Tree-SHA, Eigen-Gate-Ergebnis und Pushnachweis werden erst nach tatsächlicher Durchführung ergänzt. Der Gate-Clone wird niemals zu GitHub gepusht; es gibt keinen Force-Push und keinen parallelen Gate.
+Hotfixcommit: `29068d458439fda9df9f3b1f18ec85a5df3c9c88`, Tree `a195e9c3850f1c4222772243445c64946bbb5986`. Arbeitsworktree und detached Gate-Clone zeigten exakt denselben SHA und Tree; beide waren sauber. Der Gate-Clone hatte als Basis exakt `4b817d8a8c1039a58eb87384626a06175ddc0acd`.
+
+Der obige bestehende Eigen-Gate endete für diesen Commit mit **Exit 0** und folgendem vollständigen Urteil (Log `/tmp/uplink-hotfix-gate.log`):
+
+```text
+ALLOW: No blocking defect found in the supplied diff.
+
+Repository tools were unavailable, so I could not independently verify HEAD or inspect surrounding code. No findings.
+```
+
+**Aussagegrenze:** Der Gate hat nur den gelieferten Diff geprüft; seine Repositorywerkzeuge waren nicht verfügbar. SHA-/Tree-/Basisidentität wurden deshalb ausdrücklich separat in beiden Checkouts geprüft. Die unabhängigen internen Rust- und Sicherheitsreviews haben zusätzlich den tatsächlichen Code und die erreichbaren unveränderten Grenzen gelesen. Kein BLOCKING wurde gemeldet; die eingeschränkte Gateprüfung ersetzt den geforderten frischen Fremdreview nicht.
+
+Nach diesem Ergebnis werden ausschließlich diese Nachweisdokumente in einem separaten Commit aktualisiert; der bestehende Gate wird auf dessen finalem HEAD nochmals ausgeführt. Pushnachweis und finale Prüf-SHA folgen erst nach tatsächlicher Durchführung. Der Gate-Clone wird niemals zu GitHub gepusht; es gibt keinen Force-Push und keinen parallelen Gate.
+
+Letzte rein lesende Liveprüfung: **09.09.2026, 21:59:13 MESZ**. Link weiterhin `/opt/uplink/releases/4b817d8`, `rs-relay.service` active/running, MainPID 3441568. Health `ok=true`, `database_ready=true`, `tls_ready=true`, `tls_refresh_failed=false`, `active_sessions=0`.
 
 Der vorhandene externe `D-REVIEW-FREMD.md` mit ALLOW betrifft ausschließlich `b14f272` gegen `a3c88bd` (frühere PR #19). Er ist **keine frische Hotfixfreigabe**. Merge und Deploy bleiben bis zu einem neuen passenden ALLOW für den Hotfix angehalten, sofern der Nutzer keinen ausdrücklich sofortigen Live-Hotfix anordnet.
