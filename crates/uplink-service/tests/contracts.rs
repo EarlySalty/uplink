@@ -310,7 +310,10 @@ fn media_rejection_and_existing_errors_survive_session_completion() {
     assert!(!status.active);
     assert_eq!(status.state, "Fehler");
     assert!(status.error.is_some());
-    assert_eq!(status.ingest_end_reason.as_deref(), Some("MediaRejected(TimestampRegression)"));
+    assert_eq!(
+        status.ingest_end_reason.as_deref(),
+        Some("MediaRejected(TimestampRegression)")
+    );
     let reservation = registry.reserve(11).unwrap();
     reservation.fail("Ausgang abgewiesen");
     reservation.ingest_ended(&EndReason::PeerClosed);

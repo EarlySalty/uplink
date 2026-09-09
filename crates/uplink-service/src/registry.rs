@@ -200,7 +200,7 @@ impl Reservation {
             // EndReason/MediaError enthalten ausschließlich geprüfte Enumwerte,
             // keine fremden Protokolltexte, Adressen oder Zugangsdaten.
             state.ingest_end_reason=Some(format!("{reason:?}"));
-            if !matches!(reason,uplink_ingest::EndReason::ExplicitStop) && state.error.is_none() {
+            if !matches!(reason,uplink_ingest::EndReason::ExplicitStop | uplink_ingest::EndReason::PeerClosed) && state.error.is_none() {
                 state.error=Some("Eingang wurde unterbrochen oder abgewiesen; der Endgrund ist im Status verfügbar.");
                 state.state="Fehler";
             }
