@@ -810,6 +810,8 @@ mod tests {
             let value = serde_json::to_value(&diagnostic).unwrap();
             assert_eq!(value["probe_result_available"], available);
             assert!(!value.to_string().contains("private-media-payload"));
+            assert!(value.get("probe_dump").is_none());
+            assert!(value.get("probe_dump_requested").is_none());
             assert_eq!(diagnostic.take_probe_dump(), expected.then_some(bytes));
         }
     }

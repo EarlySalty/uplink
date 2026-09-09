@@ -208,10 +208,9 @@ impl SessionProcessor for Coordinator {
             .await;
         if let Some(bytes) = diagnostic.take_probe_dump() {
             let directory = self.state.config.media.work_directory.clone();
-            let status =
-                tokio::task::spawn_blocking(move || crate::probe_dump::write(&directory, &bytes))
-                    .await
-                    .unwrap_or(crate::probe_dump::DumpStatus::WriteFailed);
+            let status = crate::probe_dump::spawn(reservation.clone(), directory, bytes)
+                .await
+                .unwrap_or(crate::probe_dump::DumpStatus::WriteFailed);
             diagnostic.probe_dump_finished(status.code());
         }
         let running = started.map_err(|error| {

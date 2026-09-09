@@ -13,6 +13,17 @@ pub(crate) const SLOT: &str = "obs-probe-dump";
 pub(crate) const FILE: &str = "input.flv";
 const PARTIAL: &str = ".partial";
 
+pub(crate) fn spawn(
+    reservation: std::sync::Arc<crate::registry::Reservation>,
+    directory: PathBuf,
+    bytes: Vec<u8>,
+) -> tokio::task::JoinHandle<DumpStatus> {
+    tokio::task::spawn_blocking(move || {
+        let _reservation = reservation;
+        write(&directory, &bytes)
+    })
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum DumpStatus {
     Saved,
@@ -185,6 +196,61 @@ mod tests {
         assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
         assert_eq!(write(&directory, b"replacement"), DumpStatus::SlotOccupied);
         assert_eq!(std::fs::read(path).unwrap(), bytes);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn queued_dump_keeps_admission_reserved_after_coordinator_cancellation() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let directory = directory();
+            let registry = crate::registry::Registry::new(1, 1).unwrap();
+            let reservation = std::sync::Arc::new(registry.reserve(538636411).unwrap());
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                ready_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+            ready_rx.await.unwrap();
+            let (queued_tx, queued_rx) = tokio::sync::oneshot::channel();
+            let destination = directory.clone();
+            let coordinator = tokio::spawn(async move {
+                let dump = spawn(reservation.clone(), destination, b"complete".to_vec());
+                queued_tx.send(()).unwrap();
+                dump.await.unwrap()
+            });
+            queued_rx.await.unwrap();
+            coordinator.abort();
+            assert!(coordinator.await.unwrap_err().is_cancelled());
+            let active_while_queued = registry.active_count();
+            let replacement_rejected = registry.reserve(538636411).is_err();
+            release_tx.send(()).unwrap();
+            blocker.await.unwrap();
+            tokio::task::spawn_blocking(|| {}).await.unwrap();
+            assert_eq!(
+                std::fs::read(directory.join(SLOT).join(FILE)).unwrap(),
+                b"complete"
+            );
+            std::fs::remove_dir_all(directory).unwrap();
+            assert_eq!(active_while_queued, 1);
+            assert!(replacement_rejected);
+            assert_eq!(registry.active_count(), 0);
+            assert!(registry.reserve(538636411).is_ok());
+        });
+    }
+
+    #[test]
+    fn dump_refuses_directory_accessible_to_other_users() {
+        let directory = directory();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(write(&directory, b"private"), DumpStatus::UnsafeDirectory);
+        assert!(!directory.join(SLOT).exists());
         std::fs::remove_dir_all(directory).unwrap();
     }
     #[test]
