@@ -39,23 +39,35 @@ async fn rejected_platform_publish_marks_the_entire_failed_session() {
 #[tokio::test]
 #[ignore = "Benötigt isolierte PostgreSQL 16 und geprüften FFmpeg 8."]
 async fn production_twitch_without_generation_preserves_healthy_youtube() {
-    normal_case(true, None, false, Some(("11", 0))).await;
+    normal_case(true, None, false, Some(("11", 0)), None).await;
 }
 
 #[tokio::test]
 #[ignore = "Benötigt isolierte PostgreSQL 16 und geprüften FFmpeg 8."]
 async fn production_twitch_with_stale_generation_preserves_healthy_youtube() {
-    normal_case(true, None, false, Some(("11", 2))).await;
+    normal_case(true, None, false, Some(("11", 2)), None).await;
 }
 
 #[tokio::test]
 #[ignore = "Benötigt isolierte PostgreSQL 16 und geprüften FFmpeg 8."]
 async fn production_twitch_with_wrong_token_owner_preserves_healthy_youtube() {
-    normal_case(true, None, false, Some(("12", 3))).await;
+    normal_case(true, None, false, Some(("12", 3)), None).await;
+}
+
+#[tokio::test]
+#[ignore = "Benötigt isolierte PostgreSQL 16 und geprüften FFmpeg 8."]
+async fn malformed_layout_with_portrait_disabled_preserves_healthy_youtube() {
+    normal_case(true, None, false, None, Some(false)).await;
+}
+
+#[tokio::test]
+#[ignore = "Benötigt isolierte PostgreSQL 16 und geprüften FFmpeg 8."]
+async fn malformed_layout_with_portrait_enabled_stops_only_twitch() {
+    normal_case(true, None, false, Some(("11", 3)), Some(true)).await;
 }
 
 async fn normal_audio_case(single_audio: bool, twitch_mode: Option<&str>, all_failed: bool) {
-    normal_case(single_audio, twitch_mode, all_failed, None).await;
+    normal_case(single_audio, twitch_mode, all_failed, None, None).await;
 }
 
 async fn normal_case(
@@ -63,6 +75,7 @@ async fn normal_case(
     twitch_mode: Option<&str>,
     all_failed: bool,
     production: Option<(&'static str, i64)>,
+    malformed_layout: Option<bool>,
 ) {
     use futures::FutureExt;
     use sha2::{Digest, Sha256};
@@ -197,6 +210,19 @@ async fn normal_case(
             axum::http::StatusCode::OK
         );
     }
+    if let Some(enabled) = malformed_layout {
+        state
+            .store
+            .query(
+                "INSERT INTO relay.hochkant_layouts(streamer_id,revision,layout) VALUES(11,1,'{}')",
+                &[],
+            )
+            .await
+            .unwrap();
+        if enabled {
+            state.store.query("UPDATE relay.destinations SET hochkant_enabled=true,hochkant_width=144,hochkant_height=256 WHERE streamer_id=11 AND platform='twitch'", &[]).await.unwrap();
+        }
+    }
     let coordinator = Arc::new(uplink_service::media::Coordinator::new(state.clone()).unwrap());
     let (stop, stopped) = tokio::sync::oneshot::channel();
     let (ready, bound) = tokio::sync::oneshot::channel();
@@ -277,7 +303,7 @@ async fn normal_case(
                     if let Some((owner, _)) = production {
                         let twitch = status["destinations"].as_array().unwrap().iter().find(|item| item["platform"]=="twitch").unwrap();
                         assert_eq!(twitch["output_state"],"failed");
-                        assert!(twitch["reason"].as_str().unwrap().contains(if owner == "11" {"Twitch-Verbindung"} else {"Kontoinhaber"}));
+                        assert!(twitch["reason"].as_str().unwrap().contains(if malformed_layout == Some(true) {"Hochkantwahl"} else if owner == "11" {"Twitch-Verbindung"} else {"Kontoinhaber"}));
                         assert!(twitch["active_profile"].is_null());
                         assert_eq!(broker_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
                     }

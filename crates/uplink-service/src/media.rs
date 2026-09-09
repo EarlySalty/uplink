@@ -98,7 +98,6 @@ impl Coordinator {
         tenant: u64,
         wunsch: Zielwunsch,
         source: &uplink_media::SourceObservation,
-        wahl: Option<&GespeicherteWahl>,
     ) -> Result<uplink_media::ProgramOutput, &'static str> {
         let output = wunsch.output;
         let granted = self
@@ -111,7 +110,15 @@ impl Coordinator {
                 "Der Twitch-Zugang oder sein Kontoinhaber konnte nicht bestätigt werden. Twitch erneut verbinden."
             })?;
         pruefe_publish_generation(granted, wunsch.generation)?;
-        let (ziel, layout) = match (wunsch.hochkant, wahl) {
+        let wahl = if wunsch.hochkant.is_some() {
+            self.gespeicherte_hochkant_wahl(
+                i64::try_from(tenant).map_err(|_| "Nutzeridentität ist ungültig.")?,
+            )
+            .await?
+        } else {
+            None
+        };
+        let (ziel, layout) = match (wunsch.hochkant, wahl.as_ref()) {
             (Some(ziel), Some(wahl)) => (Some(ziel), Some(wahl)),
             (Some(_), None) => {
                 return Err(
@@ -378,7 +385,6 @@ impl SessionProcessor for Coordinator {
         if rows.is_empty() {
             return Err("Kein Ausgabeziel ist aktiviert.");
         }
-        let gespeicherte_wahl = self.gespeicherte_hochkant_wahl(tenant).await?;
         let mut outputs = Vec::with_capacity(rows.len());
         for row in rows {
             let platform: String = row.try_get(0).map_err(|_| "Zieldaten sind ungültig.")?;
@@ -432,13 +438,8 @@ impl SessionProcessor for Coordinator {
             let ergebnis = {
                 let tenant_wert =
                     u64::try_from(tenant).map_err(|_| "Nutzeridentität ist ungültig.")?;
-                self.twitch_output(
-                    tenant_wert,
-                    wunsch,
-                    prepared.observation(),
-                    gespeicherte_wahl.as_ref(),
-                )
-                .await
+                self.twitch_output(tenant_wert, wunsch, prepared.observation())
+                    .await
             };
             match ergebnis {
                 Ok(program) => {

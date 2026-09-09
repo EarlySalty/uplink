@@ -475,6 +475,7 @@ impl Graph {
             .map_err(|_| MediaError::InvalidMedia)?;
         let mut target_ids: HashSet<_> = desired.iter().map(|output| &output.target.id).collect();
         let mut shared_audio = Vec::new();
+        let mut shared_audio_requests = HashMap::new();
         for output in outputs {
             if output.target.id.is_empty() || !target_ids.insert(&output.target.id) {
                 return Err(MediaError::InvalidConfiguration);
@@ -491,6 +492,7 @@ impl Graph {
                 let mut audio = Vec::new();
                 let mut audio_ids = HashSet::new();
                 let mut audio_encoding = Vec::new();
+                let mut audio_requests = HashMap::new();
                 for route in &output.audio {
                     if !audio_ids.insert(route.destination_wire_track) {
                         return Err(MediaError::InvalidConfiguration);
@@ -503,15 +505,18 @@ impl Graph {
                         .input_audio
                         .get(&wire)
                         .ok_or(MediaError::MissingTrack)?;
+                    if shared_audio_requests
+                        .get(&source)
+                        .is_some_and(|prior| *prior != route.encoding)
+                        || audio_requests
+                            .insert(source, route.encoding)
+                            .is_some_and(|prior| prior != route.encoding)
+                    {
+                        return Err(MediaError::UnsupportedProfile);
+                    }
                     if let Some(encoding) = route.encoding {
                         if !(1..=2).contains(&encoding.channels)
                             || !(32..=320).contains(&encoding.bitrate_kbps)
-                        {
-                            return Err(MediaError::UnsupportedProfile);
-                        }
-                        if audio_encoding
-                            .iter()
-                            .any(|(index, prior)| *index == source && *prior != encoding)
                         {
                             return Err(MediaError::UnsupportedProfile);
                         }
@@ -520,13 +525,6 @@ impl Graph {
                         }
                     }
                     audio.push((source, route.destination_wire_track));
-                }
-                if audio_encoding.iter().any(|(track, encoding)| {
-                    shared_audio
-                        .iter()
-                        .any(|(prior_track, prior)| prior_track == track && prior != encoding)
-                }) {
-                    return Err(MediaError::UnsupportedProfile);
                 }
                 let mut video = Vec::new();
                 let mut video_ids = HashSet::new();
@@ -600,6 +598,7 @@ impl Graph {
                         shared_audio.push(encoding);
                     }
                 }
+                shared_audio_requests.extend(audio_requests);
                 Ok(Routing {
                     timestamp_offset_ms: 0,
                     group: video[0].0,
@@ -1362,6 +1361,56 @@ mod tests {
         );
         assert_eq!(graph.profiles.len(), 1);
         assert!(!graph.profiles[0].signal_bt709);
+    }
+
+    #[test]
+    fn program_audio_copy_encode_conflicts_are_isolated_in_both_orders() {
+        for encoded_first in [false, true] {
+            let program = |id, encoded| {
+                let mut audio = program_audio(0, 0);
+                if encoded {
+                    audio.encoding = Some(crate::AudioEncoding {
+                        channels: 2,
+                        bitrate_kbps: 160,
+                    });
+                }
+                program_output(
+                    id,
+                    vec![program_video(
+                        0,
+                        0,
+                        program_profile(Codec::H264, 256, 144),
+                        None,
+                    )],
+                    vec![audio],
+                )
+            };
+            let graph = Graph::mixed(
+                &program_source(),
+                &[output("ordinary", 0, None)],
+                &[
+                    program("first", encoded_first),
+                    program("conflict", !encoded_first),
+                ],
+            )
+            .unwrap();
+            assert_eq!(graph.routes[0].failure, None);
+            assert_eq!(graph.routes[1].failure, None);
+            assert_eq!(
+                graph.routes[2].failure,
+                Some(MediaError::UnsupportedProfile)
+            );
+            assert_eq!(
+                graph
+                    .profiles
+                    .iter()
+                    .any(|profile| !profile.audio_encoding.is_empty()),
+                encoded_first
+            );
+            if encoded_first {
+                assert_eq!(graph.routes[0].group, None);
+            }
+        }
     }
 
     #[test]
