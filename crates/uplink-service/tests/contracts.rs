@@ -269,3 +269,54 @@ fn probe_dump_scope_is_optional_and_rejects_invalid_account_ids() {
         Some(538636411)
     );
 }
+
+#[test]
+fn normal_ingest_stops_keep_active_and_recent_status_free_of_errors() {
+    use uplink_ingest::EndReason;
+    for reason in [EndReason::ExplicitStop, EndReason::PeerClosed] {
+        let registry = Registry::new(1, 1).unwrap();
+        let reservation = registry.reserve(11).unwrap();
+        reservation.record(123);
+        reservation.ingest_ended(&reason);
+        let status = &registry.status(11)[0];
+        assert!(status.active);
+        assert!(status.error.is_none(), "{reason:?} ist ein normaler Stopp");
+        assert_ne!(status.state, "Fehler");
+        assert_eq!(status.ingest_end_reason, Some(format!("{reason:?}")));
+        reservation.ended();
+        assert_eq!(registry.status(11)[0].state, "Beendet");
+        drop(reservation);
+        let status = &registry.status(11)[0];
+        assert!(!status.active);
+        assert!(status.error.is_none());
+        assert_eq!(status.state, "Beendet");
+        let json = serde_json::to_value(status).unwrap();
+        assert!(json["error"].is_null());
+        assert_eq!(json["state"], "Beendet");
+        assert_eq!(json["ingest_end_reason"], format!("{reason:?}"));
+    }
+}
+
+#[test]
+fn media_rejection_and_existing_errors_survive_session_completion() {
+    use uplink_ingest::{EndReason, MediaError};
+    let registry = Registry::new(1, 1).unwrap();
+    let reservation = registry.reserve(11).unwrap();
+    reservation.ingest_ended(&EndReason::MediaRejected(MediaError::TimestampRegression));
+    reservation.ended();
+    assert_eq!(registry.status(11)[0].state, "Fehler");
+    drop(reservation);
+    let status = &registry.status(11)[0];
+    assert!(!status.active);
+    assert_eq!(status.state, "Fehler");
+    assert!(status.error.is_some());
+    assert_eq!(status.ingest_end_reason.as_deref(), Some("MediaRejected(TimestampRegression)"));
+    let reservation = registry.reserve(11).unwrap();
+    reservation.fail("Ausgang abgewiesen");
+    reservation.ingest_ended(&EndReason::PeerClosed);
+    reservation.ended();
+    drop(reservation);
+    let status = &registry.status(11)[0];
+    assert_eq!(status.state, "Fehler");
+    assert_eq!(status.error, Some("Ausgang abgewiesen"));
+}

@@ -1174,7 +1174,7 @@ async fn zero_media_sessions_keep_authorized_end_reasons_and_reject_anonymous_ch
     for (mode, expected, failed) in [
         ("truncated", "MediaRejected(Truncated)", true),
         ("stop", "ExplicitStop", false),
-        ("disconnect", "PeerClosed", true),
+        ("disconnect", "PeerClosed", false),
     ] {
         let socket = tokio::net::TcpStream::connect(address).await.unwrap();
         let mut peer = tokio_rustls::TlsConnector::from(certificates.client.clone())
