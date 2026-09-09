@@ -535,16 +535,30 @@ impl MediaEngine {
         input: mpsc::Receiver<MediaEvent>,
         diagnostic: &mut PreparationDiagnostic,
     ) -> Result<RunningMedia> {
+        self.start_prepared_mixed(prepared, Vec::new(), outputs, input, diagnostic)
+    }
+
+    pub fn start_prepared_mixed(
+        &self,
+        prepared: PreparedSource,
+        desired: Vec<crate::DesiredOutput>,
+        outputs: Vec<ProgramOutput>,
+        input: mpsc::Receiver<MediaEvent>,
+        diagnostic: &mut PreparationDiagnostic,
+    ) -> Result<RunningMedia> {
         diagnostic.phase = "graph";
-        if outputs.is_empty() || outputs.len() > self.config.limits.max_outputs {
+        let count = desired.len().saturating_add(outputs.len());
+        if count == 0 || count > self.config.limits.max_outputs {
             return Err(MediaError::InvalidConfiguration);
         }
-        let graph = Graph::program(&prepared.observation, &outputs)?;
-        let routes = outputs
+        let graph = Graph::mixed(&prepared.observation, &desired, &outputs)?;
+        let routes = desired
             .into_iter()
-            .map(|output| TargetRoute {
-                output_id: output.target.id.clone(),
-                target: output.target,
+            .map(|output| output.target)
+            .chain(outputs.into_iter().map(|output| output.target))
+            .map(|target| TargetRoute {
+                output_id: target.id.clone(),
+                target,
             })
             .collect();
         diagnostic.phase = "start_graph";

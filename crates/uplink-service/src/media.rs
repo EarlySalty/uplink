@@ -325,6 +325,21 @@ fn pruefe_publish_generation(granted: i64, expected: i64) -> Result<(), &'static
     Ok(())
 }
 
+fn lokales_testziel(config: &crate::config::Config, target: &PublishTarget) -> bool {
+    config.loopback_test_ca.is_some()
+        && config.ingest_bind.ip().is_loopback()
+        && target.allow_loopback
+        && reqwest::Url::parse(&target.endpoint).is_ok_and(|url| {
+            url.scheme() == "rtmps"
+                && url.host_str() == Some("localhost")
+                && url.username().is_empty()
+                && url.password().is_none()
+                && url.query().is_none()
+                && url.fragment().is_none()
+                && target.allowed_hosts == ["localhost"]
+        })
+}
+
 /// Nur der bekannte alte Twitch-Default wird auf den offiziellen sicheren
 /// Default abgebildet (https://ingest.twitch.tv/ingests). Keine generische
 /// Protokoll-/Hostumschreibung und keine Änderung des gespeicherten Wunsches.
@@ -406,10 +421,15 @@ impl SessionProcessor for Coordinator {
                 .map_err(|_| "Eingangsmessung konnte nicht dargestellt werden.")?,
         );
         let mut programs = Vec::new();
+        let mut desired = Vec::new();
         for wunsch in outputs {
             let output = &wunsch.output;
             let platform = output.target.id.clone();
-            let ergebnis = if platform == "twitch" {
+            if platform != "twitch" || lokales_testziel(&self.state.config, &output.target) {
+                desired.push(wunsch.output);
+                continue;
+            }
+            let ergebnis = {
                 let tenant_wert =
                     u64::try_from(tenant).map_err(|_| "Nutzeridentität ist ungültig.")?;
                 self.twitch_output(
@@ -419,8 +439,6 @@ impl SessionProcessor for Coordinator {
                     gespeicherte_wahl.as_ref(),
                 )
                 .await
-            } else {
-                crate::media_output::ordinary(wunsch.output)
             };
             match ergebnis {
                 Ok(program) => {
@@ -460,12 +478,12 @@ impl SessionProcessor for Coordinator {
                 Err(reason) => reservation.block_output(platform, reason),
             }
         }
-        if programs.is_empty() {
+        if programs.is_empty() && desired.is_empty() {
             return Err("Kein ausführbares Ausgabeziel ist verfügbar; siehe Zielstatus.");
         }
         let running = self
             .engine
-            .start_prepared_program(prepared, programs, events, &mut diagnostic)
+            .start_prepared_mixed(prepared, desired, programs, events, &mut diagnostic)
             .map_err(|error| {
                 preparation_failure(&reservation, error, serde_json::json!(diagnostic))
             })?;
@@ -586,5 +604,37 @@ mod tests {
             let fehler = super::pruefe_publish_generation(granted, expected).unwrap_err();
             assert!(fehler.contains("Twitch-Verbindung"));
         }
+    }
+
+    #[test]
+    fn lokaler_key_pfad_braucht_test_ca_und_begrenztes_loopback_ziel() {
+        let mut config =
+            crate::config::Config::parse(include_str!("../../../config/uplink-beispiel.toml"))
+                .unwrap();
+        config.ingest_bind = "127.0.0.1:0".parse().unwrap();
+        config.chat = None;
+        let mut target = uplink_media::PublishTarget {
+            id: "twitch".into(),
+            endpoint: "rtmps://localhost/live".into(),
+            playpath: uplink_media::PublishSecret::new(b"synthetic".to_vec()).unwrap(),
+            tls: None,
+            allowed_hosts: vec!["localhost".into()],
+            allow_loopback: true,
+            allow_unencrypted: false,
+        };
+        assert!(!super::lokales_testziel(&config, &target));
+        config.loopback_test_ca = Some("/tmp/public-test-ca.pem".into());
+        assert!(super::lokales_testziel(&config, &target));
+        target.endpoint = "rtmps://ingest.example/live".into();
+        assert!(!super::lokales_testziel(&config, &target));
+        target.endpoint = "rtmps://localhost/live".into();
+        target.allowed_hosts.push("ingest.example".into());
+        assert!(!super::lokales_testziel(&config, &target));
+        target.allowed_hosts = vec!["localhost".into()];
+        target.allow_loopback = false;
+        assert!(!super::lokales_testziel(&config, &target));
+        target.allow_loopback = true;
+        config.ingest_bind = "0.0.0.0:443".parse().unwrap();
+        assert!(!super::lokales_testziel(&config, &target));
     }
 }

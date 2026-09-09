@@ -91,43 +91,6 @@ pub fn profile(
     })
 }
 
-pub fn ordinary(output: DesiredOutput) -> Result<ProgramOutput, &'static str> {
-    let video = output.video;
-    let profile = profile(
-        video.width,
-        video.height,
-        video.fps,
-        video.codec,
-        video.bitrate_kbps,
-        2,
-        if video.codec == Codec::H264 {
-            "high"
-        } else {
-            "main"
-        }
-        .into(),
-    )?;
-    let audio = std::iter::once(output.live_audio_track)
-        .chain(output.vod_audio_track)
-        .enumerate()
-        .map(|(index, source)| ProgramAudio {
-            source_wire_track: source,
-            destination_wire_track: index as u8,
-            encoding: None,
-        })
-        .collect();
-    Ok(ProgramOutput {
-        target: output.target,
-        video: vec![ProgramVideo {
-            wire_track: 0,
-            canvas_index: 0,
-            profile,
-            layout: output.layout,
-        }],
-        audio,
-    })
-}
-
 pub fn preferences(
     source: &SourceObservation,
     output: &DesiredOutput,

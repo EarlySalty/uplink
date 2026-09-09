@@ -45,6 +45,18 @@ impl FlvTag {
     pub fn timestamp_ms(&self) -> u32 {
         self.timestamp_ms
     }
+    pub(crate) fn restore_mux_timestamp(&self, offset_ms: u32) -> Result<Self> {
+        if self.is_sequence_header() || self.kind == 18 {
+            return Ok(self.clone());
+        }
+        Ok(Self {
+            timestamp_ms: self
+                .timestamp_ms
+                .checked_sub(offset_ms)
+                .ok_or(MediaError::InvalidMedia)?,
+            ..self.clone()
+        })
+    }
     pub fn body(&self) -> &[u8] {
         &self.body
     }
@@ -331,6 +343,21 @@ mod tests {
         assert!(reader.next().await.unwrap().is_none());
         let mut reader = FlvReader::new(bytes.as_slice(), 2);
         assert!(reader.next().await.is_err());
+    }
+
+    #[test]
+    fn mux_offset_restoration_preserves_headers_and_rejects_frame_underflow() {
+        let frame = FlvTag::new(9, 145, Arc::from(&b"\x17\x01\x00\x00\x00\x01"[..]), 64).unwrap();
+        let restored = frame.restore_mux_timestamp(22).unwrap();
+        assert_eq!(restored.timestamp_ms(), 123);
+        assert_eq!(restored.body(), frame.body());
+        let early = FlvTag::new(9, 21, Arc::from(frame.body()), 64).unwrap();
+        assert!(matches!(
+            early.restore_mux_timestamp(22),
+            Err(MediaError::InvalidMedia)
+        ));
+        let header = FlvTag::new(9, 0, Arc::from(&b"\x17\x00\x00\x00\x00\x01"[..]), 64).unwrap();
+        assert_eq!(header.restore_mux_timestamp(22).unwrap().timestamp_ms(), 0);
     }
     #[test]
     fn role_remap_preserves_opaque_aac_data_and_video_cts() {

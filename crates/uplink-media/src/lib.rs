@@ -351,6 +351,7 @@ pub struct MediaStatus {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct OutputGraph {
+    pub timestamp_offset_ms: u32,
     pub id: String,
     pub profile_origin: &'static str,
     pub video: Vec<VideoProcessing>,

@@ -179,7 +179,13 @@ fn update_status(sinks: &Sinks, status: &watch::Sender<MediaStatus>) {
     });
 }
 
-fn distribute(tag: Arc<FlvTag>, group: Option<usize>, sinks: &Sinks, limits: &MediaLimits) {
+fn distribute(
+    tag: Arc<FlvTag>,
+    group: Option<usize>,
+    mux_offset_ms: u32,
+    sinks: &Sinks,
+    limits: &MediaLimits,
+) {
     let routed = limits.routing_limits();
     let mut sinks = sinks.lock().unwrap_or_else(|error| error.into_inner());
     for sink in sinks.iter_mut().filter(|sink| sink.failure.is_none()) {
@@ -196,6 +202,12 @@ fn distribute(tag: Arc<FlvTag>, group: Option<usize>, sinks: &Sinks, limits: &Me
             {
                 result = tag
                     .with_video_track(*destination, routed.max_tag_bytes)
+                    .and_then(|tag| {
+                        let offset = mux_offset_ms
+                            .checked_sub(sink.routing.timestamp_offset_ms)
+                            .ok_or(MediaError::InvalidConfiguration)?;
+                        tag.restore_mux_timestamp(offset)
+                    })
                     .and_then(|tag| pusher.try_send(Arc::new(tag)));
                 if result.is_err() {
                     break;
@@ -347,6 +359,7 @@ async fn run(
             let pid = pid.ok_or(MediaError::ProcessFailed)?;
             directory = Some(private);
             for (index, listener) in listeners.into_iter().enumerate() {
+                let mux_offset_ms = graph.profiles[index].mux_timestamp_offset_ms();
                 let limits = config.limits.clone();
                 let output_sinks = sinks.clone();
                 let output_status = status.clone();
@@ -354,7 +367,13 @@ async fn run(
                     let stream = accept_worker(&listener, pid, limits.startup_timeout).await?;
                     let mut reader = FlvReader::worker_output(stream, &limits);
                     while let Some(tag) = reader.next().await? {
-                        distribute(Arc::new(tag), Some(index), &output_sinks, &limits);
+                        distribute(
+                            Arc::new(tag),
+                            Some(index),
+                            mux_offset_ms,
+                            &output_sinks,
+                            &limits,
+                        );
                         update_status(&output_sinks, &output_status);
                     }
                     Ok(())
@@ -548,6 +567,11 @@ async fn consume(
     let mut keyframe = false;
     let mut started = false;
     let mut observed = HashSet::new();
+    let maximum_timestamp = graph
+        .profiles
+        .iter()
+        .filter_map(|profile| profile.maximum_input_timestamp_ms())
+        .min();
     if let Some(worker) = worker {
         timeout(limits.write_timeout, worker.write_all(HEADER))
             .await
@@ -579,6 +603,11 @@ async fn consume(
         }
         if !graph.expected_tracks.contains(&event.identity.track) {
             return Err(MediaError::WrongSession);
+        }
+        if maximum_timestamp
+            .is_some_and(|maximum| i64::from(event.dts_ms) > maximum || event.pts_ms > maximum)
+        {
+            return Err(MediaError::InvalidMedia);
         }
         if event.configuration_revision != 1
             && !(event.configuration_revision == 0 && event.event_kind == EventKind::Metadata)
@@ -646,7 +675,7 @@ async fn deliver(
     status: &watch::Sender<MediaStatus>,
     limits: &MediaLimits,
 ) -> Result<()> {
-    distribute(tag.clone(), None, sinks, limits);
+    distribute(tag.clone(), None, 0, sinks, limits);
     update_status(sinks, status);
     if let Some(worker) = worker {
         timeout(limits.write_timeout, tag.write_to(worker))
@@ -710,6 +739,7 @@ mod tests {
             let sinks = Arc::new(Mutex::new(vec![Sink {
                 pusher: Some(pusher),
                 routing: crate::graph::Routing {
+                    timestamp_offset_ms: 0,
                     group: None,
                     video: vec![(None, 5)],
                     audio: vec![(0, 3)],
@@ -717,7 +747,7 @@ mod tests {
                 },
                 failure: None,
             }]));
-            distribute(tag, None, &sinks, &limits);
+            distribute(tag, None, 0, &sinks, &limits);
             assert_eq!(
                 sinks.lock().unwrap()[0].failure,
                 None,
@@ -885,6 +915,7 @@ mod tests {
             Sink {
                 pusher: Some(stalled),
                 routing: Routing {
+                    timestamp_offset_ms: 0,
                     group: Some(0),
                     video: vec![(Some(0), 0)],
                     audio: Vec::new(),
@@ -895,6 +926,7 @@ mod tests {
             Sink {
                 pusher: Some(healthy),
                 routing: Routing {
+                    timestamp_offset_ms: 0,
                     group: Some(0),
                     video: vec![(Some(0), 3)],
                     audio: Vec::new(),
@@ -908,6 +940,7 @@ mod tests {
         distribute(
             Arc::new(FlvTag::new(9, 0, body.clone(), 64).unwrap()),
             Some(0),
+            0,
             &sinks,
             &limits,
         );
@@ -915,6 +948,7 @@ mod tests {
         distribute(
             Arc::new(FlvTag::new(9, 40, body, 64).unwrap()),
             Some(0),
+            0,
             &sinks,
             &limits,
         );
@@ -926,6 +960,7 @@ mod tests {
         distribute(
             Arc::new(FlvTag::new(9, 80, Arc::from(&b"\x17\x01\x00\x00\x00"[..]), 64).unwrap()),
             Some(0),
+            0,
             &sinks,
             &limits,
         );

@@ -318,6 +318,14 @@ fn permitted_ip(ip: IpAddr, allow_loopback: bool) -> bool {
     }
 }
 
+fn permitted_target_ip(ip: IpAddr, host: &str, allow_loopback: bool) -> bool {
+    if allow_loopback && host == "localhost" {
+        ip.is_loopback()
+    } else {
+        permitted_ip(ip, allow_loopback)
+    }
+}
+
 trait Socket: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Socket for T {}
 struct Client {
@@ -359,7 +367,7 @@ impl Client {
             || addresses.len() > 16
             || addresses
                 .iter()
-                .any(|a| !permitted_ip(a.ip(), target.allow_loopback))
+                .any(|a| !permitted_target_ip(a.ip(), &endpoint.host, target.allow_loopback))
         {
             return Err(MediaError::EndpointRejected);
         }
@@ -1015,6 +1023,34 @@ mod tests {
         task::{Context, Poll},
     };
     use tokio::io::ReadBuf;
+
+    #[test]
+    fn localhost_test_target_rejects_non_loopback_resolution() {
+        for address in ["8.8.8.8", "2606:4700::1111", "10.1.1.1", "::ffff:8.8.8.8"] {
+            assert!(!permitted_target_ip(
+                address.parse().unwrap(),
+                "localhost",
+                true
+            ));
+        }
+        for address in ["127.0.0.1", "::1"] {
+            assert!(permitted_target_ip(
+                address.parse().unwrap(),
+                "localhost",
+                true
+            ));
+            assert!(!permitted_target_ip(
+                address.parse().unwrap(),
+                "localhost",
+                false
+            ));
+        }
+        assert!(permitted_target_ip(
+            "8.8.8.8".parse().unwrap(),
+            "ingest.example",
+            false
+        ));
+    }
 
     /// deleteStream wird vollständig geschrieben, während im selben Poll die
     /// Antwort lesbar wird. Kein Scheduling-Zufall und keine echte Gegenstelle.

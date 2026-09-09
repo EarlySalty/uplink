@@ -58,7 +58,13 @@ async fn capture(server: IngestServer<Auth>) -> Vec<MediaEvent> {
     while let Some(event) = connection.next().await {
         events.push(event);
     }
-    assert_eq!(connection.finish().await.reason, EndReason::ExplicitStop);
+    let report = connection.finish().await;
+    assert_eq!(
+        report.reason,
+        EndReason::ExplicitStop,
+        "{:?}",
+        report.timestamp_rejection
+    );
     events
 }
 
@@ -315,6 +321,290 @@ async fn bt709_fixture() -> Vec<u8> {
         .unwrap()
         .unwrap();
     write.await.unwrap();
+    assert!(output.status.success());
+    output.stdout
+}
+
+#[tokio::test]
+#[ignore = "Benötigt den installierten geprüften FFmpeg-8-Build; ausschließlich lokales TLS."]
+async fn mixed_program_encodes_audio_while_ordinary_preserves_aac_with_one_decoder() {
+    for offset in [0, 123] {
+        mixed_program_case(offset).await;
+    }
+}
+
+async fn mixed_program_case(offset: u32) {
+    let original = bt709_fixture().await;
+    let mut fixture = HEADER.to_vec();
+    let mut reader = FlvReader::new(&original[..], 65536);
+    while let Some(tag) = reader.next().await.unwrap() {
+        FlvTag::new(
+            tag.kind(),
+            tag.timestamp_ms() + offset,
+            Arc::from(tag.body()),
+            65536,
+        )
+        .unwrap()
+        .write_to(&mut fixture)
+        .await
+        .unwrap();
+    }
+    let events = source_events_from(&fixture, false).await;
+    let expected_video: Vec<_> = events
+        .iter()
+        .filter(|event| {
+            event.identity.track.kind == MediaKind::Video && event.event_kind == EventKind::Frame
+        })
+        .map(|event| event.dts_ms)
+        .collect();
+    let expected_audio: Vec<_> = events
+        .iter()
+        .filter(|event| {
+            event.identity.track.kind == MediaKind::Audio
+                && event.identity.track.wire_id == 1
+                && event.event_kind == EventKind::Frame
+        })
+        .map(|event| (event.dts_ms, event.payload().to_vec()))
+        .collect();
+    let (ordinary_server, mut ordinary_target) = endpoint().await;
+    ordinary_target.id = "youtube".into();
+    let (program_server, mut program_target) = endpoint().await;
+    program_target.id = "twitch".into();
+    let ordinary_capture = tokio::spawn(capture(ordinary_server));
+    let program_capture = tokio::spawn(capture(program_server));
+    let (first, mut receive) = input(events);
+    let engine = engine();
+    let mut diagnostic = PreparationDiagnostic::default();
+    let prepared = engine
+        .prepare_source_diagnosed(first, &mut receive, &HashSet::from([0, 1]), &mut diagnostic)
+        .await
+        .unwrap();
+    let mut lower = profile();
+    lower.width = 128;
+    lower.height = 72;
+    let running = engine
+        .start_prepared_mixed(
+            prepared,
+            vec![DesiredOutput {
+                target: ordinary_target,
+                video: DesiredVideo {
+                    width: 256,
+                    height: 144,
+                    fps: FrameRate::new(25, 1).unwrap(),
+                    bitrate_kbps: 384,
+                    codec: Codec::H264,
+                },
+                live_audio_track: 1,
+                vod_audio_track: None,
+                layout: None,
+            }],
+            vec![ProgramOutput {
+                target: program_target,
+                video: [profile(), lower]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, profile)| ProgramVideo {
+                        wire_track: index as u8,
+                        canvas_index: 0,
+                        profile,
+                        layout: None,
+                    })
+                    .collect(),
+                audio: [0, 1]
+                    .into_iter()
+                    .map(|track| crate::ProgramAudio {
+                        source_wire_track: track,
+                        destination_wire_track: track,
+                        encoding: Some(crate::AudioEncoding {
+                            channels: 2,
+                            bitrate_kbps: 160,
+                        }),
+                    })
+                    .collect(),
+            }],
+            receive,
+            &mut diagnostic,
+        )
+        .unwrap();
+    let report = timeout(Duration::from_secs(15), running.finish())
+        .await
+        .unwrap();
+    assert_eq!(report.error, None);
+    assert_eq!(report.status.video_decoders, 1);
+    assert_eq!(report.status.encode_groups, 2);
+    assert_eq!(report.status.graph[0].timestamp_offset_ms, 0);
+    assert_eq!(report.status.graph[1].timestamp_offset_ms, 22);
+    assert!(
+        report
+            .status
+            .outputs
+            .iter()
+            .all(|output| output.state == OutputState::LocalEndUnconfirmed)
+    );
+    let ordinary = timeout(Duration::from_secs(5), ordinary_capture)
+        .await
+        .unwrap()
+        .unwrap();
+    let program = timeout(Duration::from_secs(5), program_capture)
+        .await
+        .unwrap()
+        .unwrap();
+    let audio: Vec<_> = ordinary
+        .iter()
+        .filter(|event| {
+            event.identity.track.kind == MediaKind::Audio && event.event_kind == EventKind::Frame
+        })
+        .map(|event| {
+            assert_eq!(event.identity.track.wire_id, 0);
+            (event.dts_ms, event.payload().to_vec())
+        })
+        .collect();
+    assert_eq!(audio, expected_audio);
+    let ordinary_video: Vec<_> = ordinary
+        .iter()
+        .filter(|event| {
+            event.identity.track.kind == MediaKind::Video && event.event_kind == EventKind::Frame
+        })
+        .map(|event| event.dts_ms)
+        .collect();
+    assert_eq!(ordinary_video, expected_video);
+    assert_eq!(
+        ordinary
+            .iter()
+            .filter(|event| event.identity.track.kind == MediaKind::Video
+                && event.event_kind == EventKind::Frame)
+            .count(),
+        50
+    );
+    for track in [0, 1] {
+        let actual_video: Vec<_> = program
+            .iter()
+            .filter(|event| {
+                event.identity.track.kind == MediaKind::Video
+                    && event.identity.track.wire_id == track
+                    && event.event_kind == EventKind::Frame
+            })
+            .map(|event| event.dts_ms)
+            .collect();
+        assert_eq!(
+            actual_video,
+            expected_video
+                .iter()
+                .map(|timestamp| timestamp + 22)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            program
+                .iter()
+                .filter(|event| event.identity.track.kind == MediaKind::Video
+                    && event.identity.track.wire_id == track
+                    && event.event_kind == EventKind::Frame)
+                .count(),
+            50
+        );
+        assert!(
+            program
+                .iter()
+                .any(|event| event.identity.track.kind == MediaKind::Audio
+                    && event.identity.track.wire_id == track
+                    && event.event_kind == EventKind::Frame)
+        );
+    }
+    let encoded: Vec<_> = program
+        .iter()
+        .filter(|event| {
+            event.identity.track.kind == MediaKind::Audio
+                && event.identity.track.wire_id == 1
+                && event.event_kind == EventKind::Frame
+        })
+        .map(|event| (event.dts_ms, event.payload().to_vec()))
+        .collect();
+    assert_ne!(encoded, expected_audio);
+    assert_eq!(encoded[0].0, offset + 1);
+    assert!(
+        encoded
+            .windows(2)
+            .all(|packets| packets[0].0 < packets[1].0)
+    );
+    let mut received_flv = HEADER.to_vec();
+    for event in program.iter().filter(|event| {
+        event.identity.track.kind == MediaKind::Audio && event.identity.track.wire_id == 1
+    }) {
+        FlvTag::from_event(event, 65536)
+            .unwrap()
+            .with_audio_track(0, 65536)
+            .unwrap()
+            .write_to(&mut received_flv)
+            .await
+            .unwrap();
+    }
+    let reference = ffmpeg_bytes(
+        fixture.clone(),
+        &[
+            "-copyts",
+            "-f",
+            "flv",
+            "-i",
+            "pipe:0",
+            "-map",
+            "0:a:1",
+            "-c:a",
+            "aac",
+            "-ar",
+            "48000",
+            "-ac",
+            "2",
+            "-b:a",
+            "160k",
+            "-output_ts_offset",
+            "0.022",
+            "-avoid_negative_ts",
+            "disabled",
+            "-f",
+            "flv",
+            "pipe:1",
+        ],
+    )
+    .await;
+    let decode = [
+        "-f", "flv", "-i", "pipe:0", "-map", "0:a:0", "-ac", "2", "-f", "f32le", "pipe:1",
+    ];
+    let received_pcm = ffmpeg_bytes(received_flv, &decode).await;
+    let reference_pcm = ffmpeg_bytes(reference, &decode).await;
+    assert_eq!(
+        received_pcm, reference_pcm,
+        "Auch der vollständige AAC-Encoder-Vorlauf bleibt erhalten"
+    );
+    let source_pcm = ffmpeg_bytes(
+        fixture,
+        &[
+            "-f", "flv", "-i", "pipe:0", "-map", "0:a:1", "-ac", "2", "-f", "f32le", "pipe:1",
+        ],
+    )
+    .await;
+    assert_eq!(received_pcm.len(), source_pcm.len() + 1024 * 2 * 4);
+}
+
+async fn ffmpeg_bytes(bytes: Vec<u8>, arguments: &[&str]) -> Vec<u8> {
+    let mut child = Command::new(FFMPEG)
+        .args(["-nostdin", "-v", "error"])
+        .args(arguments)
+        .env_clear()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let writer = tokio::spawn(async move {
+        stdin.write_all(&bytes).await.unwrap();
+    });
+    let output = timeout(Duration::from_secs(10), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    writer.await.unwrap();
     assert!(output.status.success());
     output.stdout
 }
