@@ -31,6 +31,18 @@ pub struct Reservation {
     id: u64,
     tenant: u64,
     registry: Weak<Mutex<State>>,
+    report: Mutex<Option<uplink_ingest::SessionReport>>,
+    ingest_ended_at: Mutex<Option<std::time::SystemTime>>,
+    media_diagnostic: Mutex<Option<serde_json::Value>>,
+    completion: Option<Box<dyn FnOnce(SessionCompletion) + Send + Sync>>,
+}
+pub struct SessionCompletion {
+    pub streamer_id: u64,
+    pub ended_at: std::time::SystemTime,
+    pub duration: std::time::Duration,
+    pub source_tracks: usize,
+    pub end_reason: String,
+    pub profile: serde_json::Value,
 }
 pub struct TenantChange {
     tenant: u64,
@@ -101,6 +113,10 @@ impl Registry {
             id,
             tenant,
             registry: Arc::downgrade(&self.0),
+            report: Mutex::new(None),
+            ingest_ended_at: Mutex::new(None),
+            media_diagnostic: Mutex::new(None),
+            completion: None,
         })
     }
     pub fn begin_change(&self, tenant: u64) -> Result<Arc<TenantChange>, &'static str> {
@@ -151,6 +167,30 @@ impl Registry {
     }
 }
 impl Reservation {
+    pub fn media_diagnostic(&self, value: serde_json::Value) {
+        *self
+            .media_diagnostic
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(value);
+    }
+    pub fn on_completion(
+        &mut self,
+        completion: impl FnOnce(SessionCompletion) + Send + Sync + 'static,
+    ) {
+        self.completion = Some(Box::new(completion));
+    }
+    pub fn ingest_report(&self, report: &uplink_ingest::SessionReport) {
+        *self
+            .ingest_ended_at
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(std::time::SystemTime::now());
+        self.generation(report.generation);
+        self.ingest_ended(&report.reason);
+        *self
+            .report
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(report.clone());
+    }
     pub fn generation(&self, generation: uplink_ingest::ConnectionGeneration) {
         // Nur servergenerierte Zufallsinstanz und Zähler, keine Zugangsdaten.
         self.update(|state| state.generation = Some(format!("{generation:?}")));
@@ -216,18 +256,76 @@ impl Reservation {
 }
 impl Drop for Reservation {
     fn drop(&mut self) {
-        if let Some(registry) = self.registry.upgrade() {
+        let Some(registry) = self.registry.upgrade() else {
+            return;
+        };
+        let snapshot = registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .active
+            .get(&self.id)
+            .cloned();
+        if let Some((tenant, mut status)) = snapshot {
+            status.active = false;
+            if status.error.is_none() {
+                status.state = "Beendet";
+            }
+            let completed = self.completion.take().map(|completion| {
+                    let report = self
+                        .report
+                        .get_mut()
+                        .unwrap_or_else(|error| error.into_inner());
+                    let reason = report
+                        .as_ref()
+                        .map_or(uplink_ingest::EndReason::TaskFailed, |report| report.reason);
+                    let mut end_reason = match (reason, status.error) {
+                        (uplink_ingest::EndReason::ConsumerClosed, Some(error)) => {
+                            format!("ConsumerClosed: {error}")
+                        }
+                        _ => format!("{reason:?}"),
+                    };
+                    status.ingest_end_reason = Some(end_reason.clone());
+                    let media_diagnostic = self
+                        .media_diagnostic
+                        .get_mut()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .take();
+                    if let Some(diagnostic) = &media_diagnostic {
+                        end_reason.push_str("; Diagnose=");
+                        end_reason.push_str(&diagnostic.to_string());
+                    }
+                    (completion, SessionCompletion {
+                        streamer_id: tenant,
+                        ended_at: self
+                            .ingest_ended_at
+                            .get_mut()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .unwrap_or_else(std::time::SystemTime::now),
+                        duration: report
+                            .as_ref()
+                            .map_or(std::time::Duration::ZERO, |report| report.duration),
+                        source_tracks: report.as_ref().map_or(0, |report| report.track_count),
+                        end_reason,
+                        profile: serde_json::json!({
+                            "media_diagnostic": media_diagnostic,
+                            "source_observation": status.source_observation,
+                            "outputs": status.outputs,
+                            "received_events": report.as_ref().map_or(0, |report| report.received_events),
+                            "received_bytes": report.as_ref().map_or(0, |report| report.received_bytes),
+                            "source_tracks": report.as_ref().map_or(0, |report| report.track_count),
+                        }),
+                    })
+                });
             let mut state = registry.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some((tenant, mut status)) = state.active.remove(&self.id) {
-                status.active = false;
-                if status.error.is_none() {
-                    status.state = "Beendet";
-                }
-                state.recent.retain(|(t, _)| *t != tenant);
-                state.recent.push_back((tenant, status));
-                while state.recent.len() > state.total.saturating_mul(2) {
-                    state.recent.pop_front();
-                }
+            state.active.remove(&self.id);
+            state.recent.retain(|(t, _)| *t != tenant);
+            state.recent.push_back((tenant, status));
+            while state.recent.len() > state.total.saturating_mul(2) {
+                state.recent.pop_front();
+            }
+            drop(state);
+            if let Some((completion, record)) = completed {
+                completion(record);
             }
         }
     }

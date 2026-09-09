@@ -486,3 +486,110 @@ async fn independent_wrapped_aac_must_survive_worker_reader_limit() {
         .is_some()
     {}
 }
+
+#[tokio::test]
+#[ignore = "Benötigt geprüften FFmpeg 8 und ausschließlich lokale TLS-Verbindungen."]
+async fn obs_shaped_header_order_metadata_large_keyframe_and_60fps_keep_probe_diagnosis() {
+    let mut reader = FlvReader::new(FIXTURE, 2 * 1024 * 1024);
+    let mut tags = Vec::new();
+    while let Some(tag) = reader.next().await.unwrap() {
+        tags.push(tag);
+    }
+    let audio_header = tags
+        .iter()
+        .find(|tag| {
+            tag.kind() == 8 && tag.is_sequence_header() && tag.audio_track().unwrap() == Some(0)
+        })
+        .unwrap();
+    let video_header = tags
+        .iter()
+        .find(|tag| tag.kind() == 9 && tag.is_sequence_header())
+        .unwrap();
+    let video_frame = tags
+        .iter()
+        .find(|tag| tag.kind() == 9 && !tag.is_sequence_header())
+        .unwrap();
+    let audio_frame = tags
+        .iter()
+        .find(|tag| {
+            tag.kind() == 8 && !tag.is_sequence_header() && tag.audio_track().unwrap() == Some(0)
+        })
+        .unwrap();
+    let certificates = tls::test_tls();
+    let mut limits = IngestLimits::local_probe();
+    limits.max_event_bytes = 2 * 1024 * 1024;
+    limits.max_queued_bytes = 8 * 1024 * 1024;
+    limits.rtmp.chunk.max_message_bytes = 2 * 1024 * 1024;
+    limits.rtmp.chunk.max_partial_bytes = 8 * 1024 * 1024;
+    let server = IngestServer::bind_loopback(0, certificates.server, Arc::new(Auth), limits)
+        .await
+        .unwrap();
+    let target = PublishTarget {
+        id: "obs-shaped-local".into(),
+        endpoint: format!(
+            "rtmps://localhost:{}/live",
+            server.local_addr().unwrap().port()
+        ),
+        playpath: PublishSecret::new(b"review-synthetic".to_vec()).unwrap(),
+        tls: Some(certificates.client),
+        allowed_hosts: vec!["localhost".into()],
+        allow_loopback: true,
+        allow_unencrypted: false,
+    };
+    let captured = tokio::spawn(capture(server));
+    let producer = RunningPusher::start(target, MediaLimits::default())
+        .await
+        .unwrap();
+    producer.try_send(Arc::new(audio_header.clone())).unwrap();
+    producer.try_send(Arc::new(video_header.clone())).unwrap();
+    producer
+        .try_send(Arc::new(
+            FlvTag::new(
+                9,
+                0,
+                Arc::from(&b"\x94avc1\x03\x00\x00\x09"[..]),
+                2 * 1024 * 1024,
+            )
+            .unwrap(),
+        ))
+        .unwrap();
+    let mut large = video_frame.body().to_vec();
+    let filler_size = 600 * 1024u32;
+    large.extend_from_slice(&filler_size.to_be_bytes());
+    large.push(12);
+    large.extend(std::iter::repeat_n(0xff, filler_size as usize - 2));
+    large.push(0x80);
+    producer
+        .try_send(Arc::new(
+            FlvTag::new(9, 0, Arc::from(large), 2 * 1024 * 1024).unwrap(),
+        ))
+        .unwrap();
+    for frame in 1..=60u32 {
+        let timestamp = (frame * 1000 + 30) / 60;
+        producer
+            .try_send(Arc::new(
+                FlvTag::new(9, timestamp, Arc::from(video_frame.body()), 2 * 1024 * 1024).unwrap(),
+            ))
+            .unwrap();
+        producer
+            .try_send(Arc::new(
+                FlvTag::new(8, timestamp, Arc::from(audio_frame.body()), 2 * 1024 * 1024).unwrap(),
+            ))
+            .unwrap();
+    }
+    producer.finish().await.unwrap();
+    let events = captured.await.unwrap();
+    assert_eq!(events[0].identity.track.kind, MediaKind::Audio);
+    assert_eq!(events[1].identity.track.kind, MediaKind::Video);
+    assert_eq!(events[2].event_kind, EventKind::Metadata);
+    assert!(events[3].wire_body().len() > 500 * 1024);
+    let (first, mut receiver) = input(events);
+    let mut diagnostic = PreparationDiagnostic::default();
+    let result = engine()
+        .prepare_source_diagnosed(first, &mut receiver, &HashSet::from([0]), &mut diagnostic)
+        .await;
+    assert!(matches!(result, Err(MediaError::Io)));
+    assert_eq!(diagnostic.phase, "probe");
+    assert_eq!(diagnostic.ffprobe_exit_code, Some(0));
+    assert!(diagnostic.ffprobe_stderr_first_line.is_some());
+}

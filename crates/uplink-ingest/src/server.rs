@@ -115,6 +115,7 @@ pub enum EndReason {
 #[derive(Debug, Clone)]
 pub struct SessionReport {
     pub reason: EndReason,
+    pub duration: Duration,
     pub generation: ConnectionGeneration,
     pub received_events: u64,
     pub received_bytes: u64,
@@ -315,8 +316,10 @@ impl<A: Authorizer> IngestServer<A> {
             counter,
         };
         let (sender, receiver) = mpsc::channel(self.limits.max_queued_events);
+        let (stop_consumer, consumer_stopped) = watch::channel(false);
         let report = Arc::new(Mutex::new(SessionReport {
             reason: EndReason::ProtocolRejected,
+            duration: Duration::ZERO,
             generation,
             received_events: 0,
             received_bytes: 0,
@@ -336,12 +339,14 @@ impl<A: Authorizer> IngestServer<A> {
                 pending,
                 sessions: self.slots.clone(),
                 start_deadline,
+                consumer_stopped,
             },
         ));
         Ok(RunningConnection {
             receiver,
             task: Some(task),
             report,
+            stop_consumer,
             _slot: slot,
         })
     }
@@ -351,9 +356,17 @@ pub struct RunningConnection {
     receiver: mpsc::Receiver<MediaEvent>,
     task: Option<JoinHandle<SessionReport>>,
     report: Arc<Mutex<SessionReport>>,
+    stop_consumer: watch::Sender<bool>,
     _slot: Arc<SessionSlot>,
 }
 impl RunningConnection {
+    pub fn stop_consumer(&self) {
+        self.stop_consumer.send_replace(true);
+    }
+    pub async fn finish_consumer(self) -> SessionReport {
+        self.stop_consumer();
+        self.finish().await
+    }
     pub async fn next(&mut self) -> Option<MediaEvent> {
         self.receiver.recv().await
     }
@@ -418,6 +431,7 @@ struct AuthorizationCompletion<A: Authorizer> {
     session: Arc<Mutex<Option<AuthorizedSession>>>,
     report: Arc<Mutex<SessionReport>>,
     finished: bool,
+    started: Instant,
 }
 impl<A: Authorizer> Drop for AuthorizationCompletion<A> {
     fn drop(&mut self) {
@@ -435,6 +449,7 @@ impl<A: Authorizer> Drop for AuthorizationCompletion<A> {
             if !self.finished && report.reason == EndReason::ProtocolRejected {
                 report.reason = EndReason::TaskFailed;
             }
+            report.duration = self.started.elapsed();
             self.authorizer.completed(session, &report);
             self.authorizer.release(session);
         }
@@ -669,6 +684,7 @@ struct Admission {
     pending: OwnedSemaphorePermit,
     sessions: Arc<Semaphore>,
     start_deadline: Instant,
+    consumer_stopped: watch::Receiver<bool>,
 }
 
 async fn run_connection<A: Authorizer>(
@@ -685,7 +701,9 @@ async fn run_connection<A: Authorizer>(
         session: Arc::new(Mutex::new(None)),
         report: report.clone(),
         finished: false,
+        started: admission.start_deadline - limits.start_timeout,
     };
+    let mut consumer_stopped = admission.consumer_stopped;
     let deadline = admission.start_deadline;
     let reason = match timeout_at(deadline, TlsAcceptor::from(tls).accept(socket)).await {
         Err(_) => EndReason::StartTimeout,
@@ -726,6 +744,7 @@ async fn run_connection<A: Authorizer>(
                             deadline
                         };
                         tokio::select! {
+                            biased;
                             result = &mut future => {
                                 let saved = report.lock().unwrap_or_else(|e| e.into_inner()).reason;
                                 break match result {
@@ -736,6 +755,7 @@ async fn run_connection<A: Authorizer>(
                                     Err(_) => EndReason::ProtocolRejected,
                                 };
                             }
+                            _ = consumer_stopped.changed() => break EndReason::ConsumerClosed,
                             _ = sleep_until(expiry) => { break if current.published { EndReason::MediaTimeout } else { EndReason::StartTimeout }; }
                             changed = activity.changed() => { if changed.is_err() { continue; } }
                         }
@@ -746,6 +766,7 @@ async fn run_connection<A: Authorizer>(
     };
     let mut final_report = report.lock().unwrap_or_else(|e| e.into_inner()).clone();
     final_report.reason = reason;
+    final_report.duration = completion.started.elapsed();
     *report.lock().unwrap_or_else(|error| error.into_inner()) = final_report.clone();
     completion.finished = true;
     final_report
@@ -771,6 +792,7 @@ mod tests {
         };
         let report = Arc::new(Mutex::new(SessionReport {
             reason: EndReason::ProtocolRejected,
+            duration: Duration::ZERO,
             generation,
             received_events: 0,
             received_bytes: 0,

@@ -83,6 +83,7 @@ pub(crate) async fn fixture() -> (Database, Arc<ServiceState>) {
         "CREATE TABLE relay.users(streamer_id bigint PRIMARY KEY,enabled boolean NOT NULL,ingest_key_enc bytea,dock_token_enc bytea,ingest_key_hash text,reconnect_wait_s integer NOT NULL DEFAULT 0)",
         "CREATE TABLE relay.destinations(streamer_id bigint REFERENCES relay.users(streamer_id),platform text NOT NULL,rtmp_url text NOT NULL,stream_key_enc bytea NOT NULL,enabled boolean NOT NULL,width integer,height integer,fps integer,bitrate_kbps integer,UNIQUE(streamer_id,platform))",
         "CREATE TABLE relay.waitlist(streamer_id bigint PRIMARY KEY)",
+        "CREATE TABLE relay.sessions(id bigserial PRIMARY KEY,streamer_id bigint NOT NULL,started_at timestamptz NOT NULL,ended_at timestamptz,ingest_protocol text NOT NULL,ingest_codec text,profile_json jsonb NOT NULL,end_reason text)",
         include_str!("../../../../db/migrations/20260908_destination_fences.sql"),
         include_str!("../../../../db/migrations/20260908_twitch_audio_mode.sql"),
     ] {

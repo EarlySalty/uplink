@@ -1,11 +1,14 @@
 use crate::{
     api::{ServiceState, router},
-    registry::Reservation,
+    registry::{Reservation, SessionCompletion},
 };
 use std::{
     collections::HashMap,
     future::Future,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 use tokio::{net::TcpListener, sync::mpsc, task::JoinSet};
 use uplink_ingest::{AuthorizedSession, Authorizer, IngestServer, MediaEvent};
@@ -13,12 +16,94 @@ use uplink_ingest::{AuthorizedSession, Authorizer, IngestServer, MediaEvent};
 pub struct ServiceAuthorizer {
     state: Arc<ServiceState>,
     reservations: Mutex<HashMap<AuthorizedSession, Arc<Reservation>>>,
+    recorder: SessionRecorder,
+}
+#[derive(Clone)]
+struct SessionRecorder {
+    tasks: Arc<Mutex<JoinSet<()>>>,
+    store: Arc<crate::store::Store>,
+    slots: Arc<tokio::sync::Semaphore>,
+    capacity: u32,
+    failed: Arc<AtomicBool>,
+}
+impl SessionRecorder {
+    fn new(state: &ServiceState) -> Self {
+        Self {
+            tasks: Arc::new(Mutex::new(JoinSet::new())),
+            store: state.store.clone(),
+            slots: Arc::new(tokio::sync::Semaphore::new(state.config.max_sessions)),
+            capacity: state.config.max_sessions as u32,
+            failed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+    fn joined(&self, result: Result<(), tokio::task::JoinError>) {
+        if result.is_err() {
+            self.failed.store(true, Ordering::Release);
+            eprintln!("Uplink-Abschlussaufgabe wurde vor ihrem bestätigten Ende abgebrochen.");
+        }
+    }
+    fn record(&self, record: SessionCompletion, permit: tokio::sync::OwnedSemaphorePermit) {
+        let mut tasks = self.tasks.lock().unwrap_or_else(|error| error.into_inner());
+        while let Some(result) = tasks.try_join_next() {
+            self.joined(result);
+        }
+        let store = self.store.clone();
+        let worker_failed = self.failed.clone();
+        tasks.spawn(async move {
+                let _permit = permit;
+                let streamer_id = i64::try_from(record.streamer_id);
+                let started_at = record.ended_at.checked_sub(record.duration);
+                let result = match (streamer_id, started_at) {
+                    (Ok(streamer_id), Some(started_at)) => store.query_completion(
+                        "INSERT INTO relay.sessions(streamer_id,started_at,ended_at,ingest_protocol,profile_json,end_reason) VALUES($1,$2,$3,'rtmps',$4,$5)",
+                        &[&streamer_id, &started_at, &record.ended_at, &record.profile, &record.end_reason],
+                    ).await.map(|_| ()),
+                    _ => Err("Zeit oder Streamer-ID des Abschlusses ist ungültig."),
+                };
+                if let Err(error) = result {
+                    worker_failed.store(true, Ordering::Release);
+                    eprintln!(
+                        "Uplink-Abschluss konnte nicht gespeichert werden: streamer_id={} error={error}",
+                        record.streamer_id
+                    );
+                }
+        });
+    }
+    async fn drained(&self) -> Result<(), &'static str> {
+        let deadline = tokio::time::Instant::now()
+            + crate::store::QUERY_LIMIT * 2
+            + crate::store::CLEANUP_GRACE * 2
+            + std::time::Duration::from_secs(1);
+        let _idle = tokio::time::timeout_at(
+            deadline,
+            self.slots.clone().acquire_many_owned(self.capacity),
+        )
+        .await
+        .map_err(|_| "Streamabschlüsse konnten nicht rechtzeitig gespeichert werden.")?
+        .map_err(|_| "Streamabschluss ist nicht verfügbar.")?;
+        let mut tasks =
+            std::mem::take(&mut *self.tasks.lock().unwrap_or_else(|error| error.into_inner()));
+        tokio::time::timeout_at(deadline, async {
+            while let Some(result) = tasks.join_next().await {
+                self.joined(result);
+            }
+        })
+        .await
+        .map_err(|_| "Streamabschlussaufgaben konnten nicht rechtzeitig beendet werden.")?;
+        if self.failed.load(Ordering::Acquire) {
+            Err("Mindestens ein Streamabschluss konnte nicht gespeichert werden.")
+        } else {
+            Ok(())
+        }
+    }
 }
 impl ServiceAuthorizer {
     pub fn new(state: Arc<ServiceState>) -> Self {
+        let recorder = SessionRecorder::new(&state);
         Self {
             state,
             reservations: Mutex::new(HashMap::new()),
+            recorder,
         }
     }
     pub fn reservation(&self, session: AuthorizedSession) -> Option<Arc<Reservation>> {
@@ -30,6 +115,12 @@ impl Authorizer for ServiceAuthorizer {
         if app != "live" {
             return Err(());
         }
+        let permit = self
+            .recorder
+            .slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| ())?;
         let tenant = self
             .state
             .store
@@ -39,7 +130,14 @@ impl Authorizer for ServiceAuthorizer {
         if !self.state.config.permits_tenant(tenant) {
             return Err(());
         }
-        let reservation = Arc::new(self.state.registry.reserve(tenant).map_err(|_| ())?);
+        let mut reservation = self.state.registry.reserve(tenant).map_err(|_| ())?;
+        let recorder = self.recorder.clone();
+        reservation.on_completion(move |record| {
+            eprintln!("Uplink-Eingang beendet: streamer_id={} duration_ms={} source_tracks={} EndReason={}",
+                record.streamer_id, record.duration.as_millis(), record.source_tracks, record.end_reason);
+            recorder.record(record, permit);
+        });
+        let reservation = Arc::new(reservation);
         let session = AuthorizedSession::new(tenant, reservation.id()).map_err(|_| ())?;
         self.reservations
             .lock()
@@ -57,8 +155,7 @@ impl Authorizer for ServiceAuthorizer {
     }
     fn completed(&self, session: AuthorizedSession, report: &uplink_ingest::SessionReport) {
         if let Some(reservation) = self.reservation(session) {
-            reservation.generation(report.generation);
-            reservation.ingest_ended(&report.reason);
+            reservation.ingest_report(report);
         }
         if let Some(hub) = &self.state.chat {
             let _ = hub.set_active(session.tenant_id(), false);
@@ -99,6 +196,14 @@ pub async fn serve_with_ready<P: SessionProcessor>(
     ready: Option<tokio::sync::oneshot::Sender<(std::net::SocketAddr, std::net::SocketAddr)>>,
 ) -> Result<(), &'static str> {
     let authorizer = Arc::new(ServiceAuthorizer::new(state.clone()));
+    let media_limits = state.config.media_limits();
+    let coordinator_grace = media_limits.startup_timeout * 3
+        + media_limits.write_timeout
+        + media_limits.shutdown_timeout * (media_limits.max_encode_groups as u32 + 6)
+        + crate::store::QUERY_LIMIT
+        + crate::store::CLEANUP_GRACE
+        + std::time::Duration::from_secs(1);
+    let tasks_grace = coordinator_grace + std::time::Duration::from_secs(1);
     let http_shutdown_grace = std::time::Duration::from_secs(state.config.request_timeout_seconds)
         + crate::store::CLEANUP_GRACE
         + std::time::Duration::from_secs(1);
@@ -183,7 +288,7 @@ pub async fn serve_with_ready<P: SessionProcessor>(
                 // die Medienverarbeitung beendet danach ihre eigene Reservierung.
                 tasks.spawn(async move {
                     let first=tokio::select!{first=connection.next()=>first,_=media_stopped.changed()=>None};
-                    let Some(first) = first else { let _=connection.finish().await; return; };
+                    let Some(first) = first else { let _=connection.finish_consumer().await; return; };
                     let Some(reservation) = first.authorization_retention().and_then(|value| value.downcast::<Reservation>().ok()) else { return; };
                     reservation.generation(first.identity.generation);
                     reservation.record(first.wire_body().len());
@@ -192,16 +297,45 @@ pub async fn serve_with_ready<P: SessionProcessor>(
                     tokio::pin!(processing);
                     loop {
                         tokio::select! {
-                            _=media_stopped.changed()=>{drop(sender);if !matches!(tokio::time::timeout(std::time::Duration::from_secs(8),processing).await,Ok(Ok(()))){reservation.fail("Medienausgabe konnte beim Dienststopp nicht rechtzeitig schließen.");}break;}
+                            _=media_stopped.changed()=>{
+                                connection.stop_consumer();
+                                drop(sender);
+                                match tokio::time::timeout(coordinator_grace,processing).await {
+                                    Ok(Err(error)) => reservation.fail(error),
+                                    Err(_) => reservation.fail("Medienausgabe konnte beim Dienststopp nicht rechtzeitig schließen."),
+                                    Ok(Ok(())) => {}
+                                }
+                                break;
+                            }
                             result = &mut processing => { if let Err(error)=result { reservation.fail(error); } break; }
                             event = connection.next() => {
-                                let Some(event) = event else { drop(sender); if let Err(error)=processing.await{reservation.fail(error);} break; };
+                                let Some(event) = event else {
+                                    drop(sender);
+                                    match tokio::time::timeout(coordinator_grace,processing).await {
+                                        Ok(Err(error)) => reservation.fail(error),
+                                        Err(_) => reservation.fail("Medienausgabe konnte nach dem Eingangsende nicht rechtzeitig schließen."),
+                                        Ok(Ok(())) => {}
+                                    }
+                                    break;
+                                };
                                 reservation.record(event.wire_body().len());
-                                if sender.try_send(event).is_err() { reservation.fail("Medienverarbeitung hat ihr Eingangsbudget ausgeschöpft."); break; }
+                                if let Err(error) = sender.try_send(event) {
+                                    let fallback = match error {
+                                        mpsc::error::TrySendError::Closed(_) => "Medienverarbeitung hat den Eingang geschlossen.",
+                                        mpsc::error::TrySendError::Full(_) => "Medienverarbeitung hat ihr Eingangsbudget ausgeschöpft.",
+                                    };
+                                    connection.stop_consumer();
+                                    drop(sender);
+                                    match tokio::time::timeout(coordinator_grace,processing).await {
+                                        Ok(Err(error)) => reservation.fail(error),
+                                        _ => reservation.fail(fallback),
+                                    }
+                                    break;
+                                }
                             }
                         }
                     }
-                    let _ = connection.finish().await;
+                    let _ = connection.finish_consumer().await;
                     reservation.ended();
                 });
             }
@@ -209,7 +343,7 @@ pub async fn serve_with_ready<P: SessionProcessor>(
         }
     }
     let _ = stop_media.send(true);
-    let drained = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    let drained = tokio::time::timeout(tasks_grace, async {
         while tasks.join_next().await.is_some() {}
     })
     .await
@@ -219,11 +353,12 @@ pub async fn serve_with_ready<P: SessionProcessor>(
         while tasks.join_next().await.is_some() {}
     }
     let _ = stop.send(());
+    let recorded = authorizer.recorder.drained().await;
     if let Some(hub) = &chat {
         hub.shutdown().await;
     }
     match tokio::time::timeout(http_shutdown_grace, &mut http).await {
-        Ok(Ok(Ok(()))) if drained => Ok(()),
+        Ok(Ok(Ok(()))) if drained => recorded,
         _ => {
             http.abort();
             let _ = http.await;

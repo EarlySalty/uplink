@@ -75,13 +75,188 @@ struct ProbeStream {
     color_range: Option<String>,
 }
 
+#[derive(Default, serde::Serialize)]
+pub struct PreparationDiagnostic {
+    phase: &'static str,
+    probe_streams: usize,
+    probe: Vec<ProbeDiagnostic>,
+    requested: Vec<RequestedDiagnostic>,
+    ffprobe_exit_code: Option<i32>,
+    io_error_kind: Option<&'static str>,
+    ffprobe_stderr_first_line: Option<&'static str>,
+}
+
+#[derive(serde::Serialize)]
+struct RequestedDiagnostic {
+    platform: &'static str,
+    width: u32,
+    height: u32,
+    fps_numerator: u32,
+    fps_denominator: u32,
+    bitrate_kbps: u32,
+    codec: &'static str,
+    live_audio_track: u8,
+    vod_audio_track: Option<u8>,
+}
+
+#[derive(serde::Serialize)]
+struct ProbeDiagnostic {
+    kind: Option<&'static str>,
+    codec: Option<&'static str>,
+    width: Option<u32>,
+    height: Option<u32>,
+    fps: Option<(u32, u32)>,
+    pixel_format: Option<&'static str>,
+    color_primaries: Option<&'static str>,
+    color_transfer: Option<&'static str>,
+    color_matrix: Option<&'static str>,
+    color_range: Option<&'static str>,
+    sample_rate: Option<u32>,
+    channels: Option<u8>,
+}
+
+fn diagnostic_label(value: Option<&str>, allowed: &[&'static str]) -> Option<&'static str> {
+    value.map(|value| {
+        allowed
+            .iter()
+            .copied()
+            .find(|candidate| *candidate == value)
+            .unwrap_or("other")
+    })
+}
+
+impl PreparationDiagnostic {
+    fn probe(&mut self, document: &ProbeDocument) {
+        self.probe_streams = document.streams.len();
+        self.probe = document
+            .streams
+            .iter()
+            .take(32)
+            .map(|stream| ProbeDiagnostic {
+                kind: diagnostic_label(Some(&stream.codec_type), &["video", "audio"]),
+                codec: diagnostic_label(
+                    Some(&stream.codec_name),
+                    &["av1", "h264", "hevc", "aac", "opus", "mp3"],
+                ),
+                width: stream.width,
+                height: stream.height,
+                fps: stream
+                    .r_frame_rate
+                    .as_deref()
+                    .and_then(|value| value.split_once('/'))
+                    .and_then(|(n, d)| Some((n.parse().ok()?, d.parse().ok()?))),
+                pixel_format: diagnostic_label(
+                    stream.pix_fmt.as_deref(),
+                    &[
+                        "yuv420p",
+                        "yuv420p10le",
+                        "yuv422p",
+                        "yuv422p10le",
+                        "yuv444p",
+                        "yuv444p10le",
+                        "nv12",
+                        "p010le",
+                        "gbrp",
+                        "gbrp10le",
+                    ],
+                ),
+                color_primaries: diagnostic_label(
+                    stream.color_primaries.as_deref(),
+                    &[
+                        "unknown",
+                        "unspecified",
+                        "bt709",
+                        "bt2020",
+                        "smpte170m",
+                        "bt470bg",
+                        "smpte432",
+                    ],
+                ),
+                color_transfer: diagnostic_label(
+                    stream.color_transfer.as_deref(),
+                    &[
+                        "unknown",
+                        "unspecified",
+                        "bt709",
+                        "smpte170m",
+                        "smpte2084",
+                        "arib-std-b67",
+                        "iec61966-2-1",
+                        "linear",
+                        "bt2020-10",
+                        "bt2020-12",
+                    ],
+                ),
+                color_matrix: diagnostic_label(
+                    stream.color_space.as_deref(),
+                    &[
+                        "unknown",
+                        "unspecified",
+                        "bt709",
+                        "smpte170m",
+                        "gbr",
+                        "bt2020nc",
+                        "bt2020c",
+                        "bt470bg",
+                    ],
+                ),
+                color_range: diagnostic_label(
+                    stream.color_range.as_deref(),
+                    &["unknown", "unspecified", "tv", "pc"],
+                ),
+                sample_rate: stream
+                    .sample_rate
+                    .as_deref()
+                    .and_then(|value| value.parse().ok()),
+                channels: stream.channels,
+            })
+            .collect();
+    }
+}
+
 impl MediaEngine {
     /// Begrenzt messen, wirklich benötigte Tracks prüfen, erst danach Ausgaben starten.
     pub async fn prepare_and_start(
         &self,
         spec: DesiredSessionSpec,
-        mut input: mpsc::Receiver<MediaEvent>,
+        input: mpsc::Receiver<MediaEvent>,
     ) -> Result<RunningMedia> {
+        self.prepare_and_start_diagnosed(spec, input, &mut PreparationDiagnostic::default())
+            .await
+    }
+
+    pub async fn prepare_and_start_diagnosed(
+        &self,
+        spec: DesiredSessionSpec,
+        mut input: mpsc::Receiver<MediaEvent>,
+        diagnostic: &mut PreparationDiagnostic,
+    ) -> Result<RunningMedia> {
+        *diagnostic = PreparationDiagnostic::default();
+        diagnostic.phase = "configuration";
+        diagnostic.requested = spec
+            .outputs
+            .iter()
+            .take(32)
+            .map(|output| RequestedDiagnostic {
+                platform: diagnostic_label(
+                    Some(&output.target.id),
+                    &["twitch", "youtube", "kick", "tiktok"],
+                )
+                .unwrap_or("other"),
+                width: output.video.width,
+                height: output.video.height,
+                fps_numerator: output.video.fps.numerator(),
+                fps_denominator: output.video.fps.denominator(),
+                bitrate_kbps: output.video.bitrate_kbps,
+                codec: match output.video.codec {
+                    uplink_core::Codec::H264 => "h264",
+                    uplink_core::Codec::Av1 => "av1",
+                    uplink_core::Codec::Hevc => "hevc",
+                },
+                live_audio_track: output.live_audio_track,
+                vod_audio_track: output.vod_audio_track,
+            })
+            .collect();
         if spec.outputs.is_empty() || spec.outputs.len() > self.config.limits.max_outputs {
             return Err(MediaError::InvalidConfiguration);
         }
@@ -92,7 +267,10 @@ impl MediaEngine {
                 std::iter::once(output.live_audio_track).chain(output.vod_audio_track)
             })
             .collect();
-        let prepared = self.prepare_source(spec.first, &mut input, &audio).await?;
+        let prepared = self
+            .prepare_source_diagnosed(spec.first, &mut input, &audio, diagnostic)
+            .await?;
+        diagnostic.phase = "graph";
         let graph = Graph::observed(&prepared.observation, &spec.outputs)?;
         let routes = spec
             .outputs
@@ -102,6 +280,7 @@ impl MediaEngine {
                 target: output.target,
             })
             .collect();
+        diagnostic.phase = "start_graph";
         self.start_graph(
             prepared.identity,
             routes,
@@ -151,6 +330,23 @@ impl MediaEngine {
         input: &mut mpsc::Receiver<MediaEvent>,
         selected_audio: &HashSet<u8>,
     ) -> Result<PreparedSource> {
+        self.prepare_source_diagnosed(
+            first,
+            input,
+            selected_audio,
+            &mut PreparationDiagnostic::default(),
+        )
+        .await
+    }
+
+    async fn prepare_source_diagnosed(
+        &self,
+        first: MediaEvent,
+        input: &mut mpsc::Receiver<MediaEvent>,
+        selected_audio: &HashSet<u8>,
+        diagnostic: &mut PreparationDiagnostic,
+    ) -> Result<PreparedSource> {
+        diagnostic.phase = "prepare_source";
         let identity = first.identity;
         let mut prefix = VecDeque::new();
         let mut next = Some(first);
@@ -264,7 +460,10 @@ impl MediaEngine {
                 return Err(MediaError::Backpressure);
             }
         }
-        let measured = probe(&self.config, flv).await?;
+        diagnostic.phase = "probe";
+        let measured = probe(&self.config, flv, diagnostic).await?;
+        diagnostic.probe(&measured);
+        diagnostic.phase = "observation";
         let observation = observation(measured, &audio, video[0].wire_id, events, bytes, duration)?;
         let identity = TrackIdentity {
             track: video[0],
@@ -287,12 +486,75 @@ struct PreparedSource {
 #[path = "prepare/review_tests.rs"]
 mod review_tests;
 
-async fn probe(config: &EngineConfig, bytes: Vec<u8>) -> Result<ProbeDocument> {
+fn sanitized_probe_line(bytes: &[u8]) -> Option<&'static str> {
+    let line = bytes
+        .split(|byte| *byte == b'\n')
+        .next()
+        .filter(|line| !line.is_empty())?;
+    let line = String::from_utf8_lossy(line);
+    Some(
+        [
+            "Invalid data found when processing input",
+            "End of file",
+            "Could not find codec parameters",
+            "Could not find codec parameters for stream",
+            "Invalid NAL unit size",
+            "Error splitting the input into NAL units",
+            "Missing Sequence Header",
+            "No sequence header available",
+            "Invalid frame dimensions",
+            "Packet mismatch",
+            "Unknown video codec",
+            "Unsupported video codec",
+            "Failed to open codec",
+            "Cannot allocate memory",
+            "Broken pipe",
+        ]
+        .into_iter()
+        .find(|signature| line.contains(signature))
+        .unwrap_or("[redigiert]"),
+    )
+}
+
+fn io_error_label(kind: std::io::ErrorKind) -> &'static str {
+    match kind {
+        std::io::ErrorKind::BrokenPipe => "broken_pipe",
+        std::io::ErrorKind::UnexpectedEof => "unexpected_eof",
+        std::io::ErrorKind::WriteZero => "write_zero",
+        std::io::ErrorKind::ConnectionReset => "connection_reset",
+        std::io::ErrorKind::Interrupted => "interrupted",
+        std::io::ErrorKind::TimedOut => "timed_out",
+        _ => "other",
+    }
+}
+
+async fn drain_probe_stderr(
+    stderr: &mut tokio::process::ChildStderr,
+    first: &mut Vec<u8>,
+) -> Result<()> {
+    let mut buffer = [0u8; 1024];
+    loop {
+        let count = stderr.read(&mut buffer).await.map_err(|_| MediaError::Io)?;
+        if count == 0 {
+            return Ok(());
+        }
+        if !first.contains(&b'\n') && first.len() < 1024 {
+            let remaining = 1024 - first.len();
+            first.extend_from_slice(&buffer[..count.min(remaining)]);
+        }
+    }
+}
+
+async fn probe(
+    config: &EngineConfig,
+    bytes: Vec<u8>,
+    diagnostic: &mut PreparationDiagnostic,
+) -> Result<ProbeDocument> {
     let child=Command::new(&config.ffprobe)
-        .args(["-v","quiet","-threads","1","-max_alloc","67108864","-max_pixels","9000000","-probesize"])
+        .args(["-v","error","-threads","1","-max_alloc","67108864","-max_pixels","9000000","-probesize"])
         .arg(config.limits.queue_bytes.to_string())
         .args(["-analyzeduration","1000000","-show_streams","-show_entries","stream=codec_type,codec_name,width,height,pix_fmt,r_frame_rate,sample_rate,channels,color_primaries,color_transfer,color_space,color_range","-of","json","-f","flv","pipe:0"])
-        .env_clear().stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).kill_on_drop(true)
+        .env_clear().stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true)
         .spawn().map_err(|_|MediaError::ProcessFailed)?;
     let mut guard = ProbeChild {
         child: Some(child),
@@ -301,9 +563,17 @@ async fn probe(config: &EngineConfig, bytes: Vec<u8>) -> Result<ProbeDocument> {
     let child = guard.child.as_mut().ok_or(MediaError::ProcessFailed)?;
     let mut stdin = child.stdin.take().ok_or(MediaError::ProcessFailed)?;
     let stdout = child.stdout.take().ok_or(MediaError::ProcessFailed)?;
+    let mut stderr = child.stderr.take().ok_or(MediaError::ProcessFailed)?;
+    let mut stderr_first = Vec::new();
+    let mut exit_code = None;
+    let mut write_error_kind = None;
+    let mut read_error_kind = None;
     let operation = async {
         let write = async {
-            stdin.write_all(&bytes).await.map_err(|_| MediaError::Io)?;
+            stdin.write_all(&bytes).await.map_err(|error| {
+                write_error_kind = Some(io_error_label(error.kind()));
+                MediaError::Io
+            })?;
             drop(stdin);
             Ok::<_, MediaError>(())
         };
@@ -313,17 +583,25 @@ async fn probe(config: &EngineConfig, bytes: Vec<u8>) -> Result<ProbeDocument> {
                 .take(65537)
                 .read_to_end(&mut output)
                 .await
-                .map_err(|_| MediaError::Io)?;
+                .map_err(|error| {
+                    read_error_kind = Some(io_error_label(error.kind()));
+                    MediaError::Io
+                })?;
             if output.len() > 65536 {
                 return Err(MediaError::ResourceLimit);
             }
             Ok::<_, MediaError>(output)
         };
-        let (_, output) = tokio::try_join!(write, read)?;
+        let (_, output, _) = tokio::try_join!(
+            write,
+            read,
+            drain_probe_stderr(&mut stderr, &mut stderr_first)
+        )?;
         let status = child
             .wait()
             .await
             .map_err(|_| MediaError::ProcessCleanupFailed)?;
+        exit_code = status.code();
         if !status.success() {
             return Err(MediaError::ProcessFailed);
         }
@@ -333,13 +611,34 @@ async fn probe(config: &EngineConfig, bytes: Vec<u8>) -> Result<ProbeDocument> {
         Ok(result) => result,
         Err(_) => Err(MediaError::StartTimeout),
     };
+    diagnostic.io_error_kind = write_error_kind.or(read_error_kind);
+    diagnostic.ffprobe_exit_code = exit_code.or_else(|| {
+        guard
+            .child
+            .as_mut()
+            .and_then(|child| child.try_wait().ok().flatten())
+            .and_then(|status| status.code())
+    });
+    diagnostic.ffprobe_stderr_first_line = sanitized_probe_line(&stderr_first);
     match result {
         Ok(document) => {
             guard.child.take();
             Ok(document)
         }
         Err(reason) => {
+            if diagnostic.ffprobe_exit_code.is_none()
+                && let Some(child) = guard.child.as_mut()
+                && let Ok(Ok(status)) = timeout(Duration::from_millis(100), child.wait()).await
+            {
+                diagnostic.ffprobe_exit_code = status.code();
+            }
             guard.terminate().await?;
+            let _ = timeout(
+                config.limits.shutdown_timeout,
+                drain_probe_stderr(&mut stderr, &mut stderr_first),
+            )
+            .await;
+            diagnostic.ffprobe_stderr_first_line = sanitized_probe_line(&stderr_first);
             Err(reason)
         }
     }
@@ -447,6 +746,34 @@ mod tests {
         ]
     }
     #[test]
+    fn diagnostic_probe_fields_are_bounded_and_never_copy_untrusted_text() {
+        let mut document = document();
+        document.streams[0].color_space = Some("gbr".into());
+        document.streams[0].pix_fmt =
+            Some("rtmps://secret.example/live/private-key\nforged".into());
+        document.streams[0].r_frame_rate = Some("0/0".into());
+        let mut diagnostic = PreparationDiagnostic::default();
+        diagnostic.probe(&document);
+        let value = serde_json::to_value(&diagnostic).unwrap();
+        assert_eq!(value["probe"][0]["pixel_format"], "other");
+        assert_eq!(value["probe"][0]["color_matrix"], "gbr");
+        assert_eq!(value["probe"][0]["fps"], serde_json::json!([0, 0]));
+        assert!(!value.to_string().contains("private-key"));
+        assert!(observation(document, &audio(), 0, 1, 1, 1000).is_err());
+        assert_eq!(
+            sanitized_probe_line(
+                b"[flv @ 0xdeadbeef] Invalid data found when processing input: private-key\nforged"
+            ),
+            Some("Invalid data found when processing input")
+        );
+        assert_eq!(
+            sanitized_probe_line(b"rtmps://secret.example/live/private-key"),
+            Some("[redigiert]")
+        );
+        assert_eq!(sanitized_probe_line(b""), None);
+    }
+
+    #[test]
     fn observation_keeps_unknowns_and_explicit_audio_wire_ids() {
         let value = observation(document(), &audio(), 0, 120, 15000, 1000).unwrap();
         assert_eq!(
@@ -481,6 +808,44 @@ mod tests {
         fps.streams[0].r_frame_rate = Some("0/0".into());
         assert!(observation(fps, &audio(), 0, 120, 15000, 1000).is_err());
     }
+    #[tokio::test]
+    async fn closed_probe_stdin_preserves_natural_exit_status_and_safe_stderr() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut random = [0u8; 8];
+        getrandom::fill(&mut random).unwrap();
+        let directory = std::path::PathBuf::from(format!(
+            "/tmp/uplink-probe-exit-{:016x}",
+            u64::from_ne_bytes(random)
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let executable = directory.join("probe");
+        std::fs::write(&executable, b"#!/bin/sh\nexec 0<&-\nprintf 'Invalid data found when processing input: synthetic-private-key\\n' >&2\n/usr/bin/sleep 0.03\nexit 42\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let config = EngineConfig {
+            ffmpeg: "/usr/bin/true".into(),
+            ffprobe: executable,
+            work_directory: directory.clone(),
+            limits: MediaLimits::default(),
+        };
+        let mut diagnostic = PreparationDiagnostic::default();
+        let result = probe(&config, vec![0; 4 * 1024 * 1024], &mut diagnostic).await;
+        std::fs::remove_dir_all(directory).unwrap();
+        assert!(matches!(result, Err(MediaError::Io)));
+        assert_eq!(
+            diagnostic.ffprobe_exit_code,
+            Some(42),
+            "Ein bereits abbrechender Probeprozess muss seinen natürlichen Exitstatus behalten"
+        );
+        assert_eq!(
+            diagnostic.ffprobe_stderr_first_line,
+            Some("Invalid data found when processing input")
+        );
+        assert_eq!(
+            serde_json::to_value(diagnostic).unwrap()["io_error_kind"],
+            "broken_pipe"
+        );
+    }
+
     #[tokio::test]
     async fn cancelled_probe_owner_kills_and_reaps_its_child() {
         let child = Command::new("/usr/bin/sleep")

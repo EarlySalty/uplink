@@ -27,6 +27,7 @@ jobs:
           sudo apt-get install -y postgresql-16 ffmpeg
           cargo test -p uplink-service --test database --locked -j2 -- --ignored --test-threads=1
           cargo test -p uplink-service --test http_shutdown --locked -j2 -- --ignored --test-threads=1
+          cargo test -p uplink-service --test lifecycle --locked -j2 -- --ignored --test-threads=1
       - name: Gepinnter FFmpeg-8-Build und normale Audio-/Streamingstrecke
         run: |
           set -eu
