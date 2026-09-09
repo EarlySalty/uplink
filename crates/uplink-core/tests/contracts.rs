@@ -410,13 +410,63 @@ fn packet_count_time_and_decode_order_are_bounded() {
 fn timestamp_regression_buffer_clamps_small_steps_and_limits_repeated_steps() {
     for delta in [1, 2000] {
         let mut buffer = buffer();
-        buffer.push(packet(scope(), 3000, 1), Duration::ZERO).unwrap();
+        buffer
+            .push(packet(scope(), 3000, 1), Duration::ZERO)
+            .unwrap();
         buffer.pop(Duration::ZERO).unwrap();
         for _ in 0..50 {
-            buffer.push(packet(scope(), 3000 - delta, 1), Duration::ZERO).unwrap();
-            assert_eq!(buffer.pop(Duration::ZERO).unwrap().packet.unwrap().decode_timestamp_ms, 3000);
+            buffer
+                .push(packet(scope(), 3000 - delta, 1), Duration::ZERO)
+                .unwrap();
+            assert_eq!(
+                buffer
+                    .pop(Duration::ZERO)
+                    .unwrap()
+                    .packet
+                    .unwrap()
+                    .decode_timestamp_ms,
+                3000
+            );
         }
-        assert_eq!(buffer.push(packet(scope(), 3000 - delta, 1), Duration::ZERO), Err(BufferError::TimestampRegression));
-        buffer.push(packet(scope(), 3000 - delta, 1), Duration::from_secs(60)).unwrap();
+        assert_eq!(
+            buffer.push(packet(scope(), 3000 - delta, 1), Duration::ZERO),
+            Err(BufferError::TimestampRegression)
+        );
+        buffer
+            .push(packet(scope(), 3000 - delta, 1), Duration::from_secs(60))
+            .unwrap();
     }
+}
+
+#[test]
+fn timestamp_regression_buffer_large_jump_and_sliding_window_boundaries() {
+    let mut buffer = buffer();
+    buffer
+        .push(packet(scope(), 10000, 1), Duration::ZERO)
+        .unwrap();
+    buffer.pop(Duration::ZERO).unwrap();
+    assert_eq!(
+        buffer.push(packet(scope(), 7999, 1), Duration::ZERO),
+        Err(BufferError::TimestampRegression)
+    );
+    for index in 0..50 {
+        let now = Duration::from_secs(index);
+        buffer.push(packet(scope(), 9999, 1), now).unwrap();
+        buffer.pop(now).unwrap();
+    }
+    assert_eq!(
+        buffer.push(packet(scope(), 9999, 1), Duration::from_millis(59999)),
+        Err(BufferError::TimestampRegression)
+    );
+    buffer
+        .push(packet(scope(), 9999, 1), Duration::from_secs(60))
+        .unwrap();
+    buffer.pop(Duration::from_secs(60)).unwrap();
+    assert_eq!(
+        buffer.push(packet(scope(), 9999, 1), Duration::from_secs(60)),
+        Err(BufferError::TimestampRegression)
+    );
+    buffer
+        .push(packet(scope(), 9999, 1), Duration::from_secs(61))
+        .unwrap();
 }
