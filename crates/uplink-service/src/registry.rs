@@ -256,14 +256,21 @@ impl Reservation {
 }
 impl Drop for Reservation {
     fn drop(&mut self) {
-        if let Some(registry) = self.registry.upgrade() {
-            let mut state = registry.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some((tenant, mut status)) = state.active.remove(&self.id) {
-                status.active = false;
-                if status.error.is_none() {
-                    status.state = "Beendet";
-                }
-                if let Some(completion) = self.completion.take() {
+        let Some(registry) = self.registry.upgrade() else {
+            return;
+        };
+        let snapshot = registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .active
+            .get(&self.id)
+            .cloned();
+        if let Some((tenant, mut status)) = snapshot {
+            status.active = false;
+            if status.error.is_none() {
+                status.state = "Beendet";
+            }
+            let completed = self.completion.take().map(|completion| {
                     let report = self
                         .report
                         .get_mut()
@@ -287,7 +294,7 @@ impl Drop for Reservation {
                         end_reason.push_str("; Diagnose=");
                         end_reason.push_str(&diagnostic.to_string());
                     }
-                    completion(SessionCompletion {
+                    (completion, SessionCompletion {
                         streamer_id: tenant,
                         ended_at: self
                             .ingest_ended_at
@@ -307,13 +314,18 @@ impl Drop for Reservation {
                             "received_bytes": report.as_ref().map_or(0, |report| report.received_bytes),
                             "source_tracks": report.as_ref().map_or(0, |report| report.track_count),
                         }),
-                    });
-                }
-                state.recent.retain(|(t, _)| *t != tenant);
-                state.recent.push_back((tenant, status));
-                while state.recent.len() > state.total.saturating_mul(2) {
-                    state.recent.pop_front();
-                }
+                    })
+                });
+            let mut state = registry.lock().unwrap_or_else(|e| e.into_inner());
+            state.active.remove(&self.id);
+            state.recent.retain(|(t, _)| *t != tenant);
+            state.recent.push_back((tenant, status));
+            while state.recent.len() > state.total.saturating_mul(2) {
+                state.recent.pop_front();
+            }
+            drop(state);
+            if let Some((completion, record)) = completed {
+                completion(record);
             }
         }
     }

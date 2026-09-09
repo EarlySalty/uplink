@@ -366,3 +366,126 @@ async fn occupied_database_capacity_delays_completion_without_losing_it() {
     );
     result.unwrap();
 }
+
+struct DelayedCleanup {
+    ready: tokio::sync::Notify,
+    complete: tokio::sync::Notify,
+    keep_receiver: bool,
+}
+impl uplink_service::runtime::SessionProcessor for DelayedCleanup {
+    async fn process(
+        &self,
+        first: uplink_ingest::MediaEvent,
+        events: tokio::sync::mpsc::Receiver<uplink_ingest::MediaEvent>,
+    ) -> Result<(), &'static str> {
+        let receiver = if self.keep_receiver {
+            Some(events)
+        } else {
+            drop(events);
+            None
+        };
+        let reservation = first
+            .authorization_retention()
+            .unwrap()
+            .downcast::<uplink_service::registry::Reservation>()
+            .unwrap();
+        self.ready.notify_one();
+        self.complete.notified().await;
+        reservation
+            .media_diagnostic(serde_json::json!({"phase":"prepare_cleanup","error":"ProbeFailed"}));
+        drop(receiver);
+        Err("Die Medienprüfung ist nach dem Aufräumen fehlgeschlagen.")
+    }
+}
+
+async fn delayed_coordinator_case(keep_receiver: bool) {
+    let (database, state) = database::fixture().await;
+    let certificates = tls::test_tls();
+    let (ready, bound) = tokio::sync::oneshot::channel();
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let processor = Arc::new(DelayedCleanup {
+        ready: tokio::sync::Notify::new(),
+        complete: tokio::sync::Notify::new(),
+        keep_receiver,
+    });
+    let service = tokio::spawn(uplink_service::runtime::serve_with_ready(
+        state.clone(),
+        certificates.server,
+        processor.clone(),
+        async {
+            let _ = stopped.await;
+        },
+        Some(ready),
+    ));
+    let (_, address) = bound.await.unwrap();
+    let socket = tokio::net::TcpStream::connect(address).await.unwrap();
+    let mut peer = tokio_rustls::TlsConnector::from(certificates.client)
+        .connect("localhost".try_into().unwrap(), socket)
+        .await
+        .unwrap();
+    rtmp::publish(&mut peer, "rsr_00000000000000000000000000000000").await;
+    rtmp::message(&mut peer, 8, 1, &[0xaf, 0, 0x11, 0x90]).await;
+    tokio::time::timeout(Duration::from_secs(3), processor.ready.notified())
+        .await
+        .unwrap();
+    let extra = if keep_receiver { 257 } else { 1 };
+    for _ in 0..extra {
+        rtmp::message(&mut peer, 8, 1, &[0xaf, 0, 0x11, 0x90]).await;
+    }
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while state.registry.status(11)[0].received_events < extra + 1 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let mut reply = Vec::new();
+    let _ = tokio::time::timeout(
+        Duration::from_secs(3),
+        (&mut peer).take(16 * 1024).read_to_end(&mut reply),
+    )
+    .await
+    .unwrap();
+    processor.complete.notify_one();
+    stop.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(3), service)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let rows = state
+        .store
+        .query(
+            "SELECT end_reason,profile_json FROM relay.sessions WHERE streamer_id=11",
+            &[],
+        )
+        .await
+        .unwrap();
+    drop(peer);
+    drop(state);
+    database.stop().await;
+    assert_eq!(rows.len(), 1);
+    let end_reason: String = rows[0].get(0);
+    assert!(
+        end_reason.starts_with(
+            "ConsumerClosed: Die Medienprüfung ist nach dem Aufräumen fehlgeschlagen."
+        ),
+        "Finaler Coordinatorfehler wurde ersetzt: {end_reason}"
+    );
+    assert_eq!(
+        rows[0].get::<_, serde_json::Value>(1)["media_diagnostic"]["error"],
+        "ProbeFailed"
+    );
+}
+
+#[tokio::test]
+#[ignore = "Benötigt isoliertes PostgreSQL 16 und TLS."]
+async fn closed_receiver_preserves_delayed_coordinator_error_and_diagnostic() {
+    delayed_coordinator_case(false).await;
+}
+
+#[tokio::test]
+#[ignore = "Benötigt isoliertes PostgreSQL 16 und TLS."]
+async fn full_receiver_preserves_delayed_coordinator_error_and_diagnostic() {
+    delayed_coordinator_case(true).await;
+}

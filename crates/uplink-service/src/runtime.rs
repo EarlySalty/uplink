@@ -271,12 +271,41 @@ pub async fn serve_with_ready<P: SessionProcessor>(
                     tokio::pin!(processing);
                     loop {
                         tokio::select! {
-                            _=media_stopped.changed()=>{drop(sender);if !matches!(tokio::time::timeout(std::time::Duration::from_secs(8),processing).await,Ok(Ok(()))){reservation.fail("Medienausgabe konnte beim Dienststopp nicht rechtzeitig schließen.");}break;}
+                            _=media_stopped.changed()=>{
+                                connection.stop_consumer();
+                                drop(sender);
+                                match tokio::time::timeout(std::time::Duration::from_secs(8),processing).await {
+                                    Ok(Err(error)) => reservation.fail(error),
+                                    Err(_) => reservation.fail("Medienausgabe konnte beim Dienststopp nicht rechtzeitig schließen."),
+                                    Ok(Ok(())) => {}
+                                }
+                                break;
+                            }
                             result = &mut processing => { if let Err(error)=result { reservation.fail(error); } break; }
                             event = connection.next() => {
-                                let Some(event) = event else { drop(sender); if let Err(error)=processing.await{reservation.fail(error);} break; };
+                                let Some(event) = event else {
+                                    drop(sender);
+                                    match tokio::time::timeout(std::time::Duration::from_secs(8),processing).await {
+                                        Ok(Err(error)) => reservation.fail(error),
+                                        Err(_) => reservation.fail("Medienausgabe konnte nach dem Eingangsende nicht rechtzeitig schließen."),
+                                        Ok(Ok(())) => {}
+                                    }
+                                    break;
+                                };
                                 reservation.record(event.wire_body().len());
-                                if sender.try_send(event).is_err() { reservation.fail("Medienverarbeitung hat ihr Eingangsbudget ausgeschöpft."); break; }
+                                if let Err(error) = sender.try_send(event) {
+                                    let fallback = match error {
+                                        mpsc::error::TrySendError::Closed(_) => "Medienverarbeitung hat den Eingang geschlossen.",
+                                        mpsc::error::TrySendError::Full(_) => "Medienverarbeitung hat ihr Eingangsbudget ausgeschöpft.",
+                                    };
+                                    connection.stop_consumer();
+                                    drop(sender);
+                                    match tokio::time::timeout(std::time::Duration::from_secs(8),processing).await {
+                                        Ok(Err(error)) => reservation.fail(error),
+                                        _ => reservation.fail(fallback),
+                                    }
+                                    break;
+                                }
                             }
                         }
                     }

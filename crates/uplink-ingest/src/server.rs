@@ -360,8 +360,11 @@ pub struct RunningConnection {
     _slot: Arc<SessionSlot>,
 }
 impl RunningConnection {
-    pub async fn finish_consumer(self) -> SessionReport {
+    pub fn stop_consumer(&self) {
         self.stop_consumer.send_replace(true);
+    }
+    pub async fn finish_consumer(self) -> SessionReport {
+        self.stop_consumer();
         self.finish().await
     }
     pub async fn next(&mut self) -> Option<MediaEvent> {
