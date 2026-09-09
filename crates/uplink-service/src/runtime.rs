@@ -1,11 +1,14 @@
 use crate::{
     api::{ServiceState, router},
-    registry::Reservation,
+    registry::{Reservation, SessionCompletion},
 };
 use std::{
     collections::HashMap,
     future::Future,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 use tokio::{net::TcpListener, sync::mpsc, task::JoinSet};
 use uplink_ingest::{AuthorizedSession, Authorizer, IngestServer, MediaEvent};
@@ -13,12 +16,70 @@ use uplink_ingest::{AuthorizedSession, Authorizer, IngestServer, MediaEvent};
 pub struct ServiceAuthorizer {
     state: Arc<ServiceState>,
     reservations: Mutex<HashMap<AuthorizedSession, Arc<Reservation>>>,
+    recorder: SessionRecorder,
+}
+struct SessionRecorder {
+    sender: mpsc::UnboundedSender<(SessionCompletion, tokio::sync::OwnedSemaphorePermit)>,
+    slots: Arc<tokio::sync::Semaphore>,
+    capacity: u32,
+    failed: Arc<AtomicBool>,
+}
+impl SessionRecorder {
+    fn new(state: &ServiceState) -> Self {
+        let (sender, mut receiver) =
+            mpsc::unbounded_channel::<(SessionCompletion, tokio::sync::OwnedSemaphorePermit)>();
+        let store = state.store.clone();
+        let failed = Arc::new(AtomicBool::new(false));
+        let worker_failed = failed.clone();
+        tokio::spawn(async move {
+            while let Some((record, _permit)) = receiver.recv().await {
+                let streamer_id = i64::try_from(record.streamer_id);
+                let started_at = record.ended_at.checked_sub(record.duration);
+                let result = match (streamer_id, started_at) {
+                    (Ok(streamer_id), Some(started_at)) => store.query(
+                        "INSERT INTO relay.sessions(streamer_id,started_at,ended_at,ingest_protocol,profile_json,end_reason) VALUES($1,$2,$3,'rtmps',$4,$5)",
+                        &[&streamer_id, &started_at, &record.ended_at, &record.profile, &record.end_reason],
+                    ).await.map(|_| ()),
+                    _ => Err("Zeit oder Streamer-ID des Abschlusses ist ungültig."),
+                };
+                if let Err(error) = result {
+                    worker_failed.store(true, Ordering::Release);
+                    eprintln!(
+                        "Uplink-Abschluss konnte nicht gespeichert werden: streamer_id={} error={error}",
+                        record.streamer_id
+                    );
+                }
+            }
+        });
+        Self {
+            sender,
+            slots: Arc::new(tokio::sync::Semaphore::new(state.config.max_sessions)),
+            capacity: state.config.max_sessions as u32,
+            failed,
+        }
+    }
+    async fn drained(&self) -> Result<(), &'static str> {
+        let _idle = tokio::time::timeout(
+            crate::store::CLEANUP_GRACE + std::time::Duration::from_secs(10),
+            self.slots.clone().acquire_many_owned(self.capacity),
+        )
+        .await
+        .map_err(|_| "Streamabschlüsse konnten nicht rechtzeitig gespeichert werden.")?
+        .map_err(|_| "Streamabschluss ist nicht verfügbar.")?;
+        if self.failed.load(Ordering::Acquire) {
+            Err("Mindestens ein Streamabschluss konnte nicht gespeichert werden.")
+        } else {
+            Ok(())
+        }
+    }
 }
 impl ServiceAuthorizer {
     pub fn new(state: Arc<ServiceState>) -> Self {
+        let recorder = SessionRecorder::new(&state);
         Self {
             state,
             reservations: Mutex::new(HashMap::new()),
+            recorder,
         }
     }
     pub fn reservation(&self, session: AuthorizedSession) -> Option<Arc<Reservation>> {
@@ -30,6 +91,12 @@ impl Authorizer for ServiceAuthorizer {
         if app != "live" {
             return Err(());
         }
+        let permit = self
+            .recorder
+            .slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| ())?;
         let tenant = self
             .state
             .store
@@ -39,7 +106,18 @@ impl Authorizer for ServiceAuthorizer {
         if !self.state.config.permits_tenant(tenant) {
             return Err(());
         }
-        let reservation = Arc::new(self.state.registry.reserve(tenant).map_err(|_| ())?);
+        let mut reservation = self.state.registry.reserve(tenant).map_err(|_| ())?;
+        let sender = self.recorder.sender.clone();
+        let failed = self.recorder.failed.clone();
+        reservation.on_completion(move |record| {
+            eprintln!("Uplink-Eingang beendet: streamer_id={} duration_ms={} source_tracks={} EndReason={}",
+                record.streamer_id, record.duration.as_millis(), record.source_tracks, record.end_reason);
+            if let Err(error) = sender.send((record, permit)) {
+                failed.store(true, Ordering::Release);
+                eprintln!("Uplink-Abschluss konnte nicht gespeichert werden: streamer_id={} error=Speicherung ist nicht verfügbar.", error.0.0.streamer_id);
+            }
+        });
+        let reservation = Arc::new(reservation);
         let session = AuthorizedSession::new(tenant, reservation.id()).map_err(|_| ())?;
         self.reservations
             .lock()
@@ -57,8 +135,7 @@ impl Authorizer for ServiceAuthorizer {
     }
     fn completed(&self, session: AuthorizedSession, report: &uplink_ingest::SessionReport) {
         if let Some(reservation) = self.reservation(session) {
-            reservation.generation(report.generation);
-            reservation.ingest_ended(&report.reason);
+            reservation.ingest_report(report);
         }
         if let Some(hub) = &self.state.chat {
             let _ = hub.set_active(session.tenant_id(), false);
@@ -183,7 +260,7 @@ pub async fn serve_with_ready<P: SessionProcessor>(
                 // die Medienverarbeitung beendet danach ihre eigene Reservierung.
                 tasks.spawn(async move {
                     let first=tokio::select!{first=connection.next()=>first,_=media_stopped.changed()=>None};
-                    let Some(first) = first else { let _=connection.finish().await; return; };
+                    let Some(first) = first else { let _=connection.finish_consumer().await; return; };
                     let Some(reservation) = first.authorization_retention().and_then(|value| value.downcast::<Reservation>().ok()) else { return; };
                     reservation.generation(first.identity.generation);
                     reservation.record(first.wire_body().len());
@@ -201,7 +278,7 @@ pub async fn serve_with_ready<P: SessionProcessor>(
                             }
                         }
                     }
-                    let _ = connection.finish().await;
+                    let _ = connection.finish_consumer().await;
                     reservation.ended();
                 });
             }
@@ -218,12 +295,13 @@ pub async fn serve_with_ready<P: SessionProcessor>(
         tasks.abort_all();
         while tasks.join_next().await.is_some() {}
     }
+    let recorded = authorizer.recorder.drained().await;
     let _ = stop.send(());
     if let Some(hub) = &chat {
         hub.shutdown().await;
     }
     match tokio::time::timeout(http_shutdown_grace, &mut http).await {
-        Ok(Ok(Ok(()))) if drained => Ok(()),
+        Ok(Ok(Ok(()))) if drained => recorded,
         _ => {
             http.abort();
             let _ = http.await;
