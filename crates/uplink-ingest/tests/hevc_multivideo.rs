@@ -306,11 +306,11 @@ async fn default_enhanced_and_legacy_avc_share_the_same_video_track_zero() {
 
 #[tokio::test]
 async fn sequence_end_and_timestamp_regression_apply_only_to_the_selected_track() {
-    for last in [video(b"hvc1", 3, 7, 9, &[1]), video(b"hvc1", 2, 7, 9, &[])] {
+    for last in [video(b"hvc1", 3, 7, 5_000, &[1])] {
         let (_, report) = collect(
             &[
                 video(b"hvc1", 0, 7, 0, &[1]),
-                video(b"hvc1", 3, 7, 10, &[2]),
+                video(b"hvc1", 3, 7, 10_000, &[2]),
                 last,
             ],
             IngestLimits::local_probe(),
@@ -320,6 +320,10 @@ async fn sequence_end_and_timestamp_regression_apply_only_to_the_selected_track(
             report.reason,
             EndReason::MediaRejected(MediaError::TimestampRegression)
         );
+        let diagnostic = format!("{report:?}");
+        for expected in ["kind: Video", "wire_id: 7", "last_dts_ms: 10000", "new_dts_ms: 5000", "delta_ms: 5000", "session_duration_ms:", "server.rs", "event_kind: Frame"] {
+            assert!(diagnostic.contains(expected), "fehlende Diagnose {expected}: {diagnostic}");
+        }
     }
     let (events, report) = collect(
         &[
@@ -409,5 +413,57 @@ async fn malformed_multivideo_is_rejected_without_publishing_an_event() {
         assert!(matches!(report.reason, EndReason::MediaRejected(_)));
         assert!(events.is_empty());
         assert_eq!(report.track_count, 0);
+    }
+}
+
+#[tokio::test]
+async fn timestamp_regression_small_frames_remain_monotone_and_keep_cts() {
+    for delta in [1, 2000] {
+        let tags = [
+            video(b"hvc1", 0, 7, 0, &[1]),
+            audio(1, 0, 0),
+            video(b"hvc1", 1, 7, 3000, &[0, 0, 137, 1]),
+            video(b"hvc1", 1, 7, 3000 - delta, &[0, 0, 137, 2]),
+            audio(1, 1, 1),
+            video(b"hvc1", 1, 7, 3001, &[0, 0, 137, 3]),
+        ];
+        let (events, report) = collect(&tags, IngestLimits::local_probe()).await;
+        assert_eq!(report.reason, EndReason::ExplicitStop);
+        assert_eq!(events.len(), tags.len());
+        assert_eq!((events[3].dts_ms, events[3].pts_ms), (3000, 3137));
+        assert_eq!(events[4].dts_ms, 1);
+        assert_eq!(events[5].dts_ms, 3001);
+    }
+}
+
+#[tokio::test]
+async fn timestamp_regression_clamp_limit_is_fifty_per_session() {
+    for count in [50, 51] {
+        let mut tags = vec![audio(0, 0, 0), audio(1, 0, 0), audio(0, 1, 100), audio(1, 1, 100)];
+        for index in 0..count {
+            tags.push(audio((index % 2) as u8, 1, 99));
+        }
+        let (events, report) = collect(&tags, IngestLimits::local_probe()).await;
+        assert_eq!(events.len(), 4 + count.min(50));
+        assert_eq!(report.reason, if count == 50 { EndReason::ExplicitStop } else { EndReason::MediaRejected(MediaError::TimestampRegression) });
+    }
+}
+
+#[tokio::test]
+async fn timestamp_regression_obs_sequence_end_keeps_streamer_stop_reason() {
+    for fourcc in [b"hvc1", b"av01", b"avc1"] {
+        let tags = [
+            video(fourcc, 0, 7, 0, &[1]),
+            video(fourcc, 3, 7, 29_548, &[1]),
+            video(fourcc, 2, 7, 0, &[]),
+        ];
+        let (events, report) = collect(&tags, IngestLimits::local_probe()).await;
+        assert_eq!(report.reason, EndReason::ExplicitStop);
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[2].dts_ms, 29_548);
+        let diagnostic = format!("{report:?}");
+        for expected in ["event_kind: SequenceEnd", "last_dts_ms: 29548", "new_dts_ms: 0", "delta_ms: 29548", "wire_id: 7"] {
+            assert!(diagnostic.contains(expected), "fehlende Schlussdiagnose {expected}: {diagnostic}");
+        }
     }
 }
