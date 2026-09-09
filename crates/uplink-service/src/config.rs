@@ -51,6 +51,8 @@ pub struct TestIngestConfig {
 #[serde(deny_unknown_fields)]
 pub struct MediaConfig {
     #[serde(default)]
+    pub enhanced: EnhancedConfig,
+    #[serde(default)]
     pub probe_dump_streamer_id: Option<u64>,
     pub ffmpeg: std::path::PathBuf,
     pub ffprobe: std::path::PathBuf,
@@ -237,6 +239,26 @@ impl Config {
         {
             return Err("Mediengrenzen oder Audiozuordnung sind ungültig.");
         }
+        let enhanced = &config.media.enhanced;
+        let mut keys = std::collections::HashSet::new();
+        if !(1..=16).contains(&enhanced.maximum_video_tracks)
+            || !(1..=100_000).contains(&enhanced.maximum_aggregate_bitrate)
+            || enhanced.capacity_units > 100_000
+            || enhanced.legacy_session_units == 0
+            || enhanced.profiles.len() > 128
+            || (enhanced.capacity_units > 0
+                && enhanced.legacy_session_units > enhanced.capacity_units)
+            || enhanced.profiles.iter().any(|profile| {
+                profile.key.is_empty()
+                    || profile.key.len() > 4096
+                    || profile.key.chars().any(char::is_control)
+                    || !keys.insert(&profile.key)
+                    || profile.units == 0
+                    || profile.units > enhanced.capacity_units
+            })
+        {
+            return Err("Enhanced-Broadcasting-Grenzen sind ungültig.");
+        }
         config.ingest_limits()?;
         let mut platforms = std::collections::HashSet::new();
         for platform in &config.platforms {
@@ -259,5 +281,46 @@ impl Config {
             }
         }
         Ok(config)
+    }
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnhancedConfig {
+    #[serde(default = "enhanced_tracks")]
+    pub maximum_video_tracks: u32,
+    #[serde(default = "enhanced_bitrate")]
+    pub maximum_aggregate_bitrate: u64,
+    #[serde(default)]
+    pub capacity_units: u32,
+    #[serde(default = "legacy_units")]
+    pub legacy_session_units: u32,
+    #[serde(default)]
+    pub profiles: Vec<CapacityProfile>,
+}
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapacityProfile {
+    pub key: String,
+    pub units: u32,
+}
+fn enhanced_tracks() -> u32 {
+    8
+}
+fn enhanced_bitrate() -> u64 {
+    20000
+}
+fn legacy_units() -> u32 {
+    1
+}
+impl Default for EnhancedConfig {
+    fn default() -> Self {
+        Self {
+            maximum_video_tracks: enhanced_tracks(),
+            maximum_aggregate_bitrate: enhanced_bitrate(),
+            capacity_units: 0,
+            legacy_session_units: 1,
+            profiles: Vec::new(),
+        }
     }
 }

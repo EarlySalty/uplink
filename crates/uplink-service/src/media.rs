@@ -2,14 +2,18 @@ use crate::{api::ServiceState, runtime::SessionProcessor};
 use std::sync::Arc;
 use uplink_ingest::{MediaEvent, rustls};
 use uplink_media::{
-    DesiredOutput, DesiredSessionSpec, DesiredVideo, EngineConfig, MediaEngine, PublishSecret,
-    PublishTarget,
+    DesiredOutput, DesiredVideo, EngineConfig, MediaEngine, PublishSecret, PublishTarget,
 };
 
 pub struct Coordinator {
     state: Arc<ServiceState>,
     engine: MediaEngine,
     tls: Arc<rustls::ClientConfig>,
+    engine_config: EngineConfig,
+    hardware: tokio::sync::OnceCell<
+        Result<uplink_media::platform::hardware::HardwareReport, uplink_media::MediaError>,
+    >,
+    broker: Option<crate::chat::BotBroker>,
 }
 impl Coordinator {
     pub fn new(state: Arc<ServiceState>) -> Result<Self, &'static str> {
@@ -27,13 +31,14 @@ impl Coordinator {
             std::fs::Permissions::from_mode(0o700),
         )
         .map_err(|_| "Medienverzeichnis ist nicht geschützt.")?;
-        let engine = MediaEngine::new(EngineConfig {
+        let engine_config = EngineConfig {
             ffmpeg: config.ffmpeg.clone(),
             ffprobe: config.ffprobe.clone(),
             work_directory: config.work_directory.clone(),
             limits: state.config.media_limits(),
-        })
-        .map_err(|_| "Medienkonfiguration ist ungültig.")?;
+        };
+        let engine = MediaEngine::new(engine_config.clone())
+            .map_err(|_| "Medienkonfiguration ist ungültig.")?;
         let mut roots =
             rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         if let Some(path) = &state.config.loopback_test_ca {
@@ -64,12 +69,62 @@ impl Coordinator {
         .map_err(|_| "TLS-Ausgang ist ungültig.")?
         .with_root_certificates(roots)
         .with_no_client_auth();
+        state.registry.configure_capacity(
+            config.enhanced.capacity_units,
+            config.enhanced.legacy_session_units,
+        )?;
+        let broker = state
+            .config
+            .chat
+            .as_ref()
+            .map(|chat| {
+                crate::chat::BotBroker::new(
+                    &chat.bot_base_url,
+                    crate::crypto::Secret::new(state.secrets.bot_internal.expose().to_vec()),
+                )
+            })
+            .transpose()?;
         Ok(Self {
+            engine_config,
+            hardware: tokio::sync::OnceCell::new(),
+            broker,
             state,
             engine,
             tls: Arc::new(tls),
         })
     }
+    async fn twitch_output(
+        &self,
+        tenant: u64,
+        output: DesiredOutput,
+        source: &uplink_media::SourceObservation,
+    ) -> Result<uplink_media::ProgramOutput, &'static str> {
+        self.broker.as_ref().ok_or("Die Twitch-Kontoprüfung ist noch nicht eingerichtet.")?.publish_grant(tenant).await.map_err(|_| "Der Twitch-Zugang oder sein Kontoinhaber konnte nicht bestätigt werden. Twitch erneut verbinden.")?;
+        let preferences =
+            crate::media_output::preferences(source, &output, &self.state.config.media.enhanced)?;
+        let hardware = self
+            .hardware
+            .get_or_init(|| uplink_media::platform::hardware::measure(&self.engine_config))
+            .await
+            .as_ref()
+            .map_err(|_| "Die Softwareencoder konnten auf diesem Server nicht bestätigt werden.")?;
+        let configuration = uplink_media::platform::twitch::GoLiveClient::new()
+            .map_err(|error| error.message())?
+            .configure(
+                &output.target.playpath,
+                hardware,
+                &preferences,
+                &output.target.allowed_hosts,
+            )
+            .await
+            .map_err(|error| error.message())?;
+        crate::media_output::twitch(
+            configuration,
+            output.live_audio_track,
+            output.vod_audio_track,
+        )
+    }
+
     fn output(
         &self,
         row: &tokio_postgres::Row,
@@ -198,13 +253,16 @@ impl SessionProcessor for Coordinator {
         if probe_dump_allowed(&self.state.config.media, first.identity.session.tenant_id()) {
             diagnostic.request_probe_dump();
         }
-        let started = self
+        let mut events = events;
+        let selected_audio = outputs
+            .iter()
+            .flat_map(|output| {
+                std::iter::once(output.live_audio_track).chain(output.vod_audio_track)
+            })
+            .collect();
+        let prepared = self
             .engine
-            .prepare_and_start_diagnosed(
-                DesiredSessionSpec { first, outputs },
-                events,
-                &mut diagnostic,
-            )
+            .prepare_source_diagnosed(first, &mut events, &selected_audio, &mut diagnostic)
             .await;
         if let Some(bytes) = diagnostic.take_probe_dump() {
             let directory = self.state.config.media.work_directory.clone();
@@ -213,9 +271,59 @@ impl SessionProcessor for Coordinator {
                 .unwrap_or(crate::probe_dump::DumpStatus::WriteFailed);
             diagnostic.probe_dump_finished(status.code());
         }
-        let running = started.map_err(|error| {
+        let prepared = prepared.map_err(|error| {
             preparation_failure(&reservation, error, serde_json::json!(diagnostic))
         })?;
+        reservation.observation(
+            serde_json::to_value(prepared.observation())
+                .map_err(|_| "Eingangsmessung konnte nicht dargestellt werden.")?,
+        );
+        let mut programs = Vec::new();
+        for output in outputs {
+            let platform = output.target.id.clone();
+            let result = if platform == "twitch" {
+                self.twitch_output(tenant as u64, output, prepared.observation())
+                    .await
+            } else {
+                crate::media_output::ordinary(output)
+            };
+            match result {
+                Ok(program) => {
+                    if platform == "twitch" {
+                        let key =
+                            crate::media_output::capacity_key(prepared.observation(), &program);
+                        let units = self
+                            .state
+                            .config
+                            .media
+                            .enhanced
+                            .profiles
+                            .iter()
+                            .find(|profile| profile.key == key)
+                            .map(|profile| profile.units);
+                        let admitted = units.ok_or("Dieses Qualitätsprofil ist noch nicht durch eine Lastmessung freigegeben.").and_then(|units| reservation.reserve_profile_capacity(units));
+                        if let Err(reason) = admitted {
+                            reservation.media_diagnostic(
+                                serde_json::json!({"phase":"capacity", "profile_key":key}),
+                            );
+                            reservation.block_output(platform, reason);
+                            continue;
+                        }
+                    }
+                    programs.push(program);
+                }
+                Err(reason) => reservation.block_output(platform, reason),
+            }
+        }
+        if programs.is_empty() {
+            return Err("Kein ausführbares Ausgabeziel ist verfügbar; siehe Zielstatus.");
+        }
+        let running = self
+            .engine
+            .start_prepared_program(prepared, programs, events, &mut diagnostic)
+            .map_err(|error| {
+                preparation_failure(&reservation, error, serde_json::json!(diagnostic))
+            })?;
         if let Some(observation) = running.source_observation() {
             reservation.observation(
                 serde_json::to_value(observation)

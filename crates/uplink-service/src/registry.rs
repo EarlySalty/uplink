@@ -7,6 +7,9 @@ use std::{
 pub struct Registry(Arc<Mutex<State>>);
 struct State {
     changes: std::collections::HashSet<u64>,
+    capacity: HashMap<u64, u32>,
+    capacity_limit: u32,
+    legacy_units: u32,
     next: u64,
     active: HashMap<u64, (u64, SessionStatus)>,
     total: usize,
@@ -66,12 +69,27 @@ impl Registry {
         }
         Ok(Self(Arc::new(Mutex::new(State {
             changes: Default::default(),
+            capacity: HashMap::new(),
+            capacity_limit: 0,
+            legacy_units: 1,
             next: 1,
             active: HashMap::new(),
             total,
             per_tenant,
             recent: VecDeque::new(),
         }))))
+    }
+    pub fn configure_capacity(&self, limit: u32, legacy_units: u32) -> Result<(), &'static str> {
+        let mut state = self
+            .0
+            .lock()
+            .map_err(|_| "Sessionverwaltung ist nicht verfügbar.")?;
+        if !state.active.is_empty() || legacy_units == 0 || (limit > 0 && legacy_units > limit) {
+            return Err("Kapazitätskonfiguration kann nicht übernommen werden.");
+        }
+        state.capacity_limit = limit;
+        state.legacy_units = legacy_units;
+        Ok(())
     }
     pub fn reserve(&self, tenant: u64) -> Result<Reservation, &'static str> {
         let mut state = self
@@ -85,11 +103,19 @@ impl Registry {
         {
             return Err("Sessionkapazität ist belegt.");
         }
+        let used: u64 = state.capacity.values().map(|value| u64::from(*value)).sum();
+        if state.capacity_limit > 0
+            && used + u64::from(state.legacy_units) > u64::from(state.capacity_limit)
+        {
+            return Err("Gemessene Medienkapazität ist belegt.");
+        }
         let id = state.next;
         state.next = state
             .next
             .checked_add(1)
             .ok_or("Sessionidentitäten sind ausgeschöpft.")?;
+        let legacy_units = state.legacy_units;
+        state.capacity.insert(id, legacy_units);
         state.active.insert(
             id,
             (
@@ -167,6 +193,28 @@ impl Registry {
     }
 }
 impl Reservation {
+    pub fn reserve_profile_capacity(&self, units: u32) -> Result<(), &'static str> {
+        let registry = self.registry.upgrade().ok_or("Session ist beendet.")?;
+        let mut state = registry
+            .lock()
+            .map_err(|_| "Sessionverwaltung ist nicht verfügbar.")?;
+        if units == 0 || state.capacity_limit == 0 {
+            return Err(
+                "Dieses Qualitätsprofil ist noch nicht durch eine Lastmessung freigegeben.",
+            );
+        }
+        let current = *state.capacity.get(&self.id).ok_or("Session ist beendet.")?;
+        let requested = current
+            .checked_add(units)
+            .ok_or("Gemessene Medienkapazität ist belegt.")?;
+        let used: u64 = state.capacity.values().map(|value| u64::from(*value)).sum();
+        if used + u64::from(units) > u64::from(state.capacity_limit) {
+            return Err("Für dieses Qualitätsprofil ist die gemessene Medienkapazität belegt.");
+        }
+        state.capacity.insert(self.id, requested);
+        Ok(())
+    }
+
     pub fn media_diagnostic(&self, value: serde_json::Value) {
         *self
             .media_diagnostic
@@ -318,6 +366,7 @@ impl Drop for Reservation {
                 });
             let mut state = registry.lock().unwrap_or_else(|e| e.into_inner());
             state.active.remove(&self.id);
+            state.capacity.remove(&self.id);
             state.recent.retain(|(t, _)| *t != tenant);
             state.recent.push_back((tenant, status));
             while state.recent.len() > state.total.saturating_mul(2) {

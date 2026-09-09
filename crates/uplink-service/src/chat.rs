@@ -114,6 +114,24 @@ impl BotBroker {
         }
         Ok((status, body))
     }
+    pub async fn publish_grant(&self, id: u64) -> Result<(), BrokerError> {
+        let (status, body) = self
+            .get(
+                id,
+                "/twitch/api/v2/internal/platform-token",
+                &[("platform", "twitch".into()), ("purpose", "publish".into())],
+            )
+            .await?;
+        if status != 200 {
+            return Err(match status {
+                401 | 403 | 409 => BrokerError::Unauthorized,
+                404 => BrokerError::AccessUnconfirmed,
+                _ => BrokerError::Unavailable,
+            });
+        }
+        validate_publish_grant(id, &body)
+    }
+
     fn decode<T: DeserializeOwned>(body: &[u8]) -> Result<T, BrokerError> {
         serde_json::from_slice(body).map_err(|_| BrokerError::Unavailable)
     }
@@ -212,5 +230,49 @@ impl PlatformBroker for BotBroker {
                 _ => Err(BrokerError::Unavailable),
             }
         })
+    }
+}
+
+fn validate_publish_grant(id: u64, body: &[u8]) -> Result<(), BrokerError> {
+    #[derive(serde::Deserialize)]
+    struct PublishGrant<'a> {
+        purpose: &'a str,
+        token_owner: &'a str,
+        platform_user_id: &'a str,
+        scopes: Vec<&'a str>,
+        access_token: &'a str,
+    }
+    let grant: PublishGrant<'_> =
+        serde_json::from_slice(body).map_err(|_| BrokerError::AccessUnconfirmed)?;
+    if id == 0
+        || grant.purpose != "publish"
+        || grant.token_owner != id.to_string()
+        || grant.platform_user_id != id.to_string()
+        || grant.access_token.is_empty()
+        || grant.access_token.len() > 8192
+        || grant.scopes.len() > 128
+        || !grant.scopes.contains(&"channel:read:stream_key")
+    {
+        return Err(BrokerError::Unauthorized);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod publish_tests {
+    use super::*;
+    #[test]
+    fn publish_requires_explicit_purpose_owner_and_scope() {
+        let valid = serde_json::json!({"purpose":"publish","token_owner":"11","platform_user_id":"11","scopes":["channel:read:stream_key"],"access_token":"synthetic-test"});
+        assert!(validate_publish_grant(11, &serde_json::to_vec(&valid).unwrap()).is_ok());
+        for field in ["purpose", "token_owner", "platform_user_id", "scopes"] {
+            let mut invalid = valid.clone();
+            invalid.as_object_mut().unwrap().remove(field);
+            assert!(validate_publish_grant(11, &serde_json::to_vec(&invalid).unwrap()).is_err());
+        }
+        assert!(validate_publish_grant(12, &serde_json::to_vec(&valid).unwrap()).is_err());
+        let mut wrong = valid;
+        wrong["token_owner"] = serde_json::json!("12");
+        assert!(validate_publish_grant(11, &serde_json::to_vec(&wrong).unwrap()).is_err());
     }
 }

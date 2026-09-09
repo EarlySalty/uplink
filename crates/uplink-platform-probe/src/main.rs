@@ -11,7 +11,7 @@ use uplink_media::{
     },
 };
 use uplink_service::{
-    config::{Config, InfisicalConfig, MediaConfig, TlsConfig},
+    config::{Config, EnhancedConfig, InfisicalConfig, MediaConfig, TlsConfig},
     crypto::Secret,
     secrets,
     store::Store,
@@ -280,6 +280,7 @@ fn fetch_config(args: &Arguments, meta: Metadata) -> Result<Config> {
             private_key_fd: credential_fd + 2,
         },
         media: MediaConfig {
+            enhanced: EnhancedConfig::default(),
             probe_dump_streamer_id: None,
             ffmpeg: args.ffmpeg.clone(),
             ffprobe: args.ffprobe.clone(),

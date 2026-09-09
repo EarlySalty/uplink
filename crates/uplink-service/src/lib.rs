@@ -15,3 +15,5 @@ mod test_ingest;
 pub mod tls_reload;
 
 mod probe_dump;
+
+mod media_output;
