@@ -435,6 +435,17 @@ impl SessionProcessor for Coordinator {
                 desired.push(wunsch.output);
                 continue;
             }
+            if self.state.config.media.enhanced.profiles.is_empty() {
+                if wunsch.hochkant.is_some() {
+                    reservation.block_output(platform, "Die Hochkantwahl benötigt eine lastgemessene Leiter; das gespeicherte Einzelziel kann sie nicht ausführen.");
+                } else if output.video.codec != uplink_core::Codec::H264 {
+                    reservation.block_output(platform, "Das gespeicherte Twitch-Einzelziel benötigt eine H.264-Ausgabe; der Ausgabevertrag muss korrigiert werden.");
+                } else {
+                    reservation.output_notice(platform, "Eine H.264-Ausgabe aus dem gespeicherten Zielvertrag; die Leiter ist nicht lastgemessen. Zusätzliche Qualitätsstufen sind nicht freigegeben.");
+                    desired.push(wunsch.output);
+                }
+                continue;
+            }
             let ergebnis = {
                 let tenant_wert =
                     u64::try_from(tenant).map_err(|_| "Nutzeridentität ist ungültig.")?;
@@ -446,16 +457,11 @@ impl SessionProcessor for Coordinator {
                     if platform == "twitch" {
                         let key =
                             crate::media_output::capacity_key(prepared.observation(), &program);
-                        let units = self
-                            .state
-                            .config
-                            .media
-                            .enhanced
-                            .profiles
-                            .iter()
-                            .find(|profile| profile.key == key)
-                            .map(|profile| profile.units);
-                        let admitted = units.ok_or("Dieses Qualitätsprofil ist noch nicht durch eine Lastmessung freigegeben.").and_then(|units| reservation.reserve_profile_capacity(units));
+                        let admitted = reserve_twitch_profile(
+                            &self.state.config.media.enhanced,
+                            &reservation,
+                            &key,
+                        );
                         if let Err(reason) = admitted {
                             reservation.media_diagnostic(
                                 serde_json::json!({"phase":"capacity", "profile_key":key}),
@@ -528,6 +534,20 @@ impl SessionProcessor for Coordinator {
     }
 }
 
+fn reserve_twitch_profile(
+    enhanced: &crate::config::EnhancedConfig,
+    reservation: &crate::registry::Reservation,
+    key: &str,
+) -> Result<(), &'static str> {
+    let units = enhanced
+        .profiles
+        .iter()
+        .find(|profile| profile.key == key)
+        .map(|profile| profile.units)
+        .ok_or("Dieses Qualitätsprofil ist noch nicht durch eine Lastmessung freigegeben.")?;
+    reservation.reserve_profile_capacity(units)
+}
+
 fn probe_dump_allowed(config: &crate::config::MediaConfig, authenticated_tenant: u64) -> bool {
     config.probe_dump_streamer_id == Some(authenticated_tenant)
 }
@@ -545,6 +565,32 @@ fn preparation_failure(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn configured_twitch_profiles_remain_closed_without_capacity_or_matching_key() {
+        for (capacity, requested_key, admitted) in [
+            (0, "measured", false),
+            (2, "missing", false),
+            (2, "measured", true),
+        ] {
+            let registry = crate::registry::Registry::new(1, 1).unwrap();
+            registry.configure_capacity(capacity, 1).unwrap();
+            let reservation = registry.reserve(11).unwrap();
+            let enhanced = crate::config::EnhancedConfig {
+                capacity_units: capacity,
+                profiles: vec![crate::config::CapacityProfile {
+                    key: "measured".into(),
+                    units: 1,
+                }],
+                ..Default::default()
+            };
+            let result = super::reserve_twitch_profile(&enhanced, &reservation, requested_key);
+            assert_eq!(result.is_ok(), admitted);
+            if !admitted {
+                assert!(result.unwrap_err().contains("Lastmessung"));
+            }
+        }
+    }
+
     #[test]
     fn dump_scope_requires_explicit_config_and_matching_authenticated_tenant() {
         let mut config =
