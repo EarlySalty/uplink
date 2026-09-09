@@ -609,10 +609,12 @@ async fn probe(
     let mut read_error_kind = None;
     let operation = async {
         let write = async {
-            stdin.write_all(bytes).await.map_err(|error| {
+            if let Err(error) = stdin.write_all(bytes).await {
                 write_error_kind = Some(io_error_label(error.kind()));
-                MediaError::Io
-            })?;
+                if error.kind() != std::io::ErrorKind::BrokenPipe {
+                    return Err(MediaError::Io);
+                }
+            }
             drop(stdin);
             Ok::<_, MediaError>(())
         };
@@ -642,7 +644,11 @@ async fn probe(
             .map_err(|_| MediaError::ProcessCleanupFailed)?;
         exit_code = status.code();
         if !status.success() {
-            return Err(MediaError::ProcessFailed);
+            return Err(if write_error_kind.is_some() {
+                MediaError::Io
+            } else {
+                MediaError::ProcessFailed
+            });
         }
         serde_json::from_slice(&output).map_err(|_| MediaError::InvalidMedia)
     };
