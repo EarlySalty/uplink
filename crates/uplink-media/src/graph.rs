@@ -1048,7 +1048,7 @@ mod tests {
                 "duplicate-wire",
                 vec![
                     program_video(0, 0, program_profile(Codec::H264, 256, 144), None),
-                    program_video(0, 1, program_profile(Codec::Hevc, 144, 256), None),
+                    program_video(0, 0, program_profile(Codec::Hevc, 144, 256), None),
                 ],
                 audio.clone(),
             )],

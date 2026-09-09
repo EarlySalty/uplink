@@ -218,7 +218,9 @@ async fn quelle_einspeisen(
     fixture: &[u8],
 ) -> (
     MediaEvent,
+    mpsc::Sender<MediaEvent>,
     mpsc::Receiver<MediaEvent>,
+    Vec<MediaEvent>,
     Vec<(u32, i64)>,
     BTreeMap<u8, Vec<(u32, i64)>>,
 ) {
@@ -263,10 +265,14 @@ async fn quelle_einspeisen(
     let mut events = events.into_iter();
     let first = events.next().unwrap();
     let (send, receive) = mpsc::channel(512);
-    for event in events {
-        send.try_send(event).unwrap();
-    }
-    (first, receive, video_zeit, audio_zeit)
+    (
+        first,
+        send,
+        receive,
+        events.collect(),
+        video_zeit,
+        audio_zeit,
+    )
 }
 
 fn profil(codec: Codec, width: u32, height: u32) -> VideoProfile {
@@ -416,7 +422,12 @@ fn versatz(eingang: &[(u32, i64)], ausgang: &[Paket]) -> i64 {
 #[ignore = "Benötigt den installierten geprüften FFmpeg-8-Build; ausschließlich lokale TLS-Verbindungen."]
 async fn mixed_codec_program_output_preserves_headers_tracks_and_timebase() {
     let fixture = quelle_generieren().await;
-    let (first, receive, eingang_video, eingang_audio) = quelle_einspeisen(&fixture).await;
+    let (first, send, receive, rest, eingang_video, eingang_audio) =
+        quelle_einspeisen(&fixture).await;
+    for event in rest {
+        send.try_send(event).unwrap();
+    }
+    drop(send);
     let (multi_server, multi_ziel) = server_und_ziel("multi").await;
     let (shared_server, shared_ziel) = server_und_ziel("shared").await;
     let multi = erfasse(multi_server);
@@ -567,7 +578,12 @@ async fn mixed_codec_program_output_preserves_headers_tracks_and_timebase() {
 #[ignore = "Benötigt den installierten geprüften FFmpeg-8-Build; ausschließlich lokale TLS-Verbindungen."]
 async fn dead_target_does_not_stop_healthy_multitrack_target() {
     let fixture = quelle_generieren().await;
-    let (first, receive, eingang_video, _eingang_audio) = quelle_einspeisen(&fixture).await;
+    let (first, send, receive, rest, eingang_video, _eingang_audio) =
+        quelle_einspeisen(&fixture).await;
+    for event in rest {
+        send.try_send(event).unwrap();
+    }
+    drop(send);
     let (tot_server, tot_ziel) = server_und_ziel("totes-ziel").await;
     let (gesund_server, gesund_ziel) = server_und_ziel("gesundes-ziel").await;
     let tot = Task::neu(tokio::spawn(async move {
@@ -657,7 +673,12 @@ async fn dead_target_does_not_stop_healthy_multitrack_target() {
 #[ignore = "Benötigt den installierten geprüften FFmpeg-8-Build; ausschließlich lokale TLS-Verbindungen."]
 async fn explicit_stop_releases_multitrack_resources() {
     let fixture = quelle_generieren().await;
-    let (first, receive, _eingang_video, _eingang_audio) = quelle_einspeisen(&fixture).await;
+    let (first, send, receive, mut rest, _eingang_video, _eingang_audio) =
+        quelle_einspeisen(&fixture).await;
+    let ungefüttert = rest.split_off(rest.len().saturating_sub(5));
+    for event in rest {
+        send.try_send(event).unwrap();
+    }
     let (links_server, links_ziel) = server_und_ziel("links").await;
     let (rechts_server, rechts_ziel) = server_und_ziel("rechts").await;
     let links = erfasse(links_server);
@@ -704,6 +725,8 @@ async fn explicit_stop_releases_multitrack_resources() {
         running.status()
     );
     let report = timeout(FRIST, running.stop()).await.unwrap();
+    drop(send);
+    drop(ungefüttert);
     assert_eq!(
         report.error,
         Some(MediaError::Cancelled),
