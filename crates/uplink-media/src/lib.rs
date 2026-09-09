@@ -4,6 +4,7 @@ mod engine;
 pub mod flv;
 mod graph;
 pub mod platform;
+pub mod portrait;
 mod prepare;
 pub mod pusher;
 pub mod queue;
