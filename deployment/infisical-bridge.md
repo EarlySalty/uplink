@@ -16,6 +16,20 @@ Vor Aktivierung sind Code und gekoppelte Service-/Dashboard-Reader unabhängig z
 
 Reihenfolge: Bridge starten; geschützten Socket und erlaubte Client-UIDs bestätigen; Providerconfig von `infisical_port` auf `infisical_socket` umstellen; normale Uplink- und Dashboard-FD9-Konfiguration auf denselben Socket umstellen; anschließend Provider und Dienste starten. Der erste Start erfolgt mit einem begrenzten Readinesscheck. Bei späterem vorübergehend fehlendem Socket schlagen Secretzugriffe sichtbar fehl; Service-Restart und TLS-Timer wiederholen den Zugriff. Eine Rückkehr auf ungeschütztes Host-HTTP ist kein erlaubter Rollback. Die übrigen Legacy-Bot-Infisicalwege sind nicht Bestandteil dieses Pakets.
 
+### User-Unit und Host-UID 0
+
+Die bestehende `rs-relay`-User-Unit erbte beim Umschaltversuch vom 9. September 2026 `PrivateTmp=yes`, `ProtectSystem=strict` und `ProtectProc=invisible`. systemd 255 erzeugt für die Mount-Sandbox einer User-Unit implizit eine Usernamespace, auch wenn `systemctl show` weiterhin `PrivateUsers=no` meldet. Deren `uid_map` und `gid_map` enthalten hier ausschließlich `1000 1000 1`. Host-root erscheint darin als UID/GID 65534. Deshalb scheitert bereits der erste Pfadbestandteil `/` an der unveränderten Besitzerprüfung. Bridge-UID, Socketbesitzer und ACL waren korrekt.
+
+`rs-relay-override.conf` setzt diese drei geerbten Namespace-Regeln sowie `PrivateUsers` explizit zurück. Es entfällt der Mount-Schreibschutz und das private `/tmp`; `ProtectProc` wird auf die normale Prozesssicht zurückgesetzt. Der Dienst bleibt UID 1000 ohne neue Privilegien, mit UMask 0077 und den bestehenden Host-Dateirechten. Rootgeschützter Socketpfad, Owner-UID 0, Symlinkverbot und Bridge-ACL einschließlich `SO_PEERCRED` bleiben unverändert. Niemals `socket_owner_uid = 65534` einstellen: Diese Sammel-UID kann verschiedene nicht abgebildete Hostbenutzer bezeichnen. Eine vollständig erhaltene Mount-Sandbox würde eine privilegiert eingerichtete Namespace oder eine System-Unit mit `User=nathanael` benötigen und ist ein gesonderter Betriebsumbau.
+
+Die isolierte Diagnose nutzt denselben `client_builder` wie der Dienst und führt weder eine Verbindung noch eine Secretabfrage aus:
+
+```sh
+cargo run -p uplink-infisical-transport --example pruefe_socket -- /run/uplink-infisical/api.sock 0
+```
+
+Ein erfolgreicher Aufruf im normalen Terminal belegt noch nicht die Sicht des Dienstes. Bei erneutem Fehler dieselbe Probe ausschließlich lesend in dessen bestehender User- und Mountnamespace ausführen (`nsenter --target <PID> --user --mount --setuid 1000 --setgid 1000`). Vor dem nächsten Umschalten die korrigierte Override-Datei installieren und den User-Manager durch den zuständigen Deployer neu einlesen lassen. Bridge-Unit, Bridge-Config und Socketverzeichnis benötigen keine Änderung.
+
 ## Nachweise
 
 Normale Tests prüfen geschützte/fremde/symlinkartige Socketpfade sowie den Provider gegen einen echten synthetischen Unixsocket. Der zusätzliche Test `real_namespaces_switch_without_host_port_or_unauthorized_peer` läuft als root in einer eigenen äußeren Netznamespace. Er belegt zwei verschiedene echte Backend-Netznamespaces mit identischem Port, verweigert eine nicht erlaubte Peer-UID, schließt bei fehlender Gegenstelle und erreicht nach FD-Wechsel ausschließlich das zweite Backend. Der synthetische Angreiferlistener im äußeren Hostnetz erhält keine Verbindung. Produktions-Infisical wird dafür nicht neu gestartet. Die Docker-Metadatenvalidierung wird separat geprüft; der Test behauptet keinen tatsächlich ausgeführten Produktions-Docker-Neustart.
