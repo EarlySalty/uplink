@@ -383,7 +383,14 @@ fn capabilities() -> Value {
 }
 fn dashboard_state(state: &ServiceState, id: u64) -> Value {
     let statuses = state.registry.status(id);
-    let session = statuses.iter().find(|s| s.active);
+    let session = statuses
+        .iter()
+        .find(|s| s.active)
+        .map(crate::media_status::session_status);
+    let statuses: Vec<_> = statuses
+        .iter()
+        .map(crate::media_status::session_status)
+        .collect();
     json!({"sessions":statuses,"session":session,"service_status":service_status(state),"capabilities":capabilities()})
 }
 async fn status(
@@ -542,6 +549,7 @@ async fn destinations(
         .unwrap_or(0);
     let mut outputs = Vec::with_capacity(rows.len());
     let sessions = state.registry.status(query.streamer_id as u64);
+    let input = crate::media_status::input_status(sessions.iter().find(|session| session.active));
     for row in rows {
         let invalid = || {
             failure(
@@ -600,7 +608,7 @@ async fn destinations(
             .filter(|_| output_state == "sending")
             .and_then(|mode| mode.active);
         let fallback_reason = mode.and_then(|mode| mode.fallback_reason.as_deref());
-        outputs.push(json!({"platform":platform,"connection_generation":row.try_get::<_,i64>(7).map_err(|_|invalid())?,"rtmp_url":if blocked {""} else {endpoint.as_str()},"enabled":row.try_get::<_,bool>(2).map_err(|_|invalid())?,"blocked":blocked,"error":endpoint_error,"requested":{"width":row.try_get::<_,Option<i32>>(3).map_err(|_|invalid())?,"height":row.try_get::<_,Option<i32>>(4).map_err(|_|invalid())?,"fps":row.try_get::<_,Option<i32>>(5).map_err(|_|invalid())?,"bitrate_kbps":row.try_get::<_,Option<i32>>(6).map_err(|_|invalid())?},"requested_output_mode":row.try_get::<_,String>(12).map_err(|_|invalid())?,"active_output_mode":active_output_mode,"fallback_reason":fallback_reason,"active_profile":active_profile,"active_profiles":active_profiles,"hochkant":{"enabled":hochkant_enabled,"width":row.try_get::<_,Option<i32>>(10).map_err(|_|invalid())?,"height":row.try_get::<_,Option<i32>>(11).map_err(|_|invalid())?,"requested_revision":requested_revision,"active_revision":active_revision},"twitch_audio_mode":requested_audio,"effective_audio_mode":effective_audio,"active_audio_mode":active_audio,"output_state":output_state,"reason":reason,"publication_confirmed":false}));
+        outputs.push(json!({"platform":platform,"connection_generation":row.try_get::<_,i64>(7).map_err(|_|invalid())?,"rtmp_url":if blocked {""} else {endpoint.as_str()},"enabled":row.try_get::<_,bool>(2).map_err(|_|invalid())?,"blocked":blocked,"error":endpoint_error,"requested":{"width":row.try_get::<_,Option<i32>>(3).map_err(|_|invalid())?,"height":row.try_get::<_,Option<i32>>(4).map_err(|_|invalid())?,"fps":row.try_get::<_,Option<i32>>(5).map_err(|_|invalid())?,"bitrate_kbps":row.try_get::<_,Option<i32>>(6).map_err(|_|invalid())?},"requested_output_mode":row.try_get::<_,String>(12).map_err(|_|invalid())?,"active_output_mode":active_output_mode,"fallback_reason":fallback_reason,"active_profile":active_profile,"active_profiles":active_profiles,"hochkant":{"enabled":hochkant_enabled,"width":row.try_get::<_,Option<i32>>(10).map_err(|_|invalid())?,"height":row.try_get::<_,Option<i32>>(11).map_err(|_|invalid())?,"requested_revision":requested_revision,"active_revision":active_revision},"twitch_audio_mode":requested_audio,"effective_audio_mode":effective_audio,"active_audio_mode":active_audio,"output_state":output_state,"reason":reason,"publication_confirmed":false,"input_codec":input["input_codec"],"input_bitrate_kbps":input["input_bitrate_kbps"]}));
     }
     Ok(Json(json!({"destinations": outputs})))
 }
