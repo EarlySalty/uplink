@@ -3,6 +3,15 @@ use std::{
     sync::{Arc, Mutex, Weak},
 };
 
+use crate::destinations::TwitchOutputMode;
+
+#[derive(Clone, serde::Serialize)]
+pub struct OutputModeStatus {
+    pub requested: TwitchOutputMode,
+    pub active: Option<TwitchOutputMode>,
+    pub fallback_reason: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct Registry(Arc<Mutex<State>>);
 struct State {
@@ -25,10 +34,12 @@ pub struct SessionStatus {
     pub state: &'static str,
     pub received_events: u64,
     pub received_bytes: u64,
+    pub input_backpressure: bool,
     pub error: Option<&'static str>,
     pub ingest_end_reason: Option<String>,
     pub blocked_outputs: std::collections::BTreeMap<String, &'static str>,
     pub output_notices: std::collections::BTreeMap<String, &'static str>,
+    pub output_modes: std::collections::BTreeMap<String, OutputModeStatus>,
     pub outputs: Option<serde_json::Value>,
     pub source_observation: Option<serde_json::Value>,
     pub frozen_layouts: serde_json::Value,
@@ -135,6 +146,8 @@ impl Registry {
                     ingest_end_reason: None,
                     blocked_outputs: std::collections::BTreeMap::new(),
                     output_notices: std::collections::BTreeMap::new(),
+                    output_modes: std::collections::BTreeMap::new(),
+                    input_backpressure: false,
                     outputs: None,
                     source_observation: None,
                     frozen_layouts: serde_json::Value::Null,
@@ -311,6 +324,30 @@ impl Reservation {
             state.output_notices.insert(platform, message);
         });
     }
+    pub fn requested_output_mode(&self, platform: &str, requested: TwitchOutputMode) {
+        self.update(|state| {
+            state.output_modes.insert(
+                platform.to_owned(),
+                OutputModeStatus {
+                    requested,
+                    active: None,
+                    fallback_reason: None,
+                },
+            );
+        });
+    }
+    pub fn input_backpressure(&self) {
+        self.update(|state| state.input_backpressure = true);
+    }
+    pub fn single_fallback(&self, platform: &str, reason: &'static str) {
+        self.update(|state| {
+            if let Some(mode) = state.output_modes.get_mut(platform) {
+                mode.active = None;
+                mode.fallback_reason = Some(reason.to_owned());
+            }
+            state.output_notices.insert(platform.to_owned(), reason);
+        });
+    }
     pub fn fail(&self, message: &'static str) {
         self.update(|state| {
             state.error = Some(message);
@@ -325,7 +362,50 @@ impl Reservation {
         });
     }
     pub fn media_status(&self, status: serde_json::Value) {
-        self.update(|state| state.outputs = Some(status));
+        self.update(|state| {
+            for (platform, mode) in &mut state.output_modes {
+                let sending = status["outputs"].as_array().is_some_and(|outputs| {
+                    outputs.iter().any(|output| {
+                        output["id"] == platform.as_str()
+                            && output["state"] == "publishing"
+                            && output["received_events"]
+                                .as_u64()
+                                .is_some_and(|count| count > 0)
+                    })
+                });
+                let video = status["graph"]
+                    .as_array()
+                    .and_then(|graphs| graphs.iter().find(|graph| graph["id"] == platform.as_str()))
+                    .and_then(|graph| graph["video"].as_array());
+                mode.active = if sending {
+                    video.map(|tracks| {
+                        if tracks
+                            .iter()
+                            .filter(|track| track["canvas_index"] == 0)
+                            .filter_map(|track| track.get("profile"))
+                            .map(serde_json::Value::to_string)
+                            .collect::<std::collections::BTreeSet<_>>()
+                            .len()
+                            > 1
+                        {
+                            TwitchOutputMode::Enhanced
+                        } else {
+                            TwitchOutputMode::Single
+                        }
+                    })
+                } else {
+                    None
+                };
+                if mode.requested == TwitchOutputMode::Enhanced
+                    && mode.active == Some(TwitchOutputMode::Single)
+                    && mode.fallback_reason.is_none()
+                {
+                    mode.fallback_reason =
+                        Some("Es wird nur eine Querformat-Qualitätsstufe gesendet.".to_owned());
+                }
+            }
+            state.outputs = Some(status);
+        });
     }
     pub fn observation(&self, observation: serde_json::Value) {
         self.update(|state| state.source_observation = Some(observation));
@@ -381,6 +461,9 @@ impl Drop for Reservation {
             .cloned();
         if let Some((tenant, mut status)) = snapshot {
             status.active = false;
+            for mode in status.output_modes.values_mut() {
+                mode.active = None;
+            }
             if status.error.is_none() {
                 status.state = "Beendet";
             }
@@ -421,6 +504,7 @@ impl Drop for Reservation {
                         source_tracks: report.as_ref().map_or(0, |report| report.track_count),
                         end_reason,
                         profile: serde_json::json!({
+                            "input_backpressure": status.input_backpressure,
                             "media_diagnostic": media_diagnostic,
                             "source_observation": status.source_observation,
                             "outputs": status.outputs,
@@ -449,6 +533,72 @@ impl Drop for Reservation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn output_mode_is_active_only_while_its_publisher_sends() {
+        let registry = Registry::new(1, 1).unwrap();
+        let reservation = registry.reserve(11).unwrap();
+        reservation.requested_output_mode("twitch", TwitchOutputMode::Enhanced);
+        assert_eq!(registry.status(11)[0].output_modes["twitch"].active, None);
+        reservation
+            .media_status(serde_json::json!({"outputs":[{"id":"twitch","state":"publishing","received_events":1}],"graph":[{"id":"twitch","video":[{"canvas_index":0,"profile":{"width":1920}},{"canvas_index":0,"profile":{"width":1280}}]}]}));
+        assert_eq!(
+            registry.status(11)[0].output_modes["twitch"].active,
+            Some(TwitchOutputMode::Enhanced)
+        );
+        reservation.single_fallback("twitch", "Kapazität fehlt.");
+        reservation
+            .media_status(serde_json::json!({"outputs":[{"id":"twitch","state":"publishing","received_events":1}],"graph":[{"id":"twitch","video":[{"canvas_index":0}]}]}));
+        let status = &registry.status(11)[0].output_modes["twitch"];
+        assert_eq!(status.requested, TwitchOutputMode::Enhanced);
+        assert_eq!(status.active, Some(TwitchOutputMode::Single));
+        assert_eq!(status.fallback_reason.as_deref(), Some("Kapazität fehlt."));
+        reservation.media_status(
+            serde_json::json!({"outputs":[{"id":"twitch","state":"local_end_unconfirmed"}]}),
+        );
+        assert_eq!(registry.status(11)[0].output_modes["twitch"].active, None);
+        reservation
+            .media_status(serde_json::json!({"outputs":[{"id":"twitch","state":"publishing","received_events":1}],"graph":[{"id":"twitch","video":[{"canvas_index":0}]}]}));
+        drop(reservation);
+        assert_eq!(registry.status(11)[0].output_modes["twitch"].active, None);
+    }
+
+    #[test]
+    fn enhanced_status_requires_distinct_landscape_qualities_in_actual_graph() {
+        for (tracks, expected) in [
+            (
+                serde_json::json!([{"canvas_index":0,"profile":{"width":1920}}]),
+                TwitchOutputMode::Single,
+            ),
+            (
+                serde_json::json!([{"canvas_index":0,"profile":{"width":1920}},{"canvas_index":1,"profile":{"width":720}}]),
+                TwitchOutputMode::Single,
+            ),
+            (
+                serde_json::json!([{"canvas_index":0,"profile":{"width":1920}},{"canvas_index":0,"profile":{"width":1920}}]),
+                TwitchOutputMode::Single,
+            ),
+            (
+                serde_json::json!([{"canvas_index":0,"profile":{"width":1920}},{"canvas_index":0,"profile":{"width":1280}}]),
+                TwitchOutputMode::Enhanced,
+            ),
+        ] {
+            let registry = Registry::new(1, 1).unwrap();
+            let reservation = registry.reserve(11).unwrap();
+            reservation.requested_output_mode("twitch", TwitchOutputMode::Enhanced);
+            let mut status = serde_json::json!({"outputs":[{"id":"twitch","state":"publishing","received_events":1}]});
+            reservation.media_status(status.clone());
+            assert_eq!(registry.status(11)[0].output_modes["twitch"].active, None);
+            status["graph"] = serde_json::json!([{"id":"twitch","video":tracks}]);
+            reservation.media_status(status);
+            let sessions = registry.status(11);
+            assert_eq!(sessions[0].output_modes["twitch"].active, Some(expected));
+            assert_eq!(
+                sessions[0].output_modes["twitch"].fallback_reason.is_some(),
+                expected == TwitchOutputMode::Single
+            );
+        }
+    }
 
     #[test]
     fn output_block_journal_is_debounced_across_reconnects_and_bounded() {

@@ -490,6 +490,10 @@ async fn delayed_coordinator_case(keep_receiver: bool) {
         rows[0].get::<_, serde_json::Value>(1)["media_diagnostic"]["error"],
         "ProbeFailed"
     );
+    assert_eq!(
+        rows[0].get::<_, serde_json::Value>(1)["input_backpressure"],
+        keep_receiver
+    );
 }
 
 #[tokio::test]

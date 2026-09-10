@@ -21,7 +21,13 @@ async fn normal_single_aac_live_mode_reaches_twitch_compatible_output() {
 #[tokio::test]
 #[ignore = "Benötigt isolierte PostgreSQL 16 und geprüften FFmpeg 8."]
 async fn twitch_without_enhanced_profiles_sends_desired_output_and_stays_alive() {
-    normal_case_mode(true, Some("live"), false, None, None, true).await;
+    normal_case_mode(true, Some("live"), false, None, None, true, false).await;
+}
+
+#[tokio::test]
+#[ignore = "Benötigt isolierte PostgreSQL 16 und geprüften FFmpeg 8."]
+async fn enhanced_without_measured_profiles_falls_back_after_valid_publish_grant() {
+    normal_case_mode(true, Some("live"), false, None, None, true, true).await;
 }
 
 #[tokio::test]
@@ -157,6 +163,7 @@ async fn normal_case(
         production,
         malformed_layout,
         false,
+        false,
     )
     .await;
 }
@@ -168,6 +175,7 @@ async fn normal_case_mode(
     production: Option<(&'static str, i64)>,
     malformed_layout: Option<bool>,
     unmeasured_twitch: bool,
+    enhanced_fallback: bool,
 ) {
     use futures::FutureExt;
     use sha2::{Digest, Sha256};
@@ -198,7 +206,7 @@ async fn normal_case_mode(
     }
     let (database, mut state) = fixture().await;
     let broker_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let broker = if let Some((owner, _)) = production {
+    let broker = if let Some((owner, _)) = production.or(enhanced_fallback.then_some(("11", 3))) {
         let calls = broker_calls.clone();
         let app = axum::Router::new().route(
             "/twitch/api/v2/internal/platform-token",
@@ -294,6 +302,7 @@ async fn normal_case_mode(
             .seal(OUTPUT_KEY.as_bytes(), "destination:11:twitch")
             .unwrap();
         state.store.query("INSERT INTO relay.destinations(streamer_id,platform,rtmp_url,stream_key_enc,enabled,width,height,fps,bitrate_kbps,twitch_audio_mode) VALUES(11,'twitch','rtmps://ingest.example/live',$1,true,256,144,25,500,'live')", &[&key]).await.unwrap();
+        state.store.query("UPDATE relay.destinations SET twitch_output_mode='enhanced' WHERE streamer_id=11 AND platform='twitch'", &[]).await.unwrap();
         if generation > 0 {
             state.store.query("INSERT INTO relay.destination_fences(streamer_id,platform,generation,deleted) VALUES(11,'twitch',$1,false)", &[&generation]).await.unwrap();
         }
@@ -311,6 +320,10 @@ async fn normal_case_mode(
                 .status(),
             axum::http::StatusCode::OK
         );
+    }
+    if enhanced_fallback {
+        state.store.query("UPDATE relay.destinations SET twitch_output_mode='enhanced' WHERE streamer_id=11 AND platform='twitch'", &[]).await.unwrap();
+        state.store.query("INSERT INTO relay.destination_fences(streamer_id,platform,generation,deleted) VALUES(11,'twitch',3,false) ON CONFLICT(streamer_id,platform) DO UPDATE SET generation=3", &[]).await.unwrap();
     }
     if let Some(enabled) = malformed_layout {
         state
@@ -403,8 +416,12 @@ async fn normal_case_mode(
                         assert_eq!(healthy["active_audio_mode"],twitch_mode.unwrap());
                     }
                     if unmeasured_twitch {
-                        assert!(healthy["reason"].as_str().unwrap().contains("Leiter ist nicht lastgemessen"));
-                        assert_eq!(broker_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+                        let sessions = state.registry.status(11);
+                        let mode = &sessions[0].output_modes["twitch"];
+                        assert_eq!(mode.requested, if enhanced_fallback { uplink_service::destinations::TwitchOutputMode::Enhanced } else { uplink_service::destinations::TwitchOutputMode::Single });
+                        assert_eq!(mode.active, Some(uplink_service::destinations::TwitchOutputMode::Single));
+                        assert_eq!(mode.fallback_reason.is_some(), enhanced_fallback);
+                        assert_eq!(broker_calls.load(std::sync::atomic::Ordering::SeqCst), usize::from(enhanced_fallback));
                     }
                     if twitch_missing {
                         let twitch = status["destinations"].as_array().unwrap().iter().find(|item| item["platform"]=="twitch").unwrap();
@@ -444,13 +461,20 @@ async fn normal_case_mode(
         assert_eq!(me["session"]["outputs"]["encode_groups"],1);
         if twitch_mode == Some("live") && !all_failed {
             let response = http.put(format!("http://{api}/v1/me/destinations")).header("X-Relay-Auth","synthetic-api")
-                .json(&serde_json::json!({"streamer_id":11,"destinations":[{"platform":"twitch","twitch_audio_mode":"separate_vod"}]})).send().await.unwrap();
-            assert!(response.status().is_success());
+                .json(&serde_json::json!({"streamer_id":11,"destinations":[{"platform":"twitch","twitch_audio_mode":"separate_vod","connection_generation":if enhanced_fallback {3} else {0}}]})).send().await.unwrap();
+            let status = response.status();
+            let detail: serde_json::Value = response.json().await.unwrap();
+            assert!(status.is_success(), "Audioänderung: {status} {:?}", detail.get("error"));
             let changed:serde_json::Value = http.get(format!("http://{api}/v1/me/destinations?streamer_id=11")).header("X-Relay-Auth","synthetic-api").send().await.unwrap().json().await.unwrap();
             let twitch = changed["destinations"].as_array().unwrap().iter().find(|item|item["platform"]=="twitch").unwrap();
             assert_eq!(twitch["twitch_audio_mode"],"separate_vod");
             assert_eq!(twitch["effective_audio_mode"],"separate_vod");
             assert_eq!(twitch["active_audio_mode"],"live","Speichern darf laufendes Audio nicht still umschalten");
+            if enhanced_fallback {
+                assert_eq!(twitch["requested_output_mode"], "enhanced");
+                assert_eq!(twitch["active_output_mode"], "single");
+                assert!(twitch["fallback_reason"].is_string());
+            }
         }
         producer.finish().await.unwrap();
         let (video, audio, _report) = tokio::time::timeout(Duration::from_secs(15), &mut receiving).await.unwrap().unwrap();

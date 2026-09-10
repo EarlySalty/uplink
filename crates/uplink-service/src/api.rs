@@ -171,7 +171,7 @@ async fn save_destinations(
             })
             .transpose()
             .map_err(|e| failure(StatusCode::SERVICE_UNAVAILABLE, e))?;
-        rows.push(json!({"platform":output.platform,"connection_generation":output.connection_generation,"rtmp_url":output.rtmp_url,"stream_key_enc":ciphertext.map(|bytes|format!("\\x{}",hex::encode(bytes))),"enabled":output.enabled,"width":output.width,"height":output.height,"fps":output.fps,"bitrate_kbps":output.bitrate_kbps,"twitch_audio_mode":output.twitch_audio_mode}));
+        rows.push(json!({"platform":output.platform,"connection_generation":output.connection_generation,"rtmp_url":output.rtmp_url,"stream_key_enc":ciphertext.map(|bytes|format!("\\x{}",hex::encode(bytes))),"enabled":output.enabled,"width":output.width,"height":output.height,"fps":output.fps,"bitrate_kbps":output.bitrate_kbps,"twitch_audio_mode":output.twitch_audio_mode,"twitch_output_mode":output.twitch_output_mode}));
     }
     let data = json!(rows);
     // INSERT benötigt Pflichtwerte auch für bestehende Ziele. Beim Konflikt
@@ -182,7 +182,7 @@ async fn save_destinations(
             SELECT * FROM jsonb_to_recordset($2::jsonb) AS x(
                 platform text, rtmp_url text, stream_key_enc bytea,
                 enabled boolean, width integer, height integer,
-                fps integer, bitrate_kbps integer, connection_generation bigint, twitch_audio_mode text
+                fps integer, bitrate_kbps integer, connection_generation bigint, twitch_audio_mode text, twitch_output_mode text
             )
         )
             INSERT INTO relay.destination_fences AS current(streamer_id,platform,generation,deleted)
@@ -200,18 +200,19 @@ async fn save_destinations(
             SELECT * FROM jsonb_to_recordset($2::jsonb) AS x(
                 platform text, rtmp_url text, stream_key_enc bytea,
                 enabled boolean, width integer, height integer,
-                fps integer, bitrate_kbps integer, connection_generation bigint, twitch_audio_mode text
+                fps integer, bitrate_kbps integer, connection_generation bigint, twitch_audio_mode text, twitch_output_mode text
             )
         )
         INSERT INTO relay.destinations(
             streamer_id, platform, rtmp_url, stream_key_enc,
-            enabled, width, height, fps, bitrate_kbps, twitch_audio_mode
+            enabled, width, height, fps, bitrate_kbps, twitch_audio_mode, twitch_output_mode
         )
         SELECT $1, i.platform, COALESCE(i.rtmp_url,p.rtmp_url),
             COALESCE(i.stream_key_enc,p.stream_key_enc),
             COALESCE(i.enabled,p.enabled,true), COALESCE(i.width,p.width),
             COALESCE(i.height,p.height), COALESCE(i.fps,p.fps),
-            COALESCE(i.bitrate_kbps,p.bitrate_kbps), COALESCE(i.twitch_audio_mode,p.twitch_audio_mode)
+            COALESCE(i.bitrate_kbps,p.bitrate_kbps), COALESCE(i.twitch_audio_mode,p.twitch_audio_mode),
+            COALESCE(i.twitch_output_mode,p.twitch_output_mode,'single')
         FROM incoming i
         LEFT JOIN relay.destinations p
             ON p.streamer_id=$1 AND p.platform=i.platform
@@ -225,7 +226,8 @@ async fn save_destinations(
             height=COALESCE((SELECT height FROM incoming WHERE platform=EXCLUDED.platform),relay.destinations.height),
             fps=COALESCE((SELECT fps FROM incoming WHERE platform=EXCLUDED.platform),relay.destinations.fps),
             bitrate_kbps=COALESCE((SELECT bitrate_kbps FROM incoming WHERE platform=EXCLUDED.platform),relay.destinations.bitrate_kbps),
-            twitch_audio_mode=COALESCE((SELECT twitch_audio_mode FROM incoming WHERE platform=EXCLUDED.platform),relay.destinations.twitch_audio_mode)
+            twitch_audio_mode=COALESCE((SELECT twitch_audio_mode FROM incoming WHERE platform=EXCLUDED.platform),relay.destinations.twitch_audio_mode),
+            twitch_output_mode=COALESCE((SELECT twitch_output_mode FROM incoming WHERE platform=EXCLUDED.platform),relay.destinations.twitch_output_mode)
         RETURNING platform
     "#;
     state
@@ -525,7 +527,7 @@ async fn destinations(
     Query(query): Query<TenantQuery>,
 ) -> ApiResult {
     authorize(&state, &headers, query.streamer_id)?;
-    let rows = state.store.query("SELECT d.platform,d.rtmp_url,d.enabled,d.width,d.height,d.fps,d.bitrate_kbps,COALESCE(f.generation,0),d.twitch_audio_mode,d.hochkant_enabled,d.hochkant_width,d.hochkant_height FROM relay.destinations d LEFT JOIN relay.destination_fences f USING(streamer_id,platform) WHERE d.streamer_id=$1 ORDER BY d.platform", &[&query.streamer_id]).await.map_err(|e|failure(StatusCode::SERVICE_UNAVAILABLE,e))?;
+    let rows = state.store.query("SELECT d.platform,d.rtmp_url,d.enabled,d.width,d.height,d.fps,d.bitrate_kbps,COALESCE(f.generation,0),d.twitch_audio_mode,d.hochkant_enabled,d.hochkant_width,d.hochkant_height,d.twitch_output_mode FROM relay.destinations d LEFT JOIN relay.destination_fences f USING(streamer_id,platform) WHERE d.streamer_id=$1 ORDER BY d.platform", &[&query.streamer_id]).await.map_err(|e|failure(StatusCode::SERVICE_UNAVAILABLE,e))?;
     let hochkant_revision = state
         .store
         .query(
@@ -590,7 +592,15 @@ async fn destinations(
         };
         let active_audio =
             crate::media_status::active_audio_mode(sessions.first(), &platform, output_state);
-        outputs.push(json!({"platform":platform,"connection_generation":row.try_get::<_,i64>(7).map_err(|_|invalid())?,"rtmp_url":if blocked {""} else {endpoint.as_str()},"enabled":row.try_get::<_,bool>(2).map_err(|_|invalid())?,"blocked":blocked,"error":endpoint_error,"requested":{"width":row.try_get::<_,Option<i32>>(3).map_err(|_|invalid())?,"height":row.try_get::<_,Option<i32>>(4).map_err(|_|invalid())?,"fps":row.try_get::<_,Option<i32>>(5).map_err(|_|invalid())?,"bitrate_kbps":row.try_get::<_,Option<i32>>(6).map_err(|_|invalid())?},"active_profile":active_profile,"active_profiles":active_profiles,"hochkant":{"enabled":hochkant_enabled,"width":row.try_get::<_,Option<i32>>(10).map_err(|_|invalid())?,"height":row.try_get::<_,Option<i32>>(11).map_err(|_|invalid())?,"requested_revision":requested_revision,"active_revision":active_revision},"twitch_audio_mode":requested_audio,"effective_audio_mode":effective_audio,"active_audio_mode":active_audio,"output_state":output_state,"reason":reason,"publication_confirmed":false}));
+        let mode = sessions
+            .first()
+            .filter(|session| session.active)
+            .and_then(|session| session.output_modes.get(&platform));
+        let active_output_mode = mode
+            .filter(|_| output_state == "sending")
+            .and_then(|mode| mode.active);
+        let fallback_reason = mode.and_then(|mode| mode.fallback_reason.as_deref());
+        outputs.push(json!({"platform":platform,"connection_generation":row.try_get::<_,i64>(7).map_err(|_|invalid())?,"rtmp_url":if blocked {""} else {endpoint.as_str()},"enabled":row.try_get::<_,bool>(2).map_err(|_|invalid())?,"blocked":blocked,"error":endpoint_error,"requested":{"width":row.try_get::<_,Option<i32>>(3).map_err(|_|invalid())?,"height":row.try_get::<_,Option<i32>>(4).map_err(|_|invalid())?,"fps":row.try_get::<_,Option<i32>>(5).map_err(|_|invalid())?,"bitrate_kbps":row.try_get::<_,Option<i32>>(6).map_err(|_|invalid())?},"requested_output_mode":row.try_get::<_,String>(12).map_err(|_|invalid())?,"active_output_mode":active_output_mode,"fallback_reason":fallback_reason,"active_profile":active_profile,"active_profiles":active_profiles,"hochkant":{"enabled":hochkant_enabled,"width":row.try_get::<_,Option<i32>>(10).map_err(|_|invalid())?,"height":row.try_get::<_,Option<i32>>(11).map_err(|_|invalid())?,"requested_revision":requested_revision,"active_revision":active_revision},"twitch_audio_mode":requested_audio,"effective_audio_mode":effective_audio,"active_audio_mode":active_audio,"output_state":output_state,"reason":reason,"publication_confirmed":false}));
     }
     Ok(Json(json!({"destinations": outputs})))
 }
@@ -612,6 +622,14 @@ fn output_status(
     };
     if let Some(reason) = session.blocked_outputs.get(platform) {
         return ("failed", Some(*reason));
+    }
+    if session.input_backpressure {
+        return (
+            "failed",
+            Some(
+                "Der Server konnte den Eingang nicht in Echtzeit verarbeiten. Die Ausgabe wurde angehalten; der Betreiber muss die verfügbare Rechenleistung prüfen.",
+            ),
+        );
     }
     let output = session
         .outputs

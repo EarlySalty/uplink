@@ -93,13 +93,11 @@ impl Coordinator {
             tls: Arc::new(tls),
         })
     }
-    async fn twitch_output(
+    async fn twitch_publish_erlaubt(
         &self,
         tenant: u64,
-        wunsch: Zielwunsch,
-        source: &uplink_media::SourceObservation,
-    ) -> Result<uplink_media::ProgramOutput, &'static str> {
-        let output = wunsch.output;
+        generation: i64,
+    ) -> Result<(), &'static str> {
         let granted = self
             .broker
             .as_ref()
@@ -109,7 +107,15 @@ impl Coordinator {
             .map_err(|_| {
                 "Der Twitch-Zugang oder sein Kontoinhaber konnte nicht bestätigt werden. Twitch erneut verbinden."
             })?;
-        pruefe_publish_generation(granted, wunsch.generation)?;
+        pruefe_publish_generation(granted, generation)
+    }
+    async fn twitch_output(
+        &self,
+        tenant: u64,
+        wunsch: &Zielwunsch,
+        source: &uplink_media::SourceObservation,
+    ) -> Result<uplink_media::ProgramOutput, TwitchOutputError> {
+        let output = &wunsch.output;
         let wahl = if wunsch.hochkant.is_some() {
             self.gespeicherte_hochkant_wahl(
                 i64::try_from(tenant).map_err(|_| "Nutzeridentität ist ungültig.")?,
@@ -122,7 +128,8 @@ impl Coordinator {
             (Some(ziel), Some(wahl)) => (Some(ziel), Some(wahl)),
             (Some(_), None) => {
                 return Err(
-                    "Die Hochkantwahl ist eingeschaltet, aber ohne gespeicherte Bildgestaltung.",
+                    "Die Hochkantwahl ist eingeschaltet, aber ohne gespeicherte Bildgestaltung."
+                        .into(),
                 );
             }
             (None, _) => (None, None),
@@ -145,7 +152,7 @@ impl Coordinator {
         };
         let preferences = crate::media_output::preferences(
             source,
-            &output,
+            output,
             &self.state.config.media.enhanced,
             ziel,
         )?;
@@ -156,7 +163,7 @@ impl Coordinator {
             .as_ref()
             .map_err(|_| "Die Softwareencoder konnten auf diesem Server nicht bestätigt werden.")?;
         let configuration = uplink_media::platform::twitch::GoLiveClient::new()
-            .map_err(|error| error.message())?
+            .map_err(twitch_configuration_error)?
             .configure(
                 &output.target.playpath,
                 hardware,
@@ -164,7 +171,7 @@ impl Coordinator {
                 &output.target.allowed_hosts,
             )
             .await
-            .map_err(|error| error.message())?;
+            .map_err(twitch_configuration_error)?;
         crate::media_output::twitch(
             configuration,
             output.live_audio_track,
@@ -172,6 +179,7 @@ impl Coordinator {
             hochkant.as_ref(),
             source,
         )
+        .map_err(TwitchOutputError::Blocked)
     }
 
     async fn gespeicherte_hochkant_wahl(
@@ -280,9 +288,19 @@ impl Coordinator {
         } else {
             None
         };
+        let output_mode = match row
+            .try_get::<_, String>(12)
+            .map_err(|_| "Gespeicherter Ausgabemodus fehlt.")?
+            .as_str()
+        {
+            "single" => crate::destinations::TwitchOutputMode::Single,
+            "enhanced" if platform == "twitch" => crate::destinations::TwitchOutputMode::Enhanced,
+            _ => return Err("Gespeicherter Ausgabemodus ist ungültig."),
+        };
         Ok(Zielwunsch {
             generation,
             hochkant,
+            output_mode,
             output: DesiredOutput {
                 target: PublishTarget {
                     id: platform,
@@ -315,6 +333,36 @@ struct Zielwunsch {
     output: DesiredOutput,
     generation: i64,
     hochkant: Option<(u32, u32)>,
+    output_mode: crate::destinations::TwitchOutputMode,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum TwitchOutputError {
+    Blocked(&'static str),
+    Fallback(&'static str),
+}
+impl From<&'static str> for TwitchOutputError {
+    fn from(reason: &'static str) -> Self {
+        Self::Blocked(reason)
+    }
+}
+
+fn twitch_configuration_error(
+    error: uplink_media::platform::twitch::GoLiveError,
+) -> TwitchOutputError {
+    use uplink_media::platform::twitch::GoLiveError;
+    match error {
+        GoLiveError::Transport | GoLiveError::ServiceUnavailable => TwitchOutputError::Fallback(
+            "Twitch stellt den Enhanced-Vertrag gerade nicht bereit. Es läuft ein Einzelstream.",
+        ),
+        GoLiveError::AccountRejected
+        | GoLiveError::WarningNeedsDecision
+        | GoLiveError::UnsupportedEncoder
+        | GoLiveError::UnsupportedAudioMapping => TwitchOutputError::Fallback(
+            "Twitch hat keine hier ausführbare Enhanced-Konfiguration freigegeben. Es läuft ein Einzelstream.",
+        ),
+        _ => TwitchOutputError::Blocked(error.message()),
+    }
 }
 
 struct GespeicherteWahl {
@@ -381,7 +429,7 @@ impl SessionProcessor for Coordinator {
             .ok_or("Sessionreservierung fehlt.")?;
         let tenant = i64::try_from(first.identity.session.tenant_id())
             .map_err(|_| "Nutzeridentität ist ungültig.")?;
-        let rows=self.state.store.query("SELECT d.platform,d.rtmp_url,d.stream_key_enc,d.width,d.height,d.fps,d.bitrate_kbps,d.twitch_audio_mode,COALESCE(f.generation,0),d.hochkant_enabled,d.hochkant_width,d.hochkant_height FROM relay.destinations d LEFT JOIN relay.destination_fences f USING(streamer_id,platform) WHERE d.streamer_id=$1 AND d.enabled=true ORDER BY d.platform",&[&tenant]).await?;
+        let rows=self.state.store.query("SELECT d.platform,d.rtmp_url,d.stream_key_enc,d.width,d.height,d.fps,d.bitrate_kbps,d.twitch_audio_mode,COALESCE(f.generation,0),d.hochkant_enabled,d.hochkant_width,d.hochkant_height,d.twitch_output_mode FROM relay.destinations d LEFT JOIN relay.destination_fences f USING(streamer_id,platform) WHERE d.streamer_id=$1 AND d.enabled=true ORDER BY d.platform",&[&tenant]).await?;
         if rows.is_empty() {
             return Err("Kein Ausgabeziel ist aktiviert.");
         }
@@ -435,25 +483,50 @@ impl SessionProcessor for Coordinator {
                 desired.push(wunsch.output);
                 continue;
             }
-            if self.state.config.media.enhanced.profiles.is_empty() {
+            reservation.requested_output_mode(&platform, wunsch.output_mode);
+            if output.video.codec != uplink_core::Codec::H264 {
+                reservation.block_output(platform, "Das gespeicherte Twitch-Einzelziel benötigt eine H.264-Ausgabe; der Ausgabevertrag muss korrigiert werden.");
+                continue;
+            }
+            if wunsch.output_mode == crate::destinations::TwitchOutputMode::Single {
                 if wunsch.hochkant.is_some() {
-                    reservation.block_output(platform, "Die Hochkantwahl benötigt eine lastgemessene Leiter; das gespeicherte Einzelziel kann sie nicht ausführen.");
-                } else if output.video.codec != uplink_core::Codec::H264 {
-                    reservation.block_output(platform, "Das gespeicherte Twitch-Einzelziel benötigt eine H.264-Ausgabe; der Ausgabevertrag muss korrigiert werden.");
-                } else {
-                    reservation.output_notice(platform, "Eine H.264-Ausgabe aus dem gespeicherten Zielvertrag; die Leiter ist nicht lastgemessen. Zusätzliche Qualitätsstufen sind nicht freigegeben.");
-                    desired.push(wunsch.output);
+                    reservation.output_notice(platform, "Einzelstream sendet nur das Querformat. Für eine zusätzliche Hochkantfassung Enhanced wählen.");
                 }
+                desired.push(wunsch.output);
+                continue;
+            }
+            let tenant_wert = u64::try_from(tenant).map_err(|_| "Nutzeridentität ist ungültig.")?;
+            if let Err(reason) = self
+                .twitch_publish_erlaubt(tenant_wert, wunsch.generation)
+                .await
+            {
+                reservation.block_output(platform, reason);
+                continue;
+            }
+            if self.state.config.media.enhanced.profiles.is_empty() {
+                reservation.single_fallback(&platform, "Enhanced ist für diese Serverleistung noch nicht freigegeben. Es läuft ein Einzelstream ohne zusätzliche Qualitätsstufen oder Hochkantfassung.");
+                desired.push(wunsch.output);
                 continue;
             }
             let ergebnis = {
-                let tenant_wert =
-                    u64::try_from(tenant).map_err(|_| "Nutzeridentität ist ungültig.")?;
-                self.twitch_output(tenant_wert, wunsch, prepared.observation())
+                self.twitch_output(tenant_wert, &wunsch, prepared.observation())
                     .await
             };
             match ergebnis {
                 Ok(program) => {
+                    if program
+                        .video
+                        .iter()
+                        .filter(|video| video.canvas_index == 0)
+                        .map(|video| &video.profile)
+                        .collect::<std::collections::HashSet<_>>()
+                        .len()
+                        < 2
+                    {
+                        reservation.single_fallback(&platform, "Twitch hat keine zusätzlichen Querformat-Qualitätsstufen freigegeben. Es läuft ein Einzelstream.");
+                        desired.push(wunsch.output);
+                        continue;
+                    }
                     if platform == "twitch" {
                         let key =
                             crate::media_output::capacity_key(prepared.observation(), &program);
@@ -466,7 +539,8 @@ impl SessionProcessor for Coordinator {
                             reservation.media_diagnostic(
                                 serde_json::json!({"phase":"capacity", "profile_key":key}),
                             );
-                            reservation.block_output(platform, reason);
+                            reservation.single_fallback(&platform, reason);
+                            desired.push(wunsch.output);
                             continue;
                         }
                         if let Some(video) =
@@ -482,7 +556,13 @@ impl SessionProcessor for Coordinator {
                     }
                     programs.push(program);
                 }
-                Err(reason) => reservation.block_output(platform, reason),
+                Err(TwitchOutputError::Blocked(reason)) => {
+                    reservation.block_output(platform, reason)
+                }
+                Err(TwitchOutputError::Fallback(reason)) => {
+                    reservation.single_fallback(&platform, reason);
+                    desired.push(wunsch.output);
+                }
             }
         }
         if programs.is_empty() && desired.is_empty() {
@@ -565,6 +645,32 @@ fn preparation_failure(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn enhanced_fallback_preserves_authentication_and_endpoint_rejections() {
+        use uplink_media::platform::twitch::GoLiveError;
+        for error in [
+            GoLiveError::Transport,
+            GoLiveError::ServiceUnavailable,
+            GoLiveError::AccountRejected,
+            GoLiveError::UnsupportedEncoder,
+        ] {
+            assert!(matches!(
+                super::twitch_configuration_error(error),
+                super::TwitchOutputError::Fallback(_)
+            ));
+        }
+        for error in [
+            GoLiveError::HttpRejected,
+            GoLiveError::EndpointRejected,
+            GoLiveError::InvalidResponse,
+            GoLiveError::ResponseTooLarge,
+        ] {
+            assert!(matches!(
+                super::twitch_configuration_error(error),
+                super::TwitchOutputError::Blocked(_)
+            ));
+        }
+    }
     #[test]
     fn configured_twitch_profiles_remain_closed_without_capacity_or_matching_key() {
         for (capacity, requested_key, admitted) in [
