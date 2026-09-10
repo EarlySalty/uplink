@@ -3,6 +3,15 @@ use std::{
     sync::{Arc, Mutex, Weak},
 };
 
+use crate::destinations::TwitchOutputMode;
+
+#[derive(Clone, serde::Serialize)]
+pub struct OutputModeStatus {
+    pub requested: TwitchOutputMode,
+    pub active: Option<TwitchOutputMode>,
+    pub fallback_reason: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct Registry(Arc<Mutex<State>>);
 struct State {
@@ -29,6 +38,7 @@ pub struct SessionStatus {
     pub ingest_end_reason: Option<String>,
     pub blocked_outputs: std::collections::BTreeMap<String, &'static str>,
     pub output_notices: std::collections::BTreeMap<String, &'static str>,
+    pub output_modes: std::collections::BTreeMap<String, OutputModeStatus>,
     pub outputs: Option<serde_json::Value>,
     pub source_observation: Option<serde_json::Value>,
     pub frozen_layouts: serde_json::Value,
@@ -135,6 +145,7 @@ impl Registry {
                     ingest_end_reason: None,
                     blocked_outputs: std::collections::BTreeMap::new(),
                     output_notices: std::collections::BTreeMap::new(),
+                    output_modes: std::collections::BTreeMap::new(),
                     outputs: None,
                     source_observation: None,
                     frozen_layouts: serde_json::Value::Null,
@@ -311,6 +322,27 @@ impl Reservation {
             state.output_notices.insert(platform, message);
         });
     }
+    pub fn requested_output_mode(&self, platform: &str, requested: TwitchOutputMode) {
+        self.update(|state| {
+            state.output_modes.insert(
+                platform.to_owned(),
+                OutputModeStatus {
+                    requested,
+                    active: None,
+                    fallback_reason: None,
+                },
+            );
+        });
+    }
+    pub fn single_fallback(&self, platform: &str, reason: &'static str) {
+        self.update(|state| {
+            if let Some(mode) = state.output_modes.get_mut(platform) {
+                mode.active = None;
+                mode.fallback_reason = Some(reason.to_owned());
+            }
+            state.output_notices.insert(platform.to_owned(), reason);
+        });
+    }
     pub fn fail(&self, message: &'static str) {
         self.update(|state| {
             state.error = Some(message);
@@ -325,7 +357,21 @@ impl Reservation {
         });
     }
     pub fn media_status(&self, status: serde_json::Value) {
-        self.update(|state| state.outputs = Some(status));
+        self.update(|state| {
+            for (platform, mode) in &mut state.output_modes {
+                let sending = status["outputs"].as_array().is_some_and(|outputs| {
+                    outputs.iter().any(|output| {
+                        output["id"] == platform.as_str() && output["state"] == "publishing"
+                    })
+                });
+                mode.active = sending.then_some(if mode.fallback_reason.is_some() {
+                    TwitchOutputMode::Single
+                } else {
+                    mode.requested
+                });
+            }
+            state.outputs = Some(status);
+        });
     }
     pub fn observation(&self, observation: serde_json::Value) {
         self.update(|state| state.source_observation = Some(observation));
@@ -381,6 +427,9 @@ impl Drop for Reservation {
             .cloned();
         if let Some((tenant, mut status)) = snapshot {
             status.active = false;
+            for mode in status.output_modes.values_mut() {
+                mode.active = None;
+            }
             if status.error.is_none() {
                 status.state = "Beendet";
             }
@@ -449,6 +498,35 @@ impl Drop for Reservation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn output_mode_is_active_only_while_its_publisher_sends() {
+        let registry = Registry::new(1, 1).unwrap();
+        let reservation = registry.reserve(11).unwrap();
+        reservation.requested_output_mode("twitch", TwitchOutputMode::Enhanced);
+        assert_eq!(registry.status(11)[0].output_modes["twitch"].active, None);
+        reservation
+            .media_status(serde_json::json!({"outputs":[{"id":"twitch","state":"publishing"}]}));
+        assert_eq!(
+            registry.status(11)[0].output_modes["twitch"].active,
+            Some(TwitchOutputMode::Enhanced)
+        );
+        reservation.single_fallback("twitch", "Kapazität fehlt.");
+        reservation
+            .media_status(serde_json::json!({"outputs":[{"id":"twitch","state":"publishing"}]}));
+        let status = &registry.status(11)[0].output_modes["twitch"];
+        assert_eq!(status.requested, TwitchOutputMode::Enhanced);
+        assert_eq!(status.active, Some(TwitchOutputMode::Single));
+        assert_eq!(status.fallback_reason.as_deref(), Some("Kapazität fehlt."));
+        reservation.media_status(
+            serde_json::json!({"outputs":[{"id":"twitch","state":"local_end_unconfirmed"}]}),
+        );
+        assert_eq!(registry.status(11)[0].output_modes["twitch"].active, None);
+        reservation
+            .media_status(serde_json::json!({"outputs":[{"id":"twitch","state":"publishing"}]}));
+        drop(reservation);
+        assert_eq!(registry.status(11)[0].output_modes["twitch"].active, None);
+    }
 
     #[test]
     fn output_block_journal_is_debounced_across_reconnects_and_bounded() {
