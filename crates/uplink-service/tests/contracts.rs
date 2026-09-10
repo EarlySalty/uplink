@@ -12,7 +12,10 @@ fn measured_encoder_thread_count_is_explicit_and_bounded() {
     );
     for (threads, valid) in [(0, false), (4, true), (64, true), (65, false)] {
         let mut config: toml::Value = toml::from_str(example).unwrap();
-        config["media"]["worker_threads"] = threads.into();
+        config["media"]
+            .as_table_mut()
+            .unwrap()
+            .insert("worker_threads".into(), threads.into());
         let parsed = Config::parse(&toml::to_string(&config).unwrap());
         assert_eq!(parsed.is_ok(), valid);
         if let Ok(config) = parsed {
