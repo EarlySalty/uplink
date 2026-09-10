@@ -18,6 +18,9 @@ const FFMPEG: &str = "/opt/uplink/media/ffmpeg8-c733b4b2/ffmpeg";
 const FFPROBE: &str = "/opt/uplink/media/ffmpeg8-c733b4b2/ffprobe";
 const FRAMES: u64 = 360;
 
+// Die Kindprüfung umfasst den Testprozess; Codec-Fälle teilen diesen Prozess.
+static CODEC_TEST_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "Benötigt PostgreSQL 16 und produktives FFmpeg 8; lokale Codec-Abnahme."]
 async fn idee1_av1_1440p60_single_h264_1080p60_explicit_stop() {
@@ -156,6 +159,7 @@ impl Authorizer for Destination {
 }
 
 async fn case(codec: &str) {
+    let _serial = CODEC_TEST_MUTEX.lock().await;
     let source_bytes = fixture(codec).await;
     let (database, mut state) = database::fixture().await;
     let certificates = tls::test_tls();
