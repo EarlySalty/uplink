@@ -28,6 +28,8 @@ struct State {
 }
 #[derive(Clone, serde::Serialize)]
 pub struct SessionStatus {
+    #[serde(skip)]
+    started_at: std::time::Instant,
     pub id: u64,
     pub active: bool,
     pub generation: Option<String>,
@@ -43,6 +45,11 @@ pub struct SessionStatus {
     pub outputs: Option<serde_json::Value>,
     pub source_observation: Option<serde_json::Value>,
     pub frozen_layouts: serde_json::Value,
+}
+impl SessionStatus {
+    pub(crate) fn started_at(&self) -> std::time::Instant {
+        self.started_at
+    }
 }
 pub struct Reservation {
     id: u64,
@@ -136,6 +143,7 @@ impl Registry {
             (
                 tenant,
                 SessionStatus {
+                    started_at: std::time::Instant::now(),
                     id,
                     active: true,
                     generation: None,
