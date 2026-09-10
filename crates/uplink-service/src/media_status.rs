@@ -179,7 +179,11 @@ mod tests {
             let sessions = registry.status(31);
             let status = session_status(&sessions[0]);
             assert_eq!(status["input_codec"], codec);
-            assert!(status["input_bitrate_kbps"].as_f64().is_some_and(|rate| rate > 0.0));
+            assert!(
+                status["input_bitrate_kbps"]
+                    .as_f64()
+                    .is_some_and(|rate| rate > 0.0)
+            );
         }
     }
 
