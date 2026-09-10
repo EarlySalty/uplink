@@ -38,6 +38,117 @@ use database::{Database, fixture};
 
 #[tokio::test]
 #[ignore = "Benötigt isolierte PostgreSQL-16-Testinstanz."]
+async fn twitch_output_mode_survives_refresh_and_rejects_invalid_choices() {
+    let (database, state) = fixture().await;
+    let app = router(state.clone());
+    for body in [
+        serde_json::json!({"streamer_id":11,"destinations":[{"platform":"twitch","connection_generation":1,"rtmp_url":"rtmps://live.twitch.tv/app","stream_key":"synthetic","width":1920,"height":1080,"twitch_output_mode":"enhanced"}]}),
+        serde_json::json!({"streamer_id":11,"destinations":[{"platform":"twitch","connection_generation":2,"stream_key":"refreshed","enabled":false}]}),
+    ] {
+        assert_eq!(
+            app.clone()
+                .oneshot(request("PUT", "/v1/me/destinations", body.to_string()))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+    }
+    let response = app
+        .clone()
+        .oneshot(request("GET", "/v1/me/destinations?streamer_id=11", ""))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let value: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
+    assert_eq!(
+        value["destinations"][0]["requested_output_mode"],
+        "enhanced"
+    );
+    assert_eq!(value["destinations"][0]["requested"]["height"], 1080);
+    for (platform, mode) in [
+        ("kick", "enhanced"),
+        ("youtube", "single"),
+        ("twitch", "automatic"),
+    ] {
+        let body = serde_json::json!({"streamer_id":11,"destinations":[{"platform":platform,"connection_generation":2,"twitch_output_mode":mode}]}).to_string();
+        assert_eq!(
+            app.clone()
+                .oneshot(request("PUT", "/v1/me/destinations", body))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+    // Eine veraltete Verbindung darf auch die Betriebsart nicht zurücksetzen.
+    let stale = serde_json::json!({"streamer_id":11,"destinations":[{"platform":"twitch","connection_generation":1,"twitch_output_mode":"single"}]}).to_string();
+    assert_eq!(
+        app.oneshot(request("PUT", "/v1/me/destinations", stale))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CONFLICT
+    );
+    let rows = state
+        .store
+        .query(
+            "SELECT twitch_output_mode FROM relay.destinations WHERE streamer_id=11",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows[0].get::<_, String>(0), "enhanced");
+    uplink_service::migrations::apply(&state.store)
+        .await
+        .unwrap();
+    uplink_service::migrations::apply(&state.store)
+        .await
+        .unwrap();
+    let rows = state
+        .store
+        .query(
+            "SELECT twitch_output_mode FROM relay.destinations WHERE streamer_id=11",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows[0].get::<_, String>(0), "enhanced");
+    database.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "Benötigt isolierte PostgreSQL-16-Testinstanz."]
+async fn omitted_output_mode_preserves_concurrently_committed_choice() {
+    let (database, state) = fixture().await;
+    state.store.query("INSERT INTO relay.destinations(streamer_id,platform,rtmp_url,stream_key_enc,enabled) VALUES(11,'twitch','rtmps://live.twitch.tv/app',$1,true)", &[&vec![0u8]]).await.unwrap();
+    let (mut writer, driver) = database.raw().await;
+    let transaction = writer.transaction().await.unwrap();
+    transaction.execute("UPDATE relay.destinations SET twitch_output_mode='enhanced' WHERE streamer_id=11 AND platform='twitch'", &[]).await.unwrap();
+    let app = router(state.clone());
+    let omitted = tokio::spawn(async move {
+        app.oneshot(request("PUT", "/v1/me/destinations", r#"{"streamer_id":11,"destinations":[{"platform":"twitch","connection_generation":1,"enabled":false}]}"#)).await.unwrap()
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            transaction.batch_execute("SELECT pg_stat_clear_snapshot()").await.unwrap();
+            if transaction.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE wait_event_type='Lock' AND query LIKE '%INSERT INTO relay.destinations%')", &[]).await.unwrap().get::<_,bool>(0) { break; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+    transaction.commit().await.unwrap();
+    assert_eq!(omitted.await.unwrap().status(), StatusCode::OK);
+    let row = state.store.query("SELECT twitch_output_mode,enabled FROM relay.destinations WHERE streamer_id=11 AND platform='twitch'", &[]).await.unwrap();
+    assert_eq!(row[0].get::<_, String>(0), "enhanced");
+    assert!(!row[0].get::<_, bool>(1));
+    drop(writer);
+    driver.await.unwrap();
+    database.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "Benötigt isolierte PostgreSQL-16-Testinstanz."]
 async fn destination_save_enforces_its_platform_transport_policy() {
     let (database, state) = fixture().await;
     for endpoint in [

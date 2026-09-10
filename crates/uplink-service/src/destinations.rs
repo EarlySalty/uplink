@@ -34,6 +34,8 @@ pub struct DestinationUpdate {
     pub bitrate_kbps: Option<i32>,
     /// Auslassen erhält die bisherige Wahl, auch bei konkurrierenden Updates.
     pub twitch_audio_mode: Option<String>,
+    /// Auslassen erhält auch bei einem OAuth-Refresh die gespeicherte Betriebsart.
+    pub twitch_output_mode: Option<TwitchOutputMode>,
 }
 impl Drop for DestinationUpdate {
     fn drop(&mut self) {
@@ -58,6 +60,7 @@ impl DestinationUpdate {
                 .is_some_and(|v| v <= 0 || v > 8192 || v % 2 != 0)
             || self.fps.is_some_and(|v| v <= 0 || v > 240)
             || self.bitrate_kbps.is_some_and(|v| v <= 0 || v > 100_000)
+            || (self.twitch_output_mode.is_some() && self.platform != "twitch")
             || self.twitch_audio_mode.as_deref().is_some_and(|mode| {
                 self.platform != "twitch" || !matches!(mode, "live" | "separate_vod")
             })
