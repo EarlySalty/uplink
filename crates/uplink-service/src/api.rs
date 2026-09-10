@@ -623,6 +623,14 @@ fn output_status(
     if let Some(reason) = session.blocked_outputs.get(platform) {
         return ("failed", Some(*reason));
     }
+    if session.input_backpressure {
+        return (
+            "failed",
+            Some(
+                "Der Server konnte den Eingang nicht in Echtzeit verarbeiten. Die Ausgabe wurde angehalten; der Betreiber muss die verfügbare Rechenleistung prüfen.",
+            ),
+        );
+    }
     let output = session
         .outputs
         .as_ref()

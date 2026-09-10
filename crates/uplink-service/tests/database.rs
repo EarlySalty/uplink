@@ -131,7 +131,7 @@ async fn twitch_output_mode_survives_refresh_and_rejects_invalid_choices() {
     );
     reservation.single_fallback("twitch", "Twitch bietet keine Qualitätsstufen an.");
     reservation.media_status(
-        serde_json::json!({"outputs":[{"id":"twitch","state":"publishing","received_events":10}]}),
+        serde_json::json!({"outputs":[{"id":"twitch","state":"publishing","received_events":10}],"graph":[{"id":"twitch","profile_origin":"running_graph","video":[{"canvas_index":0,"mode":"encode","profile":{"codec":"h264","width":1920,"height":1080,"fps_numerator":60,"fps_denominator":1,"target_bitrate_kbps":6000}}]}]}),
     );
     let response = app
         .clone()
@@ -149,6 +149,12 @@ async fn twitch_output_mode_survives_refresh_and_rejects_invalid_choices() {
         value["destinations"][0]["fallback_reason"],
         "Twitch bietet keine Qualitätsstufen an."
     );
+    assert_eq!(
+        value["destinations"][0]["active_profiles"][0]["height"],
+        1080
+    );
+    reservation.input_backpressure();
+    reservation.fail("Medienausgang fehlgeschlagen.");
     drop(reservation);
     let response = app
         .clone()
@@ -159,6 +165,17 @@ async fn twitch_output_mode_survives_refresh_and_rejects_invalid_choices() {
         serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
     assert!(value["destinations"][0]["active_output_mode"].is_null());
     assert!(value["destinations"][0]["fallback_reason"].is_null());
+    assert_eq!(value["destinations"][0]["output_state"], "failed");
+    assert!(
+        value["destinations"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("nicht in Echtzeit")
+    );
+    assert_eq!(
+        state.registry.status(11)[0].error,
+        Some("Medienausgang fehlgeschlagen.")
+    );
     for (platform, mode) in [
         ("kick", "enhanced"),
         ("youtube", "single"),
