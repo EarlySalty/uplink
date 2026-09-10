@@ -66,6 +66,8 @@ jobs:
           cargo test --manifest-path third_party/scuffle-amf/Cargo.toml --features serde --release --locked --target-dir target -j2
       - name: Lokales Planszenario
         run: cargo run --release --locked -p uplink-cli -- plan --config config/plan-beispiel.toml
+      - name: Abgeschlossene Debug-Artefakte freigeben
+        run: cargo clean --manifest-path Cargo.toml --profile dev --target-dir target
       - name: Isolierter E-FLV-Interoperabilitätsnachweis
         run: |
           cargo fmt --manifest-path experiments/scuffle-probe/Cargo.toml -- --check
