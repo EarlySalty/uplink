@@ -38,6 +38,62 @@ use database::{Database, fixture};
 
 #[tokio::test]
 #[ignore = "Benötigt isolierte PostgreSQL-16-Testinstanz."]
+async fn output_mode_migration_keeps_legacy_rows_and_enforces_platform_constraint() {
+    let (database, state) = fixture().await;
+    state
+        .store
+        .query(
+            "ALTER TABLE relay.destinations DROP COLUMN twitch_output_mode",
+            &[],
+        )
+        .await
+        .unwrap();
+    state.store.query("INSERT INTO relay.destinations(streamer_id,platform,rtmp_url,stream_key_enc,enabled) VALUES(11,'twitch','rtmps://live.twitch.tv/app',$1,true),(11,'kick','rtmps://example.org/app',$1,true)", &[&vec![0u8]]).await.unwrap();
+    uplink_service::migrations::apply(&state.store)
+        .await
+        .unwrap();
+    let rows = state
+        .store
+        .query(
+            "SELECT twitch_output_mode FROM relay.destinations ORDER BY platform",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|row| row.get::<_, String>(0) == "single"));
+    for statement in [
+        "UPDATE relay.destinations SET twitch_output_mode='enhanced' WHERE platform='kick'",
+        "UPDATE relay.destinations SET twitch_output_mode='automatic' WHERE platform='twitch'",
+        "UPDATE relay.destinations SET twitch_output_mode=NULL WHERE platform='twitch'",
+    ] {
+        assert!(state.store.query(statement, &[]).await.is_err());
+    }
+    state
+        .store
+        .query(
+            "UPDATE relay.destinations SET twitch_output_mode='enhanced' WHERE platform='twitch'",
+            &[],
+        )
+        .await
+        .unwrap();
+    uplink_service::migrations::apply(&state.store)
+        .await
+        .unwrap();
+    let rows = state
+        .store
+        .query(
+            "SELECT twitch_output_mode FROM relay.destinations WHERE platform='twitch'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows[0].get::<_, String>(0), "enhanced");
+    database.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "Benötigt isolierte PostgreSQL-16-Testinstanz."]
 async fn twitch_output_mode_survives_refresh_and_rejects_invalid_choices() {
     let (database, state) = fixture().await;
     let app = router(state.clone());
