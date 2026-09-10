@@ -373,6 +373,9 @@ pub async fn serve_with_ready<P: SessionProcessor>(
                                 };
                                 reservation.record(event.wire_body().len());
                                 if let Err(error) = sender.try_send(event) {
+                                    if matches!(error, mpsc::error::TrySendError::Full(_)) {
+                                        reservation.input_backpressure();
+                                    }
                                     let fallback = match error {
                                         mpsc::error::TrySendError::Closed(_) => "Medienverarbeitung hat den Eingang geschlossen.",
                                         mpsc::error::TrySendError::Full(_) => "Medienverarbeitung hat ihr Eingangsbudget ausgeschöpft.",
