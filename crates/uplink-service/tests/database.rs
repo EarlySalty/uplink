@@ -67,6 +67,42 @@ async fn twitch_output_mode_survives_refresh_and_rejects_invalid_choices() {
         "enhanced"
     );
     assert_eq!(value["destinations"][0]["requested"]["height"], 1080);
+    assert!(value["destinations"][0]["active_output_mode"].is_null());
+    let reservation = state.registry.reserve(11).unwrap();
+    reservation.requested_output_mode(
+        "twitch",
+        uplink_service::destinations::TwitchOutputMode::Enhanced,
+    );
+    reservation.single_fallback("twitch", "Twitch bietet keine Qualitätsstufen an.");
+    reservation.media_status(
+        serde_json::json!({"outputs":[{"id":"twitch","state":"publishing","received_events":10}]}),
+    );
+    let response = app
+        .clone()
+        .oneshot(request("GET", "/v1/me/destinations?streamer_id=11", ""))
+        .await
+        .unwrap();
+    let value: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
+    assert_eq!(
+        value["destinations"][0]["requested_output_mode"],
+        "enhanced"
+    );
+    assert_eq!(value["destinations"][0]["active_output_mode"], "single");
+    assert_eq!(
+        value["destinations"][0]["fallback_reason"],
+        "Twitch bietet keine Qualitätsstufen an."
+    );
+    drop(reservation);
+    let response = app
+        .clone()
+        .oneshot(request("GET", "/v1/me/destinations?streamer_id=11", ""))
+        .await
+        .unwrap();
+    let value: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
+    assert!(value["destinations"][0]["active_output_mode"].is_null());
+    assert!(value["destinations"][0]["fallback_reason"].is_null());
     for (platform, mode) in [
         ("kick", "enhanced"),
         ("youtube", "single"),
@@ -1574,6 +1610,7 @@ async fn controlplane_preserves_credentials_and_rejects_unauthorized_changes() {
     ] {
         store.query(statement, &[]).await.unwrap();
     }
+    uplink_service::migrations::apply(&store).await.unwrap();
     let encryption = Secret::new(vec![7; 32]);
     let key = encryption
         .seal(b"rsr_00000000000000000000000000000000", "ingest_key:11")
