@@ -1,6 +1,27 @@
 use uplink_service::{config::Config, crypto::Secret, registry::Registry};
 
 #[test]
+fn measured_encoder_thread_count_is_explicit_and_bounded() {
+    let example = include_str!("../../../config/uplink-beispiel.toml");
+    assert_eq!(
+        Config::parse(example)
+            .unwrap()
+            .media_limits()
+            .worker_threads,
+        2
+    );
+    for (threads, valid) in [(0, false), (4, true), (64, true), (65, false)] {
+        let mut config: toml::Value = toml::from_str(example).unwrap();
+        config["media"]["worker_threads"] = threads.into();
+        let parsed = Config::parse(&toml::to_string(&config).unwrap());
+        assert_eq!(parsed.is_ok(), valid);
+        if let Ok(config) = parsed {
+            assert_eq!(config.media_limits().worker_threads, threads as usize);
+        }
+    }
+}
+
+#[test]
 fn advertised_dock_addresses_require_an_usable_public_origin() {
     let example = include_str!("../../../config/uplink-beispiel.toml");
     for address in [

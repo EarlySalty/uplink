@@ -280,6 +280,7 @@ fn fetch_config(args: &Arguments, meta: Metadata) -> Result<Config> {
             private_key_fd: credential_fd + 2,
         },
         media: MediaConfig {
+            worker_threads: 2,
             enhanced: EnhancedConfig::default(),
             probe_dump_streamer_id: None,
             ffmpeg: args.ffmpeg.clone(),

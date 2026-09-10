@@ -50,6 +50,8 @@ pub struct TestIngestConfig {
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MediaConfig {
+    #[serde(default = "media_worker_threads_default")]
+    pub worker_threads: usize,
     #[serde(default)]
     pub enhanced: EnhancedConfig,
     #[serde(default)]
@@ -63,6 +65,9 @@ pub struct MediaConfig {
     pub max_tracks: usize,
     pub live_audio_track: u8,
     pub vod_audio_track: Option<u8>,
+}
+fn media_worker_threads_default() -> usize {
+    2
 }
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]

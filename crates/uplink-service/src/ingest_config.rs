@@ -7,6 +7,9 @@ impl Config {
     /// Dieselben Grenzen dienen Admission und Validierung. Auch anonyme
     /// Verbindungen können Parserpuffer füllen; sie zählen deshalb vollständig.
     pub fn ingest_limits(&self) -> Result<IngestLimits, &'static str> {
+        if !(1..=64).contains(&self.media.worker_threads) {
+            return Err("Die Encoder-Threadzahl muss zwischen 1 und 64 liegen.");
+        }
         self.media_limits()
             .validate_packet_limits()
             .map_err(|_| "Paket- oder Queuegrenzen verletzen den gemeinsamen Medienvertrag.")?;
@@ -56,6 +59,7 @@ impl Config {
 
     pub fn media_limits(&self) -> uplink_media::MediaLimits {
         uplink_media::MediaLimits {
+            worker_threads: self.media.worker_threads,
             max_tag_bytes: self.media.max_event_bytes,
             queue_bytes: self.media.max_queued_bytes,
             queue_events: self.media.max_queued_events,

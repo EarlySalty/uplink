@@ -122,8 +122,8 @@ pub fn preferences(
         denominator: source.fps_denominator,
     };
     let mut canvases = vec![Canvas {
-        width: source.width.min(output.video.width),
-        height: source.height.min(output.video.height),
+        width: source.width,
+        height: source.height,
         canvas_width: source.width,
         canvas_height: source.height,
         framerate,
@@ -483,6 +483,31 @@ mod tests {
                 &quelle(),
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn enhanced_fordert_gemessene_quelle_statt_gespeichertem_einzelziel_an() {
+        let mut source = quelle();
+        source.width = 2560;
+        source.height = 1440;
+        let request = preferences(
+            &source,
+            &test_wunsch(),
+            &crate::config::EnhancedConfig::default(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            (request.canvases[0].width, request.canvases[0].height),
+            (2560, 1440)
+        );
+        assert_eq!(
+            (
+                request.canvases[0].canvas_width,
+                request.canvases[0].canvas_height
+            ),
+            (2560, 1440)
         );
     }
 

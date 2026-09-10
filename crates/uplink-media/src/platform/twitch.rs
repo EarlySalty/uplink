@@ -16,6 +16,7 @@ pub enum GoLiveError {
     InvalidRequest,
     Transport,
     HttpRejected,
+    ServiceUnavailable,
     ResponseTooLarge,
     InvalidResponse,
     AccountRejected,
@@ -31,6 +32,7 @@ impl GoLiveError {
             Self::InvalidRequest => "Twitch-Anfrage passt nicht zu den gemessenen Fähigkeiten",
             Self::Transport => "Twitch-Konfiguration ist vorübergehend nicht erreichbar",
             Self::HttpRejected => "Twitch hat die Konfigurationsanfrage abgelehnt",
+            Self::ServiceUnavailable => "Twitch kann gerade keinen Enhanced-Vertrag bereitstellen",
             Self::ResponseTooLarge => "Twitch-Konfiguration überschreitet die zulässige Größe",
             Self::InvalidResponse => "Twitch-Konfiguration ist unvollständig oder widersprüchlich",
             Self::AccountRejected => "Twitch hat diese Ausgabekonfiguration nicht freigegeben",
@@ -176,8 +178,8 @@ pub struct RequestCapabilities {
     cpu: Cpu,
     memory: Memory,
     system: System,
-    /// Der OBS-Vertrag serialisiert unbekannte optionale Fähigkeiten als null.
-    gpu: Option<()>,
+    /// Keine nachgewiesene GPU: leere Liste gemäß Linux-PostData-Vertrag.
+    gpu: Vec<()>,
     gaming_features: Option<()>,
 }
 impl RequestCapabilities {
@@ -209,8 +211,10 @@ impl RequestCapabilities {
                 revision: report.system.revision.clone(),
                 bits: report.system.bits,
                 arm: report.system.arm,
+                build: 0,
+                arm_emulation: false,
             },
-            gpu: None,
+            gpu: Vec::new(),
             gaming_features: None,
         })
     }
@@ -235,6 +239,9 @@ struct System {
     revision: String,
     bits: u32,
     arm: bool,
+    build: i32,
+    #[serde(rename = "armEmulation")]
+    arm_emulation: bool,
 }
 
 /// Response enthält Zugänge. Debug zeigt bewusst nur geprüfte Medienzahlen.
@@ -513,7 +520,13 @@ struct PostData<'a> {
     authentication: &'a str,
     client: ClientDescription,
     capabilities: &'a RequestCapabilities,
+    preferences: RequestPreferences<'a>,
+}
+#[derive(Serialize)]
+struct RequestPreferences<'a> {
+    #[serde(flatten)]
     preferences: &'a Preferences,
+    composition_gpu_index: Option<u32>,
 }
 #[derive(Serialize)]
 struct ClientDescription {
@@ -564,7 +577,10 @@ fn request_body(
         authentication,
         client,
         capabilities,
-        preferences,
+        preferences: RequestPreferences {
+            preferences,
+            composition_gpu_index: None,
+        },
     };
     // Serialize directly into a zeroizing owner; no temporary plaintext String.
     let mut bytes = Zeroizing::new(Vec::new());
@@ -606,9 +622,7 @@ fn validate_preferences(p: &Preferences) -> Result<()> {
     Ok(())
 }
 async fn read_response(mut response: reqwest::Response) -> Result<Zeroizing<Vec<u8>>> {
-    if !response.status().is_success() {
-        return Err(GoLiveError::HttpRejected);
-    }
+    validate_http_status(response.status())?;
     if response
         .content_length()
         .is_some_and(|len| len > MAX_RESPONSE as u64)
@@ -627,6 +641,18 @@ async fn read_response(mut response: reqwest::Response) -> Result<Zeroizing<Vec<
         bytes.extend_from_slice(&chunk);
     }
     Ok(bytes)
+}
+
+fn validate_http_status(status: reqwest::StatusCode) -> Result<()> {
+    if status.is_success() {
+        Ok(())
+    } else if status.is_server_error()
+        || (status.is_client_error() && !matches!(status.as_u16(), 401 | 403))
+    {
+        Err(GoLiveError::ServiceUnavailable)
+    } else {
+        Err(GoLiveError::HttpRejected)
+    }
 }
 
 #[derive(Deserialize)]

@@ -7,6 +7,23 @@ use fixtures::{
 
 mod fixtures;
 
+#[test]
+fn http_auth_rejection_is_distinct_from_transient_contract_failure() {
+    for status in [401, 403, 302] {
+        assert_eq!(
+            validate_http_status(reqwest::StatusCode::from_u16(status).unwrap()),
+            Err(GoLiveError::HttpRejected)
+        );
+    }
+    for status in [400, 404, 408, 422, 429, 500, 502, 503, 504] {
+        assert_eq!(
+            validate_http_status(reqwest::StatusCode::from_u16(status).unwrap()),
+            Err(GoLiveError::ServiceUnavailable)
+        );
+    }
+    assert_eq!(validate_http_status(reqwest::StatusCode::OK), Ok(()));
+}
+
 const HARDWARE_ENCODERS: [&str; 15] = [
     "jim_nvenc",
     "obs_nvenc_h264_tex",
@@ -214,7 +231,7 @@ fn safe_probe_report_never_echoes_untrusted_response_text() {
 #[test]
 fn request_uses_measured_capabilities_and_real_client_identity() {
     let capabilities = RequestCapabilities {
-        gpu: None,
+        gpu: Vec::new(),
         gaming_features: None,
         cpu: Cpu {
             physical_cores: 4,
@@ -233,6 +250,8 @@ fn request_uses_measured_capabilities_and_real_client_identity() {
             revision: "measured".into(),
             bits: 64,
             arm: false,
+            build: 0,
+            arm_emulation: false,
         },
     };
     let authentication = PublishSecret::new(b"synthetic-authentication".to_vec()).unwrap();
@@ -250,8 +269,10 @@ fn request_uses_measured_capabilities_and_real_client_identity() {
         serde_json::json!(["h264", "h265"])
     );
     assert_eq!(value["capabilities"]["cpu"]["physical_cores"], 4);
-    assert!(value["capabilities"]["gpu"].is_null());
-    assert!(value["preferences"].get("composition_gpu_index").is_none());
+    assert_eq!(value["capabilities"]["gpu"], serde_json::json!([]));
+    assert_eq!(value["capabilities"]["system"]["build"], 0);
+    assert_eq!(value["capabilities"]["system"]["armEmulation"], false);
+    assert!(value["preferences"]["composition_gpu_index"].is_null());
     assert_eq!(value["authentication"], "synthetic-authentication");
     assert_eq!(value["schema_version"], SCHEMA);
 }
