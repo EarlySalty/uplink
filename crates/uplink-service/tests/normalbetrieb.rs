@@ -9,61 +9,63 @@ use database::fixture;
 #[tokio::test]
 #[ignore = "Benötigt isolierte PostgreSQL 16 und den installierten geprüften FFmpeg-8-Build."]
 async fn normal_coordinator_keeps_healthy_output_and_reports_real_graph() {
-    normal_audio_case(false, None, false).await;
+    // Ein alter gespeicherter "live"-Wert darf die feste Twitch-Zuordnung
+    // nicht mehr abschalten. Mit beiden OBS-Spuren muss Twitch getrennt laufen.
+    normal_audio_case(false, Some("live"), false).await;
 }
 
 #[tokio::test]
 #[ignore = "Benötigt isolierte PostgreSQL 16 und geprüften FFmpeg 8."]
-async fn normal_single_aac_live_mode_reaches_twitch_compatible_output() {
+async fn legacy_live_choice_cannot_replace_missing_vod_track() {
     normal_audio_case(true, Some("live"), false).await;
 }
 
 #[tokio::test]
 #[ignore = "Benötigt isolierte PostgreSQL 16 und geprüften FFmpeg 8."]
 async fn twitch_without_enhanced_profiles_sends_desired_output_and_stays_alive() {
-    normal_case_mode(true, Some("live"), false, None, None, true, false).await;
+    normal_case_mode(false, Some("live"), false, None, None, true, false).await;
 }
 
 #[tokio::test]
 #[ignore = "Benötigt isolierte PostgreSQL 16 und geprüften FFmpeg 8."]
 async fn enhanced_without_measured_profiles_falls_back_after_valid_publish_grant() {
-    normal_case_mode(true, Some("live"), false, None, None, true, true).await;
+    normal_case_mode(false, Some("live"), false, None, None, true, true).await;
 }
 
 #[tokio::test]
 #[ignore = "Benötigt isolierte PostgreSQL 16 und geprüften FFmpeg 8."]
-async fn missing_separate_vod_audio_stops_only_twitch() {
+async fn missing_vod_audio_stops_only_twitch() {
     normal_audio_case(true, Some("separate_vod"), false).await;
 }
 
 #[tokio::test]
 #[ignore = "Benötigt isolierte PostgreSQL 16 und geprüften FFmpeg 8."]
-async fn explicit_separate_vod_preserves_both_distinct_aac_feeds() {
+async fn automatic_twitch_vod_preserves_both_distinct_aac_feeds() {
     normal_audio_case(false, Some("separate_vod"), false).await;
 }
 
 #[tokio::test]
 #[ignore = "Benötigt isolierte PostgreSQL 16 und geprüften FFmpeg 8."]
 async fn rejected_platform_publish_marks_the_entire_failed_session() {
-    normal_audio_case(true, Some("live"), true).await;
+    normal_audio_case(false, Some("live"), true).await;
 }
 
 #[tokio::test]
 #[ignore = "Benötigt isolierte PostgreSQL 16 und geprüften FFmpeg 8."]
 async fn production_twitch_with_profile_zero_capacity_and_no_generation_stays_blocked() {
-    normal_case(true, None, false, Some(("11", 0)), None).await;
+    normal_case(false, None, false, Some(("11", 0)), None).await;
 }
 
 #[tokio::test]
 #[ignore = "Benötigt isolierte PostgreSQL 16 und geprüften FFmpeg 8."]
 async fn production_twitch_with_stale_generation_preserves_healthy_youtube() {
-    normal_case(true, None, false, Some(("11", 2)), None).await;
+    normal_case(false, None, false, Some(("11", 2)), None).await;
 }
 
 #[tokio::test]
 #[ignore = "Benötigt isolierte PostgreSQL 16 und geprüften FFmpeg 8."]
 async fn production_twitch_with_wrong_token_owner_preserves_healthy_youtube() {
-    normal_case(true, None, false, Some(("12", 3)), None).await;
+    normal_case(false, None, false, Some(("12", 3)), None).await;
 }
 
 #[tokio::test]
@@ -75,7 +77,7 @@ async fn malformed_layout_with_portrait_disabled_preserves_healthy_youtube() {
 #[tokio::test]
 #[ignore = "Benötigt isolierte PostgreSQL 16 und geprüften FFmpeg 8."]
 async fn malformed_layout_with_portrait_enabled_stops_only_twitch() {
-    normal_case(true, None, false, Some(("11", 3)), Some(true)).await;
+    normal_case(false, None, false, Some(("11", 3)), Some(true)).await;
 }
 
 async fn normal_audio_case(single_audio: bool, twitch_mode: Option<&str>, all_failed: bool) {
@@ -186,7 +188,10 @@ async fn normal_case_mode(
         MediaLimits, PublishSecret, PublishTarget, flv::FlvReader, pusher::RunningPusher,
     };
     const OUTPUT_KEY: &str = "synthetic-full-key?keep=this-entire-value";
-    let twitch_missing = single_audio && twitch_mode == Some("separate_vod");
+    // Sobald Twitch Ziel des Falls ist, braucht es immer beide OBS-Spuren.
+    // Ein alter gespeicherter "live"-Wert darf diese Anforderung nicht mehr
+    // abschalten.
+    let twitch_missing = single_audio && twitch_mode.is_some();
     let healthy_platform = if twitch_mode.is_some() && !twitch_missing {
         "twitch"
     } else {
@@ -413,7 +418,13 @@ async fn normal_case_mode(
                     assert_eq!(healthy["active_profile"]["profile_origin"],"running_graph");
                     assert_eq!(healthy["publication_confirmed"],false);
                     if healthy_platform == "twitch" {
-                        assert_eq!(healthy["active_audio_mode"],twitch_mode.unwrap());
+                        assert_eq!(healthy["twitch_audio_mode"], serde_json::Value::Null);
+                        assert_eq!(healthy["effective_audio_mode"], "separate_vod");
+                        assert_eq!(healthy["active_audio_mode"], "separate_vod");
+                        assert_eq!(healthy["active_audio_routes"], serde_json::json!([
+                            {"source_wire_track":0,"destination_wire_track":0,"role":"live"},
+                            {"source_wire_track":1,"destination_wire_track":1,"role":"vod"}
+                        ]));
                     }
                     if unmeasured_twitch {
                         let sessions = state.registry.status(11);
@@ -428,7 +439,9 @@ async fn normal_case_mode(
                         assert_eq!(twitch["output_state"],"failed");
                         assert!(twitch["reason"].as_str().unwrap().contains("Medienspur fehlt"));
                         assert!(twitch["active_audio_mode"].is_null());
-                        assert_eq!(twitch["twitch_audio_mode"],"separate_vod");
+                        assert!(twitch["active_audio_routes"].is_null());
+                        assert!(twitch["twitch_audio_mode"].is_null());
+                        assert_eq!(twitch["effective_audio_mode"],"separate_vod");
                     }
                     if let Some((owner, _)) = production {
                         let twitch = status["destinations"].as_array().unwrap().iter().find(|item| item["platform"]=="twitch").unwrap();
@@ -459,17 +472,23 @@ async fn normal_case_mode(
         assert_eq!(me["session"]["source_observation"]["height"],180);
         assert_eq!(me["session"]["source_observation"]["audio"].as_array().unwrap().len(),if single_audio {1} else {2});
         assert_eq!(me["session"]["outputs"]["encode_groups"],1);
-        if twitch_mode == Some("live") && !all_failed {
+        if healthy_platform == "twitch" && twitch_mode == Some("live") && !all_failed {
+            // Auch ein alter Client, der während des Streams noch explizit
+            // "live" schreibt, darf die automatische VOD-Spur nicht abschalten.
             let response = http.put(format!("http://{api}/v1/me/destinations")).header("X-Relay-Auth","synthetic-api")
-                .json(&serde_json::json!({"streamer_id":11,"destinations":[{"platform":"twitch","twitch_audio_mode":"separate_vod","connection_generation":if enhanced_fallback {3} else {0}}]})).send().await.unwrap();
+                .json(&serde_json::json!({"streamer_id":11,"destinations":[{"platform":"twitch","twitch_audio_mode":"live","connection_generation":if enhanced_fallback {3} else {0}}]})).send().await.unwrap();
             let status = response.status();
             let detail: serde_json::Value = response.json().await.unwrap();
-            assert!(status.is_success(), "Audioänderung: {status} {:?}", detail.get("error"));
+            assert!(status.is_success(), "Legacy-Audiowahl: {status} {:?}", detail.get("error"));
             let changed:serde_json::Value = http.get(format!("http://{api}/v1/me/destinations?streamer_id=11")).header("X-Relay-Auth","synthetic-api").send().await.unwrap().json().await.unwrap();
             let twitch = changed["destinations"].as_array().unwrap().iter().find(|item|item["platform"]=="twitch").unwrap();
-            assert_eq!(twitch["twitch_audio_mode"],"separate_vod");
+            assert!(twitch["twitch_audio_mode"].is_null());
             assert_eq!(twitch["effective_audio_mode"],"separate_vod");
-            assert_eq!(twitch["active_audio_mode"],"live","Speichern darf laufendes Audio nicht still umschalten");
+            assert_eq!(twitch["active_audio_mode"],"separate_vod","Legacy-Wahl darf den laufenden Mediengraph nicht umschalten");
+            assert_eq!(twitch["active_audio_routes"], serde_json::json!([
+                {"source_wire_track":0,"destination_wire_track":0,"role":"live"},
+                {"source_wire_track":1,"destination_wire_track":1,"role":"vod"}
+            ]));
             if enhanced_fallback {
                 assert_eq!(twitch["requested_output_mode"], "enhanced");
                 assert_eq!(twitch["active_output_mode"], "single");

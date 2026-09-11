@@ -129,16 +129,14 @@ pub fn active_profiles(session: Option<&SessionStatus>, platform: &str, state: &
     json!(stufen)
 }
 
-/// Lokales Audio-Routing, keine Bestätigung eines Plattform-VODs.
-pub fn active_audio_mode(session: Option<&SessionStatus>, platform: &str, state: &str) -> Value {
-    let Some(session) =
-        session.filter(|session| session.active && state == "sending" && platform == "twitch")
-    else {
-        return Value::Null;
-    };
-    let Some(audio) = session
-        .outputs
-        .as_ref()
+fn laufendes_audio<'a>(
+    session: Option<&'a SessionStatus>,
+    platform: &str,
+    state: &str,
+) -> Option<&'a Vec<Value>> {
+    session
+        .filter(|session| session.active && state == "sending" && platform == "twitch")
+        .and_then(|session| session.outputs.as_ref())
         .and_then(|status| status["graph"].as_array())
         .and_then(|graphs| {
             graphs
@@ -146,20 +144,61 @@ pub fn active_audio_mode(session: Option<&SessionStatus>, platform: &str, state:
                 .find(|graph| graph["id"] == platform && graph["profile_origin"] == "running_graph")
         })
         .and_then(|graph| graph["audio"].as_array())
-    else {
+}
+
+fn getrennte_twitch_routen(audio: &[Value]) -> Option<(u64, u64)> {
+    if audio.len() != 2 {
+        return None;
+    }
+    let live = audio
+        .iter()
+        .find(|route| route["destination_wire_track"].as_u64() == Some(0))?;
+    let vod = audio
+        .iter()
+        .find(|route| route["destination_wire_track"].as_u64() == Some(1))?;
+    let live_source = live["source_wire_track"].as_u64()?;
+    let vod_source = vod["source_wire_track"].as_u64()?;
+    (live_source != vod_source).then_some((live_source, vod_source))
+}
+
+/// Lokales Audio-Routing, keine Bestätigung eines Plattform-VODs.
+pub fn active_audio_mode(session: Option<&SessionStatus>, platform: &str, state: &str) -> Value {
+    let Some(audio) = laufendes_audio(session, platform, state) else {
         return Value::Null;
     };
-    match audio.as_slice() {
-        [live] if live["destination_wire_track"] == 0 => json!("live"),
-        [live, vod]
-            if live["destination_wire_track"] == 0
-                && vod["destination_wire_track"] == 1
-                && live["source_wire_track"] != vod["source_wire_track"] =>
-        {
-            json!("separate_vod")
-        }
-        _ => Value::Null,
+    if matches!(audio.as_slice(), [live] if live["destination_wire_track"] == 0) {
+        return json!("live");
     }
+    if getrennte_twitch_routen(audio).is_some() {
+        json!("separate_vod")
+    } else {
+        Value::Null
+    }
+}
+
+/// Tatsächlich laufende Zuordnung des Eingangs auf die Twitch-Rollen. Die
+/// Rollen werden ausschließlich aus dem sendenden Graph abgeleitet. Damit kann
+/// das Dashboard beweisen, dass zwei verschiedene OBS-Spuren auf Live und VOD
+/// geroutet werden, ohne einen gespeicherten Wunsch als Laufzeitstatus auszugeben.
+pub fn active_audio_routes(session: Option<&SessionStatus>, platform: &str, state: &str) -> Value {
+    let Some(audio) = laufendes_audio(session, platform, state) else {
+        return Value::Null;
+    };
+    let Some((live_source, vod_source)) = getrennte_twitch_routen(audio) else {
+        return Value::Null;
+    };
+    json!([
+        {
+            "source_wire_track": live_source,
+            "destination_wire_track": 0,
+            "role": "live",
+        },
+        {
+            "source_wire_track": vod_source,
+            "destination_wire_track": 1,
+            "role": "vod",
+        }
+    ])
 }
 
 #[cfg(test)]
@@ -295,5 +334,70 @@ mod tests {
             active_profiles(sessions.first(), "twitch", "sending"),
             json!([])
         );
+    }
+
+    #[test]
+    fn twitch_audio_status_belegt_getrennte_live_und_vod_routen() {
+        let registry = Registry::new(2, 1).unwrap();
+        let reservation = registry.reserve(22).unwrap();
+        reservation.media_status(json!({"graph":[{
+            "id":"twitch",
+            "profile_origin":"running_graph",
+            "video":[],
+            "audio":[
+                {"source_wire_track":0,"destination_wire_track":0},
+                {"source_wire_track":1,"destination_wire_track":1}
+            ]
+        }]}));
+        let sessions = registry.status(22);
+        assert_eq!(
+            active_audio_mode(sessions.first(), "twitch", "sending"),
+            "separate_vod"
+        );
+        assert_eq!(
+            active_audio_routes(sessions.first(), "twitch", "sending"),
+            json!([
+                {"source_wire_track":0,"destination_wire_track":0,"role":"live"},
+                {"source_wire_track":1,"destination_wire_track":1,"role":"vod"}
+            ])
+        );
+        assert!(active_audio_routes(sessions.first(), "youtube", "sending").is_null());
+        assert!(active_audio_routes(sessions.first(), "twitch", "starting").is_null());
+
+        // Die Reihenfolge im Graph ist nur Darstellung, nicht Semantik.
+        reservation.media_status(json!({"graph":[{
+            "id":"twitch",
+            "profile_origin":"running_graph",
+            "video":[],
+            "audio":[
+                {"source_wire_track":1,"destination_wire_track":1},
+                {"source_wire_track":0,"destination_wire_track":0}
+            ]
+        }]}));
+        let sessions = registry.status(22);
+        assert_eq!(
+            active_audio_mode(sessions.first(), "twitch", "sending"),
+            "separate_vod"
+        );
+        assert_eq!(
+            active_audio_routes(sessions.first(), "twitch", "sending"),
+            json!([
+                {"source_wire_track":0,"destination_wire_track":0,"role":"live"},
+                {"source_wire_track":1,"destination_wire_track":1,"role":"vod"}
+            ])
+        );
+
+        reservation.media_status(json!({"graph":[{
+            "id":"twitch",
+            "profile_origin":"running_graph",
+            "video":[],
+            "audio":[
+                {"source_wire_track":0,"destination_wire_track":0},
+                {"source_wire_track":0,"destination_wire_track":1}
+            ]
+        }]}));
+        let sessions = registry.status(22);
+        assert!(active_audio_mode(sessions.first(), "twitch", "sending").is_null());
+        assert!(active_audio_routes(sessions.first(), "twitch", "sending").is_null());
     }
 }

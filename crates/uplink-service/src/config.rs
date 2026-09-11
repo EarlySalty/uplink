@@ -281,6 +281,13 @@ impl Config {
                             .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
                 })
                 || (platform.use_vod_audio && config.media.vod_audio_track.is_none())
+                // Produktvertrag für Twitch: OBS-Spur 1 ist Live (Wire 0),
+                // OBS-Spur 2 ist VOD (Wire 1). So kann eine abweichende
+                // Deployment-Konfiguration die automatische Trennung nicht
+                // still vertauschen oder vollständig abschalten.
+                || (platform.name == "twitch"
+                    && (config.media.live_audio_track != 0
+                        || config.media.vod_audio_track != Some(1)))
             {
                 return Err("Plattformkonfiguration ist ungültig.");
             }

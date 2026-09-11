@@ -253,13 +253,12 @@ impl Coordinator {
                 .filter(|value| *value > 0)
                 .ok_or("Gewünschtes Ausgabeprofil ist noch unvollständig.")
         };
-        let audio_mode: Option<String> = row.try_get(7).map_err(|_| "Audiowahl fehlt.")?;
-        let use_vod_audio = match (platform.as_str(), audio_mode.as_deref()) {
-            ("twitch", Some("live")) => false,
-            ("twitch", Some("separate_vod")) => true,
-            (_, None) => policy.use_vod_audio,
-            _ => return Err("Gespeicherte Audiowahl ist ungültig."),
-        };
+        // Twitch hat keinen nutzerwaehlbaren Audio-Modus mehr. Der Eingang
+        // liefert Live auf Wire-Track 0 und den getrennten VOD-Mix auf Track 1;
+        // Uplink prueft beide und routet sie deterministisch. Die alte
+        // twitch_audio_mode-Spalte bleibt nur fuer rollende Upgrades im SELECT,
+        // beeinflusst den Mediengraph aber nicht mehr.
+        let use_vod_audio = platform == "twitch" || policy.use_vod_audio;
         let vod_audio_track = if use_vod_audio {
             Some(
                 self.state

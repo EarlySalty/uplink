@@ -32,7 +32,9 @@ pub struct DestinationUpdate {
     pub height: Option<i32>,
     pub fps: Option<i32>,
     pub bitrate_kbps: Option<i32>,
-    /// Auslassen erhält die bisherige Wahl, auch bei konkurrierenden Updates.
+    /// Legacy-Feld für ältere Dashboard-Versionen. Twitch trennt Live und VOD
+    /// automatisch; der Wert wird validiert, aber nicht mehr gespeichert oder
+    /// für den Mediengraph ausgewertet.
     pub twitch_audio_mode: Option<String>,
     /// Auslassen erhält auch bei einem OAuth-Refresh die gespeicherte Betriebsart.
     pub twitch_output_mode: Option<TwitchOutputMode>,
