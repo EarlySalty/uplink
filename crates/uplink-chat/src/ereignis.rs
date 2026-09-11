@@ -313,7 +313,7 @@ impl ArtFilter {
     pub fn passt(&self, ereignis: &crate::nachricht::Ereignis) -> bool {
         use crate::nachricht::Ereignis;
         match ereignis {
-            Ereignis::Chat(_) => self.chat,
+            Ereignis::Chat(_) | Ereignis::ChatSteuerung(_) => self.chat,
             Ereignis::Activity(_) => self.activity,
             Ereignis::Punkte(_) => self.points,
             Ereignis::Info(_) => self.info,

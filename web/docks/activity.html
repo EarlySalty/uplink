@@ -246,6 +246,7 @@ body.mehrere .eintrag .marke { display: block; }
     paket: '<path d="M20 12v9H4v-9"/><path d="M2 7h20v5H2z"/><path d="M12 21V7"/><path d="M12 7H7.5a2.5 2.5 0 0 1 0-5C11 2 12 7 12 7z"/><path d="M12 7h4.5a2.5 2.5 0 0 0 0-5C13 2 12 7 12 7z"/>',
     diamant: '<path d="M6 3h12l4 6-10 12L2 9z"/><path d="M2 9h20"/><path d="m11 3-3 6 4 12 4-12-3-6"/>',
     fahne: '<path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V4s-1 1-4 1-5-2-8-2-4 1-4 1z"/><path d="M4 22V4"/>',
+    live: '<circle cx="12" cy="12" r="2"/><path d="M8.5 8.5a5 5 0 0 0 0 7M15.5 8.5a5 5 0 0 1 0 7M5.5 5.5a9 9 0 0 0 0 13M18.5 5.5a9 9 0 0 1 0 13"/>',
     alle: '<path d="M4 6h16M4 12h16M4 18h10"/>'
   };
   function ikone(name) {
@@ -315,7 +316,8 @@ body.mehrere .eintrag .marke { display: block; }
     { id: "abo", name: "Abos", symbol: "stern" },
     { id: "geschenk", name: "Geschenke", symbol: "paket" },
     { id: "bits", name: "Bits", symbol: "diamant" },
-    { id: "raid", name: "Raids", symbol: "fahne" }
+    { id: "raid", name: "Raids", symbol: "fahne" },
+    { id: "stream", name: "Stream", symbol: "live" }
   ];
 
   GRUPPEN.forEach(function (g) {
@@ -471,9 +473,12 @@ body.mehrere .eintrag .marke { display: block; }
             : "Hat dich mit " + zuschauer + " Zuschauern geraidet."
         };
       }
-      /* Stream-Start, Stream-Ende und geaenderte Stream-Infos gehoeren nicht
-         in diesen Strom: die ersten beiden werden gar nicht abonniert, die
-         dritte laeuft als `info` ins Stream-Info-Fenster. */
+      case "stream_online":
+        return { gruppe: "stream", symbol: "live", wer: "Twitch", satz: "Der Stream ist live gegangen." };
+      case "stream_offline":
+        return { gruppe: "stream", symbol: "live", wer: "Twitch", satz: "Der Stream wurde beendet." };
+      /* Geaenderte Stream-Infos laufen als `info` ins Stream-Info-Fenster und
+         erscheinen deshalb hier nicht doppelt. */
       default:
         return null;
     }

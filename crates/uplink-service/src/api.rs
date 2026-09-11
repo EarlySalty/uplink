@@ -600,6 +600,8 @@ async fn destinations(
         };
         let active_audio =
             crate::media_status::active_audio_mode(sessions.first(), &platform, output_state);
+        let active_audio_routes =
+            crate::media_status::active_audio_routes(sessions.first(), &platform, output_state);
         let mode = sessions
             .first()
             .filter(|session| session.active)
@@ -608,7 +610,7 @@ async fn destinations(
             .filter(|_| output_state == "sending")
             .and_then(|mode| mode.active);
         let fallback_reason = mode.and_then(|mode| mode.fallback_reason.as_deref());
-        outputs.push(json!({"platform":platform,"connection_generation":row.try_get::<_,i64>(7).map_err(|_|invalid())?,"rtmp_url":if blocked {""} else {endpoint.as_str()},"enabled":row.try_get::<_,bool>(2).map_err(|_|invalid())?,"blocked":blocked,"error":endpoint_error,"requested":{"width":row.try_get::<_,Option<i32>>(3).map_err(|_|invalid())?,"height":row.try_get::<_,Option<i32>>(4).map_err(|_|invalid())?,"fps":row.try_get::<_,Option<i32>>(5).map_err(|_|invalid())?,"bitrate_kbps":row.try_get::<_,Option<i32>>(6).map_err(|_|invalid())?},"requested_output_mode":row.try_get::<_,String>(12).map_err(|_|invalid())?,"active_output_mode":active_output_mode,"fallback_reason":fallback_reason,"active_profile":active_profile,"active_profiles":active_profiles,"hochkant":{"enabled":hochkant_enabled,"width":row.try_get::<_,Option<i32>>(10).map_err(|_|invalid())?,"height":row.try_get::<_,Option<i32>>(11).map_err(|_|invalid())?,"requested_revision":requested_revision,"active_revision":active_revision},"twitch_audio_mode":requested_audio,"effective_audio_mode":effective_audio,"active_audio_mode":active_audio,"output_state":output_state,"reason":reason,"publication_confirmed":false,"input_codec":input["input_codec"],"input_bitrate_kbps":input["input_bitrate_kbps"]}));
+        outputs.push(json!({"platform":platform,"connection_generation":row.try_get::<_,i64>(7).map_err(|_|invalid())?,"rtmp_url":if blocked {""} else {endpoint.as_str()},"enabled":row.try_get::<_,bool>(2).map_err(|_|invalid())?,"blocked":blocked,"error":endpoint_error,"requested":{"width":row.try_get::<_,Option<i32>>(3).map_err(|_|invalid())?,"height":row.try_get::<_,Option<i32>>(4).map_err(|_|invalid())?,"fps":row.try_get::<_,Option<i32>>(5).map_err(|_|invalid())?,"bitrate_kbps":row.try_get::<_,Option<i32>>(6).map_err(|_|invalid())?},"requested_output_mode":row.try_get::<_,String>(12).map_err(|_|invalid())?,"active_output_mode":active_output_mode,"fallback_reason":fallback_reason,"active_profile":active_profile,"active_profiles":active_profiles,"hochkant":{"enabled":hochkant_enabled,"width":row.try_get::<_,Option<i32>>(10).map_err(|_|invalid())?,"height":row.try_get::<_,Option<i32>>(11).map_err(|_|invalid())?,"requested_revision":requested_revision,"active_revision":active_revision},"twitch_audio_mode":requested_audio,"effective_audio_mode":effective_audio,"active_audio_mode":active_audio,"active_audio_routes":active_audio_routes,"output_state":output_state,"reason":reason,"publication_confirmed":false,"input_codec":input["input_codec"],"input_bitrate_kbps":input["input_bitrate_kbps"]}));
     }
     Ok(Json(json!({"destinations": outputs})))
 }

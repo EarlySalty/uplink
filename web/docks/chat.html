@@ -1067,8 +1067,63 @@ footer {
     return JSON.stringify(["chat", n.platform || "", n.channel_id || "", n.message_id || ""]);
   }
 
+  function chatSteuerung(e) {
+    function leerNachModeration() {
+      if (liste.querySelector(".zeile") || leer) return;
+      leer = document.createElement("div");
+      leer.className = "leerzustand";
+      leer.id = "leer";
+      var text = document.createElement("p");
+      text.className = "willkommen";
+      text.textContent = "Der Chat ist derzeit leer.";
+      leer.appendChild(text);
+      liste.appendChild(leer);
+    }
+    function entfernen(eintrag) {
+      if (!eintrag || !eintrag.nachricht) return;
+      if (eintrag.zeile && eintrag.zeile.parentNode === liste) eintrag.zeile.remove();
+      eintrag.zeile = null;
+      // Ein spaeteres identisches EventSub-Replay darf eine bereits geloeschte
+      // Nachricht nicht kurz wieder sichtbar machen.
+      eintrag.geloescht = true;
+    }
+    if (e.art === "message_delete") {
+      var key = dedupeKey({
+        platform: e.platform,
+        channel_id: e.channel_id,
+        message_id: e.message_id
+      });
+      var eintrag = gesehen[key];
+      if (eintrag) {
+        entfernen(eintrag);
+      } else {
+        // Auch wenn das Delete durch Reconnect/Reordering vor der alten
+        // Chatnachricht eintrifft, bleibt deren ID tombstoned.
+        gesehen[key] = { inhalt: null, zeile: null, nachricht: null, geloescht: true };
+        gesehenReihe.push(key);
+        if (gesehenReihe.length > 2000) delete gesehen[gesehenReihe.shift()];
+      }
+      leerNachModeration();
+      return;
+    }
+    if (e.art !== "clear_user" && e.art !== "clear") return;
+    Object.keys(gesehen).forEach(function (key) {
+      var eintrag = gesehen[key];
+      var n = eintrag && eintrag.nachricht;
+      if (!n || n.platform !== e.platform || n.channel_id !== e.channel_id) return;
+      if (e.art === "clear_user" && n.sender_id !== e.target_user_id) return;
+      entfernen(eintrag);
+    });
+    leerNachModeration();
+  }
+
   function anhaengen(rahmen) {
     if (!rahmen || !rahmen.ereignis) return;
+    if (rahmen.ereignis.typ === "chat_control") {
+      if (typeof rahmen.id === "number" && rahmen.id > letzteId) letzteId = rahmen.id;
+      chatSteuerung(rahmen.ereignis);
+      return;
+    }
     if (rahmen.ereignis.typ === "activity") {
       if (typeof rahmen.id === "number" && rahmen.id > letzteId) letzteId = rahmen.id;
       bitsZaehlen(rahmen.ereignis);
@@ -1080,11 +1135,11 @@ footer {
     var key = dedupeKey(n);
     var vorher = gesehen[key];
     var inhalt = JSON.stringify(n);
-    if (vorher && vorher.inhalt === inhalt) return;
+    if (vorher && (vorher.geloescht || vorher.inhalt === inhalt)) return;
     // Plattformen können dieselbe Nachricht später ergänzen. Sie bleibt an
     // ihrem Platz; ein erneut gelieferter identischer Stand erzeugt keine Zeile.
     var zeile = zeileBauen(n);
-    gesehen[key] = { inhalt: inhalt, zeile: zeile };
+    gesehen[key] = { inhalt: inhalt, zeile: zeile, nachricht: n, geloescht: false };
     if (!vorher) {
       gesehenReihe.push(key);
       if (gesehenReihe.length > 2000) delete gesehen[gesehenReihe.shift()];

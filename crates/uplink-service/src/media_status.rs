@@ -129,16 +129,14 @@ pub fn active_profiles(session: Option<&SessionStatus>, platform: &str, state: &
     json!(stufen)
 }
 
-/// Lokales Audio-Routing, keine Bestätigung eines Plattform-VODs.
-pub fn active_audio_mode(session: Option<&SessionStatus>, platform: &str, state: &str) -> Value {
-    let Some(session) =
-        session.filter(|session| session.active && state == "sending" && platform == "twitch")
-    else {
-        return Value::Null;
-    };
-    let Some(audio) = session
-        .outputs
-        .as_ref()
+fn laufendes_audio<'a>(
+    session: Option<&'a SessionStatus>,
+    platform: &str,
+    state: &str,
+) -> Option<&'a Vec<Value>> {
+    session
+        .filter(|session| session.active && state == "sending" && platform == "twitch")
+        .and_then(|session| session.outputs.as_ref())
         .and_then(|status| status["graph"].as_array())
         .and_then(|graphs| {
             graphs
@@ -146,7 +144,11 @@ pub fn active_audio_mode(session: Option<&SessionStatus>, platform: &str, state:
                 .find(|graph| graph["id"] == platform && graph["profile_origin"] == "running_graph")
         })
         .and_then(|graph| graph["audio"].as_array())
-    else {
+}
+
+/// Lokales Audio-Routing, keine Bestätigung eines Plattform-VODs.
+pub fn active_audio_mode(session: Option<&SessionStatus>, platform: &str, state: &str) -> Value {
+    let Some(audio) = laufendes_audio(session, platform, state) else {
         return Value::Null;
     };
     match audio.as_slice() {
@@ -160,6 +162,33 @@ pub fn active_audio_mode(session: Option<&SessionStatus>, platform: &str, state:
         }
         _ => Value::Null,
     }
+}
+
+/// Die wirklich laufende Zuordnung von Eingangs-AAC-Spuren auf die Twitch-
+/// Rollen. Die Rolle kommt aus dem Ziel-Track des laufenden Graphen, nicht aus
+/// gespeicherten Wuenschen. Ein unbekannter Ziel-Track wird nicht umgedeutet.
+pub fn active_audio_routes(session: Option<&SessionStatus>, platform: &str, state: &str) -> Value {
+    let Some(audio) = laufendes_audio(session, platform, state) else {
+        return Value::Null;
+    };
+    let routes: Vec<Value> = audio
+        .iter()
+        .filter_map(|route| {
+            let source = route["source_wire_track"].as_u64()?;
+            let destination = route["destination_wire_track"].as_u64()?;
+            let role = match destination {
+                0 => "live",
+                1 => "vod",
+                _ => "unknown",
+            };
+            Some(json!({
+                "source_wire_track": source,
+                "destination_wire_track": destination,
+                "role": role,
+            }))
+        })
+        .collect();
+    json!(routes)
 }
 
 #[cfg(test)]
@@ -294,6 +323,41 @@ mod tests {
         assert_eq!(
             active_profiles(sessions.first(), "twitch", "sending"),
             json!([])
+        );
+    }
+
+    #[test]
+    fn twitch_audio_status_zeigt_tatsaechliche_live_und_vod_quellspuren() {
+        let registry = Registry::new(2, 1).unwrap();
+        let reservation = registry.reserve(22).unwrap();
+        reservation.media_status(json!({"graph":[{
+            "id":"twitch",
+            "profile_origin":"running_graph",
+            "video":[],
+            "audio":[
+                {"source_wire_track":7,"destination_wire_track":0},
+                {"source_wire_track":12,"destination_wire_track":1}
+            ]
+        }]}));
+        let sessions = registry.status(22);
+        assert_eq!(
+            active_audio_mode(sessions.first(), "twitch", "sending"),
+            "separate_vod"
+        );
+        assert_eq!(
+            active_audio_routes(sessions.first(), "twitch", "sending"),
+            json!([
+                {"source_wire_track":7,"destination_wire_track":0,"role":"live"},
+                {"source_wire_track":12,"destination_wire_track":1,"role":"vod"}
+            ])
+        );
+        assert!(
+            active_audio_routes(sessions.first(), "youtube", "sending").is_null(),
+            "Twitch-Rollen werden nicht fuer andere Plattformen erfunden"
+        );
+        assert!(
+            active_audio_routes(sessions.first(), "twitch", "starting").is_null(),
+            "gespeicherter Graph ohne laufende Ausgabe ist kein aktiver Audioweg"
         );
     }
 }

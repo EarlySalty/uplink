@@ -32,6 +32,12 @@ async fn enhanced_without_measured_profiles_falls_back_after_valid_publish_grant
 
 #[tokio::test]
 #[ignore = "Benötigt isolierte PostgreSQL 16 und geprüften FFmpeg 8."]
+async fn enhanced_fallback_preserves_distinct_live_and_vod_audio() {
+    normal_case_mode(false, Some("separate_vod"), false, None, None, true, true).await;
+}
+
+#[tokio::test]
+#[ignore = "Benötigt isolierte PostgreSQL 16 und geprüften FFmpeg 8."]
 async fn missing_separate_vod_audio_stops_only_twitch() {
     normal_audio_case(true, Some("separate_vod"), false).await;
 }
@@ -414,6 +420,18 @@ async fn normal_case_mode(
                     assert_eq!(healthy["publication_confirmed"],false);
                     if healthy_platform == "twitch" {
                         assert_eq!(healthy["active_audio_mode"],twitch_mode.unwrap());
+                        let routes = healthy["active_audio_routes"].as_array().expect("laufende Twitch-Audiorouten");
+                        assert_eq!(routes[0]["source_wire_track"],0);
+                        assert_eq!(routes[0]["destination_wire_track"],0);
+                        assert_eq!(routes[0]["role"],"live");
+                        if twitch_mode == Some("separate_vod") {
+                            assert_eq!(routes.len(),2);
+                            assert_eq!(routes[1]["source_wire_track"],1);
+                            assert_eq!(routes[1]["destination_wire_track"],1);
+                            assert_eq!(routes[1]["role"],"vod");
+                        } else {
+                            assert_eq!(routes.len(),1);
+                        }
                     }
                     if unmeasured_twitch {
                         let sessions = state.registry.status(11);
