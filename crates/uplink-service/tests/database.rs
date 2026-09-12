@@ -23,6 +23,7 @@ impl uplink_service::runtime::SessionProcessor for Collector {
         &self,
         first: uplink_ingest::MediaEvent,
         mut events: tokio::sync::mpsc::Receiver<uplink_ingest::MediaEvent>,
+        _source_termination: tokio::sync::watch::Receiver<uplink_media::SourceTermination>,
     ) -> Result<(), &'static str> {
         self.0.lock().unwrap().push(first.identity);
         while let Some(event) = events.recv().await {

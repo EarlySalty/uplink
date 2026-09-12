@@ -11,6 +11,7 @@ impl uplink_service::runtime::SessionProcessor for NoMedia {
         &self,
         _: uplink_ingest::MediaEvent,
         mut events: tokio::sync::mpsc::Receiver<uplink_ingest::MediaEvent>,
+        _source_termination: tokio::sync::watch::Receiver<uplink_media::SourceTermination>,
     ) -> Result<(), &'static str> {
         while events.recv().await.is_some() {}
         Ok(())

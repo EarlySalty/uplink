@@ -499,6 +499,32 @@ impl Drop for Reservation {
                         end_reason.push_str("; Diagnose=");
                         end_reason.push_str(&diagnostic.to_string());
                     }
+                    let media_gaps: Vec<_> = report
+                        .as_ref()
+                        .map(|report| {
+                            report
+                                .media_gaps
+                                .iter()
+                                .map(|gap| {
+                                    let track_kind = match gap.recovered_track.kind {
+                                        uplink_ingest::MediaKind::Audio => "audio",
+                                        uplink_ingest::MediaKind::Video => "video",
+                                    };
+                                    serde_json::json!({
+                                        "recovered_at_ms": u64::try_from(gap.recovered_at_ms).unwrap_or(u64::MAX),
+                                        "gap_ms": u64::try_from(gap.gap_ms).unwrap_or(u64::MAX),
+                                        "recovered_track_kind": track_kind,
+                                        "recovered_wire_track": gap.recovered_track.wire_id,
+                                        "recovered_event_kind": format!("{:?}", gap.recovered_event_kind),
+                                    })
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let media_gap_count = report.as_ref().map_or(0, |report| report.media_gap_count);
+                    let max_media_gap_ms = report
+                        .as_ref()
+                        .map_or(0, |report| u64::try_from(report.max_media_gap_ms).unwrap_or(u64::MAX));
                     (completion, SessionCompletion {
                         streamer_id: tenant,
                         ended_at: self
@@ -519,6 +545,9 @@ impl Drop for Reservation {
                             "received_events": report.as_ref().map_or(0, |report| report.received_events),
                             "received_bytes": report.as_ref().map_or(0, |report| report.received_bytes),
                             "source_tracks": report.as_ref().map_or(0, |report| report.track_count),
+                            "media_gaps": media_gaps,
+                            "media_gap_count": media_gap_count,
+                            "max_media_gap_ms": max_media_gap_ms,
                         }),
                     })
                 });
