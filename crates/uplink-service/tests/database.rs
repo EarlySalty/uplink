@@ -289,7 +289,7 @@ async fn destination_save_enforces_its_platform_transport_policy() {
 
 #[tokio::test]
 #[ignore = "Benötigt isolierte PostgreSQL-16-Testinstanz."]
-async fn explicit_twitch_audio_choice_survives_omitted_updates() {
+async fn legacy_twitch_audio_choice_is_ignored_and_status_is_automatic() {
     let (database, state) = fixture().await;
     let response = router(state.clone()).oneshot(request("PUT", "/v1/me/destinations", r#"{"streamer_id":11,"destinations":[{"platform":"twitch","connection_generation":1,"rtmp_url":"rtmps://live.twitch.tv/app","stream_key":"synthetic","twitch_audio_mode":"live"}]}"#)).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
@@ -312,9 +312,13 @@ async fn explicit_twitch_audio_choice_survives_omitted_updates() {
         .unwrap();
     let value: serde_json::Value =
         serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
-    assert_eq!(value["destinations"][0]["twitch_audio_mode"], "live");
-    assert_eq!(value["destinations"][0]["effective_audio_mode"], "live");
+    assert!(value["destinations"][0]["twitch_audio_mode"].is_null());
+    assert_eq!(
+        value["destinations"][0]["effective_audio_mode"],
+        "separate_vod"
+    );
     assert!(value["destinations"][0]["active_audio_mode"].is_null());
+    assert!(value["destinations"][0]["active_audio_routes"].is_null());
     for (platform, mode) in [("kick", "live"), ("twitch", "fallback")] {
         let body = serde_json::json!({"streamer_id":11,"destinations":[{"platform":platform,"connection_generation":2,"twitch_audio_mode":mode}]}).to_string();
         assert_eq!(

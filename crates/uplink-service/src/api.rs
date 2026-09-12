@@ -171,7 +171,11 @@ async fn save_destinations(
             })
             .transpose()
             .map_err(|e| failure(StatusCode::SERVICE_UNAVAILABLE, e))?;
-        rows.push(json!({"platform":output.platform,"connection_generation":output.connection_generation,"rtmp_url":output.rtmp_url,"stream_key_enc":ciphertext.map(|bytes|format!("\\x{}",hex::encode(bytes))),"enabled":output.enabled,"width":output.width,"height":output.height,"fps":output.fps,"bitrate_kbps":output.bitrate_kbps,"twitch_audio_mode":output.twitch_audio_mode,"twitch_output_mode":output.twitch_output_mode}));
+        // twitch_audio_mode ist nur noch ein Legacy-Feld für rollende Clients.
+        // Ein alter Client darf damit die automatische Live/VOD-Trennung nicht
+        // wieder abschalten. NULL sorgt dafür, dass der bestehende DB-Wert bei
+        // Teilupdates unverändert bleibt; der Medienpfad ignoriert ihn ohnehin.
+        rows.push(json!({"platform":output.platform,"connection_generation":output.connection_generation,"rtmp_url":output.rtmp_url,"stream_key_enc":ciphertext.map(|bytes|format!("\\x{}",hex::encode(bytes))),"enabled":output.enabled,"width":output.width,"height":output.height,"fps":output.fps,"bitrate_kbps":output.bitrate_kbps,"twitch_audio_mode":serde_json::Value::Null,"twitch_output_mode":output.twitch_output_mode}));
     }
     let data = json!(rows);
     // INSERT benötigt Pflichtwerte auch für bestehende Ziele. Beim Konflikt
@@ -579,27 +583,17 @@ async fn destinations(
             .and_then(|session| session.frozen_layouts.get(&platform))
             .and_then(|wahl| wahl["revision"].as_u64());
         let hochkant_enabled: bool = row.try_get(9).unwrap_or(false);
-        let requested_audio: Option<String> = row.try_get(8).map_err(|_| invalid())?;
-        let effective_audio = if platform == "twitch" {
-            requested_audio.as_deref().or_else(|| {
-                state
-                    .config
-                    .platforms
-                    .iter()
-                    .find(|policy| policy.name == "twitch")
-                    .map(|policy| {
-                        if policy.use_vod_audio {
-                            "separate_vod"
-                        } else {
-                            "live"
-                        }
-                    })
-            })
-        } else {
-            None
-        };
+        // Der gespeicherte Altwert ist absichtlich keine Steuerung mehr. Wir
+        // lesen die Legacy-Spalte nur noch, damit ein ungültiger DB-Datensatz
+        // weiterhin sichtbar als fehlerhafte Zeile abgewiesen wird.
+        // Twitch bekommt immer einen getrennten VOD-Mix; fehlt OBS-Track 2,
+        // scheitert nur dieser Ausgang sichtbar statt den Live-Mix zu kopieren.
+        let _legacy_requested_audio: Option<String> = row.try_get(8).map_err(|_| invalid())?;
+        let effective_audio = (platform == "twitch").then_some("separate_vod");
         let active_audio =
             crate::media_status::active_audio_mode(sessions.first(), &platform, output_state);
+        let active_audio_routes =
+            crate::media_status::active_audio_routes(sessions.first(), &platform, output_state);
         let mode = sessions
             .first()
             .filter(|session| session.active)
@@ -608,7 +602,7 @@ async fn destinations(
             .filter(|_| output_state == "sending")
             .and_then(|mode| mode.active);
         let fallback_reason = mode.and_then(|mode| mode.fallback_reason.as_deref());
-        outputs.push(json!({"platform":platform,"connection_generation":row.try_get::<_,i64>(7).map_err(|_|invalid())?,"rtmp_url":if blocked {""} else {endpoint.as_str()},"enabled":row.try_get::<_,bool>(2).map_err(|_|invalid())?,"blocked":blocked,"error":endpoint_error,"requested":{"width":row.try_get::<_,Option<i32>>(3).map_err(|_|invalid())?,"height":row.try_get::<_,Option<i32>>(4).map_err(|_|invalid())?,"fps":row.try_get::<_,Option<i32>>(5).map_err(|_|invalid())?,"bitrate_kbps":row.try_get::<_,Option<i32>>(6).map_err(|_|invalid())?},"requested_output_mode":row.try_get::<_,String>(12).map_err(|_|invalid())?,"active_output_mode":active_output_mode,"fallback_reason":fallback_reason,"active_profile":active_profile,"active_profiles":active_profiles,"hochkant":{"enabled":hochkant_enabled,"width":row.try_get::<_,Option<i32>>(10).map_err(|_|invalid())?,"height":row.try_get::<_,Option<i32>>(11).map_err(|_|invalid())?,"requested_revision":requested_revision,"active_revision":active_revision},"twitch_audio_mode":requested_audio,"effective_audio_mode":effective_audio,"active_audio_mode":active_audio,"output_state":output_state,"reason":reason,"publication_confirmed":false,"input_codec":input["input_codec"],"input_bitrate_kbps":input["input_bitrate_kbps"]}));
+        outputs.push(json!({"platform":platform,"connection_generation":row.try_get::<_,i64>(7).map_err(|_|invalid())?,"rtmp_url":if blocked {""} else {endpoint.as_str()},"enabled":row.try_get::<_,bool>(2).map_err(|_|invalid())?,"blocked":blocked,"error":endpoint_error,"requested":{"width":row.try_get::<_,Option<i32>>(3).map_err(|_|invalid())?,"height":row.try_get::<_,Option<i32>>(4).map_err(|_|invalid())?,"fps":row.try_get::<_,Option<i32>>(5).map_err(|_|invalid())?,"bitrate_kbps":row.try_get::<_,Option<i32>>(6).map_err(|_|invalid())?},"requested_output_mode":row.try_get::<_,String>(12).map_err(|_|invalid())?,"active_output_mode":active_output_mode,"fallback_reason":fallback_reason,"active_profile":active_profile,"active_profiles":active_profiles,"hochkant":{"enabled":hochkant_enabled,"width":row.try_get::<_,Option<i32>>(10).map_err(|_|invalid())?,"height":row.try_get::<_,Option<i32>>(11).map_err(|_|invalid())?,"requested_revision":requested_revision,"active_revision":active_revision},"twitch_audio_mode":serde_json::Value::Null,"effective_audio_mode":effective_audio,"active_audio_mode":active_audio,"active_audio_routes":active_audio_routes,"output_state":output_state,"reason":reason,"publication_confirmed":false,"input_codec":input["input_codec"],"input_bitrate_kbps":input["input_bitrate_kbps"]}));
     }
     Ok(Json(json!({"destinations": outputs})))
 }
