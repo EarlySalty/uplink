@@ -264,6 +264,24 @@ const SUBSCRIPTIONS: &[Subscription] = &[
         bedingung: Bedingung::BroadcasterUndUser,
     },
     Subscription {
+        typ: "channel.chat.message_delete",
+        version: "1",
+        scope: Some("user:read:chat"),
+        bedingung: Bedingung::BroadcasterUndUser,
+    },
+    Subscription {
+        typ: "channel.chat.clear_user_messages",
+        version: "1",
+        scope: Some("user:read:chat"),
+        bedingung: Bedingung::BroadcasterUndUser,
+    },
+    Subscription {
+        typ: "channel.chat.clear",
+        version: "1",
+        scope: Some("user:read:chat"),
+        bedingung: Bedingung::BroadcasterUndUser,
+    },
+    Subscription {
         typ: "channel.follow",
         version: "2",
         scope: Some("moderator:read:followers"),
@@ -302,6 +320,18 @@ const SUBSCRIPTIONS: &[Subscription] = &[
     Subscription {
         typ: "channel.update",
         version: "2",
+        scope: None,
+        bedingung: Bedingung::Broadcaster,
+    },
+    Subscription {
+        typ: "stream.online",
+        version: "1",
+        scope: None,
+        bedingung: Bedingung::Broadcaster,
+    },
+    Subscription {
+        typ: "stream.offline",
+        version: "1",
         scope: None,
         bedingung: Bedingung::Broadcaster,
     },
@@ -526,7 +556,7 @@ impl Inner {
     }
 
     /// Legt alle Subscriptions fuer diese WebSocket-Session an, parallel,
-    /// damit die 10-s-Frist nach dem Welcome auch mit neun Aufrufen haelt.
+    /// damit die 10-s-Frist nach dem Welcome auch mit allen Aufrufen haelt.
     /// Nur der Chat ist Pflicht; ein fehlender Scope ueberspringt den Typ
     /// und merkt sich den Scope, ein anderer Fehler wird nur geloggt.
     ///
@@ -560,13 +590,13 @@ impl Inner {
                 continue;
             }
             let Err(fehler) = ergebnis else { continue };
-            // Ein 403 auf eine Nebensubscription heisst: der Scope steht
-            // nicht im Zugang, auch wenn die lokale Liste etwas anderes
-            // behauptet (oder gar keine Liste kam). Ohne diesen Eintrag
-            // faellt die Funktion still aus und das Dock meldet null
-            // fehlende Scopes (REQ-12).
+            // Ein 403 auf eine Nebensubscription kann einen fehlenden
+            // optionalen Scope beweisen. Teilt sie dagegen den Pflicht-Scope
+            // des erfolgreichen Chat-Abos, waere "Scope fehlt" widerspruechlich:
+            // dann bleibt nur der konkrete Nebentyp nicht verfuegbar.
             if matches!(fehler, ChatFehler::NeuAnmeldungNoetig(_))
                 && let Some(scope) = sub.scope
+                && Some(scope) != SUBSCRIPTIONS[0].scope
             {
                 merken(scope, &mut fehlend);
             }
@@ -891,7 +921,9 @@ fn revocation_bewerten(inner: &Inner, json: &Value) -> Widerruf {
     if sub.typ == SUBSCRIPTIONS[0].typ {
         return Widerruf::Alles;
     }
-    if let Some(scope) = sub.scope {
+    if let Some(scope) = sub.scope
+        && Some(scope) != SUBSCRIPTIONS[0].scope
+    {
         inner.scope_nachtragen(scope);
     }
     tracing::warn!(
@@ -1410,7 +1442,10 @@ mod tests {
             vec![
                 "channel.channel_points_custom_reward_redemption.add",
                 "channel.channel_points_custom_reward_redemption.update",
+                "channel.chat.clear",
+                "channel.chat.clear_user_messages",
                 "channel.chat.message",
+                "channel.chat.message_delete",
                 "channel.cheer",
                 "channel.follow",
                 "channel.raid",
@@ -1418,6 +1453,8 @@ mod tests {
                 "channel.subscription.gift",
                 "channel.subscription.message",
                 "channel.update",
+                "stream.offline",
+                "stream.online",
             ]
         );
         // Condition je Typ: follow braucht moderator_user_id, raid to_broadcaster.
@@ -1442,6 +1479,14 @@ mod tests {
         assert_eq!(koerper("channel.update")["version"], "2");
         assert_eq!(
             koerper("channel.chat.message")["condition"]["user_id"],
+            "12345"
+        );
+        assert_eq!(
+            koerper("channel.chat.message_delete")["condition"]["user_id"],
+            "12345"
+        );
+        assert_eq!(
+            koerper("stream.online")["condition"]["broadcaster_user_id"],
             "12345"
         );
         assert_eq!(
@@ -1473,8 +1518,17 @@ mod tests {
         warte_bis(&adapter, true, "Chat verbunden trotz fehlender Scopes").await;
         assert_eq!(
             abonnierte_typen(&server).await,
-            vec!["channel.chat.message", "channel.raid", "channel.update"],
-            "nur Chat und die scope-freien Typen"
+            vec![
+                "channel.chat.clear",
+                "channel.chat.clear_user_messages",
+                "channel.chat.message",
+                "channel.chat.message_delete",
+                "channel.raid",
+                "channel.update",
+                "stream.offline",
+                "stream.online",
+            ],
+            "Chatsteuerung und scope-freie Typen bleiben ohne optionale Aktivitaetsscopes aktiv"
         );
         let mut fehlend = adapter.fehlende_scopes();
         fehlend.sort();
@@ -1751,6 +1805,51 @@ mod tests {
             adapter.fehlende_scopes(),
             vec!["moderator:read:followers".to_string()],
             "die 403 gehoert ins Dock"
+        );
+        adapter.trennen().await;
+    }
+
+    #[tokio::test]
+    async fn abgelehntes_chat_delete_erfindet_keinen_fehlenden_pflicht_scope() {
+        let server = bot_und_helix_mit_scopes(1, DOCK_SCOPES).await;
+        Mock::given(method("POST"))
+            .and(path("/eventsub/subscriptions"))
+            .and(body_partial_json(
+                json!({ "type": "channel.chat.message_delete" }),
+            ))
+            .respond_with(ResponseTemplate::new(403).set_body_json(json!({
+                "error": "Forbidden", "status": 403, "message": "subscription rejected"
+            })))
+            .mount(&server)
+            .await;
+        subscription_mock(&server).await;
+        let ws_url = ws_server(|mut ws| {
+            Box::pin(async move {
+                ws.send(welcome("sess-1")).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                ws.send(notification("chat-laeuft")).await.unwrap();
+                while let Some(Ok(_)) = ws.next().await {}
+            })
+        })
+        .await;
+        let (tx, mut rx) = mpsc::channel(8);
+        let adapter = fabrik(&server, &ws_url)
+            .await
+            .bauen(7, Platform::Twitch, tx)
+            .await
+            .expect("Adapter");
+        adapter.verbinden().await.expect("verbinden");
+        tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("Chatzeile binnen 5 s")
+            .expect("Kanal offen");
+        assert!(adapter.verbunden(), "das Pflicht-Chatabo laeuft weiter");
+        assert!(
+            !adapter
+                .fehlende_scopes()
+                .iter()
+                .any(|scope| scope == "user:read:chat"),
+            "ein erfolgreich genutzter Pflicht-Scope darf nicht als fehlend erscheinen"
         );
         adapter.trennen().await;
     }

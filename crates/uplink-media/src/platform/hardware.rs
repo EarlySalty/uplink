@@ -693,20 +693,28 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn encoder_timeout_and_output_limit_kill_and_reap_the_process() {
-        for (program, arguments, expected) in [
-            ("/usr/bin/sleep", vec!["20"], MediaError::StartTimeout),
+        for (program, arguments, deadline, expected) in [
+            (
+                "/usr/bin/sleep",
+                vec!["20"],
+                Duration::from_millis(100),
+                MediaError::StartTimeout,
+            ),
             (
                 "/usr/bin/head",
                 vec!["-c", "1048577", "/dev/zero"],
+                Duration::from_secs(2),
                 MediaError::ResourceLimit,
             ),
-            ("/usr/bin/false", vec![], MediaError::ProcessFailed),
+            (
+                "/usr/bin/false",
+                vec![],
+                Duration::from_secs(2),
+                MediaError::ProcessFailed,
+            ),
         ] {
             let (guard, pid) = child(program, &arguments);
-            assert_eq!(
-                collect_output(guard, Duration::from_millis(100)).await,
-                Err(expected)
-            );
+            assert_eq!(collect_output(guard, deadline).await, Err(expected));
             assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
         }
     }

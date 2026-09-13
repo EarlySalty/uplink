@@ -418,6 +418,7 @@ impl SessionProcessor for Coordinator {
         &self,
         first: MediaEvent,
         events: tokio::sync::mpsc::Receiver<MediaEvent>,
+        source_termination: tokio::sync::watch::Receiver<uplink_media::SourceTermination>,
     ) -> Result<(), &'static str> {
         if self.state.config.test_ingest.is_some() {
             return crate::test_ingest::receive(first, events).await;
@@ -569,7 +570,14 @@ impl SessionProcessor for Coordinator {
         }
         let running = self
             .engine
-            .start_prepared_mixed(prepared, desired, programs, events, &mut diagnostic)
+            .start_prepared_mixed_with_termination(
+                prepared,
+                desired,
+                programs,
+                events,
+                source_termination,
+                &mut diagnostic,
+            )
             .map_err(|error| {
                 preparation_failure(&reservation, error, serde_json::json!(diagnostic))
             })?;

@@ -147,6 +147,37 @@ test('Chat: an updated message replaces its row and keeps order/platform separat
   assert.match(rows[0].textContent, /Fünf Geschenke/);
   assert.match(rows[1].textContent, /Anderer Chat/);
 });
+test('Chat: Twitch delete and clear-user remove matching rows and keep tombstones across replay', t => {
+  const app = dock(t, 'chat'); app.status();
+  const first = chatEvent(1, 'Wird gelöscht', 'twitch');
+  first.ereignis.message_id = 'message-delete';
+  first.ereignis.sender_id = '20';
+  const second = chatEvent(2, 'Wird per Timeout geleert', 'twitch');
+  second.ereignis.message_id = 'message-timeout';
+  second.ereignis.sender_id = '21';
+  app.message(first);
+  app.message(second);
+  assert.equal(app.document.querySelectorAll('.zeile').length, 2);
+  app.message({ id: 3, ereignis: { typ: 'chat_control', art: 'message_delete', platform: 'twitch', channel_id: '10', message_id: 'message-delete', occurred_at: new Date().toISOString(), dedupe_key: 'delete-1' } });
+  assert.equal(app.document.querySelectorAll('.zeile').length, 1);
+  app.message({ id: 4, ereignis: { typ: 'chat_control', art: 'clear_user', platform: 'twitch', channel_id: '10', target_user_id: '21', occurred_at: new Date().toISOString(), dedupe_key: 'clear-user-1' } });
+  assert.equal(app.document.querySelectorAll('.zeile').length, 0);
+  app.message({ ...second, id: 5 });
+  assert.equal(app.document.querySelectorAll('.zeile').length, 0, 'Replay darf eine gelöschte Nachricht nicht wieder einblenden');
+  const fresh = chatEvent(6, 'Neue Nachricht nach Timeout', 'twitch');
+  fresh.ereignis.message_id = 'message-fresh';
+  fresh.ereignis.sender_id = '21';
+  app.message(fresh);
+  assert.equal(app.document.querySelectorAll('.zeile').length, 1);
+});
+test('Chat: a delete arriving before the matching replay tombstones the message ID', t => {
+  const app = dock(t, 'chat'); app.status();
+  app.message({ id: 1, ereignis: { typ: 'chat_control', art: 'message_delete', platform: 'twitch', channel_id: '10', message_id: 'late-message', occurred_at: new Date().toISOString(), dedupe_key: 'delete-before-chat' } });
+  const late = chatEvent(2, 'Darf nie erscheinen', 'twitch');
+  late.ereignis.message_id = 'late-message';
+  app.message(late);
+  assert.equal(app.document.querySelectorAll('.zeile').length, 0);
+});
 test('Stream-Info: pending initial load preserves a typed title', async t => {
   const app = dock(t, 'stream-info');
   app.input('titel', 'Schon eingetippt');
@@ -251,6 +282,17 @@ test('Activity: gift updates replace the existing visible event', t => {
   app.message({ id: 3, ereignis: { ...event, count: 5 } });
   assert.equal(app.document.querySelectorAll('.eintrag').length, 1);
   assert.match(app.element('liste').textContent, /5 Abos/);
+});
+test('Activity: Twitch stream lifecycle is visible and filterable', t => {
+  const app = dock(t, 'activity'); app.status();
+  app.message({ id: 1, ereignis: { typ: 'activity', art: 'stream_online', platform: 'twitch', channel_id: '10', dedupe_key: 'online-1', occurred_at: new Date().toISOString() } });
+  app.message({ id: 2, ereignis: { typ: 'activity', art: 'stream_offline', platform: 'twitch', channel_id: '10', dedupe_key: 'offline-1', occurred_at: new Date().toISOString() } });
+  assert.match(app.element('liste').textContent, /live gegangen/);
+  assert.match(app.element('liste').textContent, /beendet/);
+  const streamButton = [...app.document.querySelectorAll('.chip')].find(button => button.textContent.includes('Stream'));
+  assert.ok(streamButton);
+  streamButton.click();
+  assert.equal([...app.document.querySelectorAll('.eintrag')].filter(row => row.style.display !== 'none').length, 2);
 });
 test('Docks: markup has no remote scripts or remote fonts', () => {
   for (const name of ['chat', 'activity', 'points', 'stream-info']) {

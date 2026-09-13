@@ -116,6 +116,8 @@ const TIMESTAMP_TOLERANCE_MS: u32 = 2_000;
 const TIMESTAMP_CLAMP_LIMIT: usize = 50;
 const TIMESTAMP_CLAMP_WINDOW: Duration = Duration::from_secs(60);
 const TIMESTAMP_TRACE_LIMIT: usize = 8;
+const MEDIA_GAP_TRACE_LIMIT: usize = 32;
+const MEDIA_GAP_THRESHOLD: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TimestampDiagnostic {
@@ -149,6 +151,17 @@ impl TimestampClamps {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MediaGapDiagnostic {
+    /// Zeitpunkt des ersten neuen Medienpakets nach der Lücke, relativ zum Sessionstart.
+    pub recovered_at_ms: u128,
+    /// Zeit seit dem letzten abspielbaren Medienpaket.
+    pub gap_ms: u128,
+    /// Spur, auf der nach der Lücke wieder Medien ankamen.
+    pub recovered_track: WireTrack,
+    pub recovered_event_kind: EventKind,
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionReport {
     pub reason: EndReason,
@@ -164,6 +177,10 @@ pub struct SessionReport {
     pub timestamp_clamps: u64,
     pub timestamp_rejection: Option<TimestampDiagnostic>,
     pub timestamp_tail: VecDeque<TimestampDiagnostic>,
+    /// Begrenzte Diagnose auffälliger Empfangslücken; enthält keine Mediendaten.
+    pub media_gaps: VecDeque<MediaGapDiagnostic>,
+    pub media_gap_count: u64,
+    pub max_media_gap_ms: u128,
 }
 
 /// Ausschließlich empfangene Wire-Metadaten, kein vollständiges Planner-Profil.
@@ -369,6 +386,9 @@ impl<A: Authorizer> IngestServer<A> {
             timestamp_clamps: 0,
             timestamp_rejection: None,
             timestamp_tail: VecDeque::new(),
+            media_gaps: VecDeque::new(),
+            media_gap_count: 0,
+            max_media_gap_ms: 0,
         }));
         let task = tokio::spawn(run_connection(
             socket,
@@ -504,6 +524,7 @@ impl<A: Authorizer> Drop for AuthorizationCompletion<A> {
 #[derive(Clone, Copy)]
 struct Activity {
     published: bool,
+    media_seen: bool,
     last_media: Instant,
 }
 impl<A: Authorizer> Handler<A> {
@@ -674,6 +695,7 @@ impl<A: Authorizer> Handler<A> {
         if let Some(track) = track {
             self.tracks.insert(parsed.track, track);
         }
+        let mut recovered_gap = None;
         let mut report = self.report.lock().unwrap_or_else(|e| e.into_inner());
         report.timestamp_tail = self.timestamp_tail.clone();
         report.received_events += 1;
@@ -686,10 +708,42 @@ impl<A: Authorizer> Handler<A> {
             parsed.event_kind,
             EventKind::SequenceHeader | EventKind::Frame
         ) {
-            self.status.send_replace(Activity {
+            let now = Instant::now();
+            let previous = self.status.send_replace(Activity {
                 published: true,
-                last_media: Instant::now(),
+                media_seen: true,
+                last_media: now,
             });
+            if previous.media_seen {
+                let gap = now.saturating_duration_since(previous.last_media);
+                if gap >= MEDIA_GAP_THRESHOLD {
+                    let diagnostic = MediaGapDiagnostic {
+                        recovered_at_ms: self.started.elapsed().as_millis(),
+                        gap_ms: gap.as_millis(),
+                        recovered_track: parsed.track,
+                        recovered_event_kind: parsed.event_kind,
+                    };
+                    report.media_gap_count = report.media_gap_count.saturating_add(1);
+                    if report.media_gaps.len() == MEDIA_GAP_TRACE_LIMIT {
+                        report.media_gaps.pop_front();
+                    }
+                    report.max_media_gap_ms = report.max_media_gap_ms.max(gap.as_millis());
+                    report.media_gaps.push_back(diagnostic);
+                    recovered_gap = Some(diagnostic);
+                }
+            }
+        }
+        drop(report);
+        if let Some(gap) = recovered_gap {
+            eprintln!(
+                "Uplink-Medienlücke überwunden: streamer_id={} session_id={} gap_ms={} recovered_at_ms={} track={:?} event={:?}",
+                session.tenant_id(),
+                session.session_id(),
+                gap.gap_ms,
+                gap.recovered_at_ms,
+                gap.recovered_track,
+                gap.recovered_event_kind,
+            );
         }
         Ok(())
     }
@@ -722,6 +776,7 @@ impl<A: Authorizer> SessionHandler for Handler<A> {
         self.retention = self.authorizer.retention(session);
         self.status.send_replace(Activity {
             published: true,
+            media_seen: false,
             last_media: Instant::now(),
         });
         Ok(())
@@ -811,6 +866,7 @@ async fn run_connection<A: Authorizer>(
         Ok(Ok(socket)) => {
             let (status, mut activity) = watch::channel(Activity {
                 published: false,
+                media_seen: false,
                 last_media: Instant::now(),
             });
             let generation = report.lock().unwrap_or_else(|e| e.into_inner()).generation;
@@ -905,11 +961,15 @@ mod tests {
             timestamp_clamps: 0,
             timestamp_rejection: None,
             timestamp_tail: VecDeque::new(),
+            media_gaps: VecDeque::new(),
+            media_gap_count: 0,
+            max_media_gap_ms: 0,
         }));
         let budget = Arc::new(Semaphore::new(limits.max_queued_bytes));
         let (sender, mut receiver) = mpsc::channel(1);
         let (status, _) = watch::channel(Activity {
             published: true,
+            media_seen: false,
             last_media: Instant::now(),
         });
         let mut handler = Handler {
@@ -949,6 +1009,92 @@ mod tests {
         producer.join().unwrap().unwrap();
         assert_eq!(report.lock().unwrap().max_queued_bytes, 4);
     }
+    #[test]
+    fn media_gap_trace_records_only_timing_metadata_after_recovery() {
+        let limits = IngestLimits::local_probe();
+        let generation = ConnectionGeneration {
+            instance: [0; 16],
+            counter: 1,
+        };
+        let report = Arc::new(Mutex::new(SessionReport {
+            reason: EndReason::ProtocolRejected,
+            duration: Duration::ZERO,
+            generation,
+            received_events: 0,
+            received_bytes: 0,
+            max_queued_bytes: 0,
+            track_count: 0,
+            ignored_amf_messages: 0,
+            timestamp_clamps: 0,
+            timestamp_rejection: None,
+            timestamp_tail: VecDeque::new(),
+            media_gaps: VecDeque::new(),
+            media_gap_count: 0,
+            max_media_gap_ms: 0,
+        }));
+        let (sender, mut receiver) = mpsc::channel(4);
+        let (status, _) = watch::channel(Activity {
+            published: true,
+            media_seen: false,
+            last_media: Instant::now(),
+        });
+        let mut handler = Handler {
+            authorizer: Arc::new(UnusedAuthorizer),
+            retention: None,
+            session: Some((1, AuthorizedSession::new(1, 1).unwrap())),
+            completion_session: Arc::new(Mutex::new(None)),
+            generation,
+            tracks: HashMap::new(),
+            started: Instant::now(),
+            timestamp_clamps: TimestampClamps::default(),
+            timestamp_tail: VecDeque::new(),
+            limits: limits.clone(),
+            sender,
+            budget: Arc::new(Semaphore::new(limits.max_queued_bytes)),
+            status,
+            report: report.clone(),
+            event_budget: Arc::new(Semaphore::new(limits.max_queued_events)),
+            slot: Arc::new(SessionSlot::empty()),
+            pending: None,
+            session_slots: Arc::new(Semaphore::new(1)),
+        };
+        handler
+            .media(
+                1,
+                MediaKind::Audio,
+                0,
+                Bytes::from_static(&[0xaf, 0, 0x11, 0x90]),
+            )
+            .unwrap();
+        drop(receiver.blocking_recv().unwrap());
+        assert!(report.lock().unwrap().media_gaps.is_empty());
+
+        handler.status.send_replace(Activity {
+            published: true,
+            media_seen: true,
+            last_media: Instant::now() - Duration::from_millis(750),
+        });
+        handler
+            .media(
+                1,
+                MediaKind::Audio,
+                20,
+                Bytes::from_static(&[0xaf, 1, 0x01]),
+            )
+            .unwrap();
+        drop(receiver.blocking_recv().unwrap());
+
+        let report = report.lock().unwrap();
+        assert_eq!(report.media_gaps.len(), 1);
+        assert_eq!(report.media_gap_count, 1);
+        let gap = report.media_gaps[0];
+        assert!(gap.gap_ms >= 750 && gap.gap_ms < 2_000);
+        assert_eq!(gap.recovered_track.kind, MediaKind::Audio);
+        assert_eq!(gap.recovered_track.wire_id, 0);
+        assert_eq!(gap.recovered_event_kind, EventKind::Frame);
+        assert_eq!(report.max_media_gap_ms, gap.gap_ms);
+    }
+
     #[test]
     fn timestamp_clamp_window_is_sliding_bounded_and_expires_at_sixty_seconds() {
         let mut clamps = TimestampClamps::default();

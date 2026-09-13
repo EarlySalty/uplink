@@ -190,6 +190,40 @@ async fn native_rtmps_preserves_av1_h264_and_two_aac_tracks_exactly() {
 }
 
 #[tokio::test]
+async fn interrupted_source_closes_transport_without_explicit_unpublish() {
+    let (server, target, _) = test_target("localhost", true).await;
+    let capture = tokio::spawn(async move {
+        let mut connection = server.accept().await.unwrap();
+        while connection.next().await.is_some() {}
+        connection.finish().await
+    });
+    let pusher = timeout(
+        Duration::from_secs(5),
+        RunningPusher::start(target, MediaLimits::default()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(pusher.status().state, OutputState::Publishing);
+
+    let status = timeout(Duration::from_secs(5), pusher.interrupt())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status.state, OutputState::Interrupted);
+
+    let report = timeout(Duration::from_secs(5), capture)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        report.reason,
+        EndReason::PeerClosed,
+        "Ein Internet-Hickup darf beim Ziel nicht wie ExplicitStop/deleteStream aussehen"
+    );
+}
+
+#[tokio::test]
 async fn queued_short_stream_finishes_after_delayed_publish_without_losing_headers_or_audio() {
     let (server, target, _) = test_target("localhost", true).await;
     let (release, wait) = tokio::sync::oneshot::channel();

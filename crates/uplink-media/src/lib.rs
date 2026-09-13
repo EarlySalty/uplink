@@ -333,10 +333,24 @@ pub struct OutputStatus {
 pub enum OutputState {
     Starting,
     Publishing,
+    /// Die Quelle ist unerwartet abgerissen. Der Plattformtransport wurde
+    /// absichtlich ohne RTMP-deleteStream geschlossen, damit eine vorhandene
+    /// plattformseitige Disconnect-Protection den Reconnect übernehmen kann.
+    Interrupted,
     /// Lokal vollständig geschrieben und Verbindung beendet. Entfernte
     /// Medienannahme, Verarbeitung und Veröffentlichung bleiben unbestätigt.
     LocalEndUnconfirmed,
     Failed(MediaError),
+}
+
+/// Wie ein geschlossenes Eingangs-Eventstream zu behandeln ist. Ein normaler
+/// Abschluss darf der Plattform das Ende signalisieren; bei einer unerwarteten
+/// Unterbrechung darf genau dieses Signal nicht gesendet werden.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SourceTermination {
+    #[default]
+    Graceful,
+    Interrupted,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]

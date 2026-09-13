@@ -127,7 +127,9 @@ impl RunningPusher {
             match self.status.borrow().state {
                 OutputState::Publishing => return Ok(()),
                 OutputState::Failed(error) => return Err(error),
-                OutputState::LocalEndUnconfirmed => return Err(MediaError::Cancelled),
+                OutputState::Interrupted | OutputState::LocalEndUnconfirmed => {
+                    return Err(MediaError::Cancelled);
+                }
                 OutputState::Starting => {}
             }
             self.status
@@ -189,7 +191,35 @@ impl RunningPusher {
         self.task.take();
         report
     }
-    /// Sofortiger expliziter Abbruch; wartet auf die Freigabe der Verbindung.
+    /// Unerwartetes Quellenende: Transport sofort schließen, aber bewusst kein
+    /// RTMP-deleteStream senden. Das unterscheidet einen Internet-Hickup vom
+    /// absichtlichen Streamende und lässt die Plattform ihren Reconnect-Schutz
+    /// anwenden. `Cancelled` ist hier der erwartete lokale Abbruch, kein Fehler.
+    pub async fn interrupt(mut self) -> Result<OutputStatus> {
+        self.sender.take();
+        self.cancel();
+        let task = self.task.as_mut().ok_or(MediaError::Cancelled)?;
+        let report = timeout(self.shutdown_timeout, task)
+            .await
+            .map_err(|_| MediaError::ProcessCleanupFailed)?
+            .map_err(|_| MediaError::ProcessCleanupFailed)?;
+        self.task.take();
+        match report {
+            Ok(mut status) => {
+                status.state = OutputState::Interrupted;
+                Ok(status)
+            }
+            Err(MediaError::Cancelled) => {
+                let mut status = self.status.borrow().clone();
+                status.state = OutputState::Interrupted;
+                Ok(status)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Sofortiger expliziter Abbruch wegen eines lokalen Fehlers; wartet auf die
+    /// Freigabe der Verbindung und bleibt als Fehler sichtbar.
     pub async fn stop(mut self) -> Result<OutputStatus> {
         self.sender.take();
         self.cancel();

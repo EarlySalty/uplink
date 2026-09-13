@@ -44,8 +44,12 @@ jobs:
           sudo install -D -m 0755 "$media_tmp/ffmpeg" /opt/uplink/media/ffmpeg8-c733b4b2/ffmpeg
           sudo install -D -m 0755 "$media_tmp/ffprobe" /opt/uplink/media/ffmpeg8-c733b4b2/ffprobe
           cargo test -p uplink-service --test normalbetrieb --locked -j2 -- --ignored --test-threads=1
+      - name: Debug-Artefakte vor Medien-Regressionen freigeben
+        run: cargo clean --manifest-path Cargo.toml --profile dev --target-dir target
       - name: Vier echte FFmpeg-Regressionen für Audioauswahl und AAC-Erhalt
         run: cargo test -p uplink-media --lib prepare::review_tests --locked -j2 -- --ignored --test-threads=1
+      - name: Medien-Debug-Artefakte vor Release freigeben
+        run: cargo clean --manifest-path Cargo.toml --profile dev --target-dir target
       - name: Release-Build
         run: cargo build --workspace --release --locked -j2
       - name: Gekoppeltes Releasepaket einschließlich Bridge und TLS-Provider
