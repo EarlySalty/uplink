@@ -109,9 +109,11 @@ impl MediaEngine {
             input,
             VecDeque::new(),
             None,
+            None,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn start_graph(
         &self,
         identity: TrackIdentity,
@@ -120,6 +122,7 @@ impl MediaEngine {
         input: mpsc::Receiver<MediaEvent>,
         prefix: VecDeque<MediaEvent>,
         observation: Option<SourceObservation>,
+        source_termination: Option<watch::Receiver<SourceTermination>>,
     ) -> Result<RunningMedia> {
         if graph.profiles.len() > self.config.limits.max_encode_groups
             || routes.len() > self.config.limits.max_outputs
@@ -152,7 +155,15 @@ impl MediaEngine {
         let config = self.config.clone();
         let task = tokio::spawn(async move {
             run(
-                config, identity, routes, graph, input, prefix, status_tx, stopped,
+                config,
+                identity,
+                routes,
+                graph,
+                input,
+                prefix,
+                status_tx,
+                stopped,
+                source_termination,
             )
             .await
         });
@@ -266,8 +277,10 @@ async fn run(
     mut prefix: VecDeque<MediaEvent>,
     status: watch::Sender<MediaStatus>,
     mut stopped: watch::Receiver<bool>,
+    source_termination: Option<watch::Receiver<SourceTermination>>,
 ) -> MediaReport {
     let mut error = None;
+    let mut source_interrupted = false;
     let origin = if graph.profiles.is_empty() {
         Some(0)
     } else {
@@ -391,14 +404,23 @@ async fn run(
             result = consume(identity,&graph,&mut input,&mut prefix,&mut worker_input,&sinks,&status,&config.limits) => result,
             _ = stopped.changed() => Err(MediaError::Cancelled),
         };
-        if let Err(reason) = consumed {
-            error = Some(reason);
+        match consumed {
+            Ok(()) => {
+                source_interrupted = source_termination.as_ref().is_some_and(|termination| {
+                    *termination.borrow() == SourceTermination::Interrupted
+                });
+            }
+            Err(reason) => error = Some(reason),
         }
     }
     drop(worker_input.take());
     if let Some(mut child) = worker
-        && let Err(reason) =
-            cleanup(&mut child, config.limits.shutdown_timeout, error.is_some()).await
+        && let Err(reason) = cleanup(
+            &mut child,
+            config.limits.shutdown_timeout,
+            error.is_some() || source_interrupted,
+        )
+        .await
     {
         error.get_or_insert(reason);
     }
@@ -439,6 +461,8 @@ async fn run(
         finishing.spawn(async move {
             let final_state = if failure.is_some() {
                 pusher.stop().await
+            } else if source_interrupted {
+                pusher.interrupt().await
             } else {
                 pusher.finish().await
             };
@@ -862,6 +886,7 @@ mod tests {
                     graph,
                     receiver,
                     VecDeque::from([first]),
+                    None,
                     None,
                 )
                 .unwrap();

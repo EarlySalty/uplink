@@ -323,6 +323,7 @@ impl MediaEngine {
             input,
             prepared.prefix,
             Some(prepared.observation),
+            None,
         )
     }
 
@@ -356,6 +357,7 @@ impl MediaEngine {
             input,
             prepared.prefix,
             Some(prepared.observation),
+            None,
         )
     }
 
@@ -546,6 +548,37 @@ impl MediaEngine {
         input: mpsc::Receiver<MediaEvent>,
         diagnostic: &mut PreparationDiagnostic,
     ) -> Result<RunningMedia> {
+        self.start_prepared_mixed_inner(prepared, desired, outputs, input, None, diagnostic)
+    }
+
+    pub fn start_prepared_mixed_with_termination(
+        &self,
+        prepared: PreparedSource,
+        desired: Vec<crate::DesiredOutput>,
+        outputs: Vec<ProgramOutput>,
+        input: mpsc::Receiver<MediaEvent>,
+        source_termination: tokio::sync::watch::Receiver<SourceTermination>,
+        diagnostic: &mut PreparationDiagnostic,
+    ) -> Result<RunningMedia> {
+        self.start_prepared_mixed_inner(
+            prepared,
+            desired,
+            outputs,
+            input,
+            Some(source_termination),
+            diagnostic,
+        )
+    }
+
+    fn start_prepared_mixed_inner(
+        &self,
+        prepared: PreparedSource,
+        desired: Vec<crate::DesiredOutput>,
+        outputs: Vec<ProgramOutput>,
+        input: mpsc::Receiver<MediaEvent>,
+        source_termination: Option<tokio::sync::watch::Receiver<SourceTermination>>,
+        diagnostic: &mut PreparationDiagnostic,
+    ) -> Result<RunningMedia> {
         diagnostic.phase = "graph";
         let count = desired.len().saturating_add(outputs.len());
         if count == 0 || count > self.config.limits.max_outputs {
@@ -569,6 +602,7 @@ impl MediaEngine {
             input,
             prepared.prefix,
             Some(prepared.observation),
+            source_termination,
         )
     }
 }

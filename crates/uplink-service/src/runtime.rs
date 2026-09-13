@@ -28,15 +28,20 @@ fn ingest_completion_diagnostic(
     timestamp_clamps: u64,
     timestamp_rejection: Option<uplink_ingest::TimestampDiagnostic>,
     timestamp_tail: &std::collections::VecDeque<uplink_ingest::TimestampDiagnostic>,
+    media_gaps: &std::collections::VecDeque<uplink_ingest::MediaGapDiagnostic>,
+    media_gap_count: u64,
+    max_media_gap_ms: u128,
 ) -> String {
     let ending = match reason {
-        uplink_ingest::EndReason::ExplicitStop | uplink_ingest::EndReason::PeerClosed => {
-            "Streamer hat beendet"
-        }
+        uplink_ingest::EndReason::ExplicitStop => "Streamer hat ausdrücklich beendet",
+        uplink_ingest::EndReason::PeerClosed => "Transport unerwartet getrennt",
+        uplink_ingest::EndReason::MediaTimeout => "Medienfluss abgerissen",
         _ => "Eingang beendet",
     };
+    let media_gap_tail: Vec<_> = media_gaps.iter().rev().take(8).copied().collect();
     format!(
-        " Abschluss={ending}; timestamp_clamps={timestamp_clamps} timestamp_rejection={timestamp_rejection:?} timestamp_tail={timestamp_tail:?}"
+        " Abschluss={ending}; timestamp_clamps={timestamp_clamps} timestamp_rejection={timestamp_rejection:?} timestamp_tail={timestamp_tail:?} media_gap_count={} max_media_gap_ms={max_media_gap_ms} media_gap_tail={media_gap_tail:?}",
+        media_gap_count
     )
 }
 
@@ -171,6 +176,9 @@ impl Authorizer for ServiceAuthorizer {
                         report.timestamp_clamps,
                         report.timestamp_rejection,
                         &report.timestamp_tail,
+                        &report.media_gaps,
+                        report.media_gap_count,
+                        report.max_media_gap_ms,
                     )
                 })
                 .unwrap_or_default();
@@ -230,7 +238,18 @@ pub trait SessionProcessor: Send + Sync + 'static {
         &self,
         first: MediaEvent,
         events: mpsc::Receiver<MediaEvent>,
+        source_termination: tokio::sync::watch::Receiver<uplink_media::SourceTermination>,
     ) -> impl Future<Output = Result<(), &'static str>> + Send;
+}
+
+fn source_termination(reason: uplink_ingest::EndReason) -> uplink_media::SourceTermination {
+    match reason {
+        uplink_ingest::EndReason::PeerClosed
+        | uplink_ingest::EndReason::MediaTimeout
+        | uplink_ingest::EndReason::ProtocolTimeout
+        | uplink_ingest::EndReason::TaskFailed => uplink_media::SourceTermination::Interrupted,
+        _ => uplink_media::SourceTermination::Graceful,
+    }
 }
 
 pub async fn serve<P: SessionProcessor>(
@@ -346,12 +365,17 @@ pub async fn serve_with_ready<P: SessionProcessor>(
                     reservation.generation(first.identity.generation);
                     reservation.record(first.wire_body().len());
                     let (sender, receiver) = mpsc::channel(256);
-                    let processing = processor.process(first, receiver);
+                    let (termination_tx, termination_rx) =
+                        tokio::sync::watch::channel(uplink_media::SourceTermination::Graceful);
+                    let processing = processor.process(first, receiver, termination_rx);
                     tokio::pin!(processing);
+                    let mut connection = Some(connection);
                     loop {
                         tokio::select! {
                             _=media_stopped.changed()=>{
-                                connection.stop_consumer();
+                                if let Some(connection) = connection.as_ref() {
+                                    connection.stop_consumer();
+                                }
                                 drop(sender);
                                 match tokio::time::timeout(coordinator_grace,processing).await {
                                     Ok(Err(error)) => reservation.fail(error),
@@ -361,15 +385,22 @@ pub async fn serve_with_ready<P: SessionProcessor>(
                                 break;
                             }
                             result = &mut processing => { if let Err(error)=result { reservation.fail(error); } break; }
-                            event = connection.next() => {
+                            event = connection.as_mut().expect("aktive Ingestverbindung").next() => {
                                 let Some(event) = event else {
+                                    let report = connection
+                                        .take()
+                                        .expect("beendete Ingestverbindung")
+                                        .finish()
+                                        .await;
+                                    termination_tx.send_replace(source_termination(report.reason));
                                     drop(sender);
                                     match tokio::time::timeout(coordinator_grace,processing).await {
                                         Ok(Err(error)) => reservation.fail(error),
                                         Err(_) => reservation.fail("Medienausgabe konnte nach dem Eingangsende nicht rechtzeitig schließen."),
                                         Ok(Ok(())) => {}
                                     }
-                                    break;
+                                    reservation.ended();
+                                    return;
                                 };
                                 reservation.record(event.wire_body().len());
                                 if let Err(error) = sender.try_send(event) {
@@ -380,7 +411,9 @@ pub async fn serve_with_ready<P: SessionProcessor>(
                                         mpsc::error::TrySendError::Closed(_) => "Medienverarbeitung hat den Eingang geschlossen.",
                                         mpsc::error::TrySendError::Full(_) => "Medienverarbeitung hat ihr Eingangsbudget ausgeschöpft.",
                                     };
-                                    connection.stop_consumer();
+                                    if let Some(connection) = connection.as_ref() {
+                                        connection.stop_consumer();
+                                    }
                                     drop(sender);
                                     match tokio::time::timeout(coordinator_grace,processing).await {
                                         Ok(Err(error)) => reservation.fail(error),
@@ -391,7 +424,9 @@ pub async fn serve_with_ready<P: SessionProcessor>(
                             }
                         }
                     }
-                    let _ = connection.finish_consumer().await;
+                    if let Some(connection) = connection {
+                        let _ = connection.finish_consumer().await;
+                    }
                     reservation.ended();
                 });
             }
@@ -431,6 +466,35 @@ mod timestamp_diagnostic_tests {
     };
 
     #[test]
+    fn only_an_explicit_obs_stop_is_a_graceful_platform_end() {
+        for reason in [
+            EndReason::PeerClosed,
+            EndReason::MediaTimeout,
+            EndReason::ProtocolTimeout,
+            EndReason::TaskFailed,
+        ] {
+            assert_eq!(
+                source_termination(reason),
+                uplink_media::SourceTermination::Interrupted,
+                "{reason:?} darf der Plattform kein absichtliches Streamende signalisieren"
+            );
+        }
+        for reason in [
+            EndReason::ExplicitStop,
+            EndReason::MediaRejected(MediaError::TimestampRegression),
+            EndReason::Backpressure,
+            EndReason::ConsumerClosed,
+            EndReason::ProtocolRejected,
+        ] {
+            assert_eq!(
+                source_termination(reason),
+                uplink_media::SourceTermination::Graceful,
+                "{reason:?} ist kein reconnect-fähiger Transport-Hickup"
+            );
+        }
+    }
+
+    #[test]
     fn completion_line_keeps_full_numeric_packet_diagnostic_and_distinguishes_stops() {
         let diagnostic = TimestampDiagnostic {
             track: WireTrack {
@@ -445,11 +509,15 @@ mod timestamp_diagnostic_tests {
             path: "server.rs",
         };
         let tail = [diagnostic].into();
+        let gaps = std::collections::VecDeque::new();
         let line = ingest_completion_diagnostic(
             EndReason::MediaRejected(MediaError::TimestampRegression),
             50,
             Some(diagnostic),
             &tail,
+            &gaps,
+            0,
+            0,
         );
         for expected in [
             "kind: Video",
@@ -468,12 +536,14 @@ mod timestamp_diagnostic_tests {
                 "fehlendes Abschlussfeld {expected}: {line}"
             );
         }
-        assert!(!line.contains("Streamer hat beendet"));
-        for reason in [EndReason::ExplicitStop, EndReason::PeerClosed] {
-            assert!(
-                ingest_completion_diagnostic(reason, 0, None, &tail)
-                    .contains("Streamer hat beendet")
-            );
-        }
+        assert!(!line.contains("Streamer hat ausdrücklich beendet"));
+        assert!(
+            ingest_completion_diagnostic(EndReason::ExplicitStop, 0, None, &tail, &gaps, 0, 0,)
+                .contains("Streamer hat ausdrücklich beendet")
+        );
+        assert!(
+            ingest_completion_diagnostic(EndReason::PeerClosed, 0, None, &tail, &gaps, 0, 0,)
+                .contains("Transport unerwartet getrennt")
+        );
     }
 }

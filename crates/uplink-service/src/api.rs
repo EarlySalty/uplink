@@ -644,6 +644,12 @@ fn output_status(
             "failed",
             Some(crate::media_status::failure_reason(&value["failed"])),
         ),
+        Some(value) if value == "interrupted" => (
+            "finished",
+            Some(
+                "Quellverbindung unerwartet unterbrochen; die Plattform wurde nicht aktiv beendet und kann einen schnellen OBS-Reconnect übernehmen.",
+            ),
+        ),
         Some(value) if value == "ended" || value == "local_end_unconfirmed" => (
             "finished",
             Some("Lokaler Versand beendet; Plattformannahme ist nicht bestätigt."),

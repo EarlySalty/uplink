@@ -14,6 +14,7 @@ impl uplink_service::runtime::SessionProcessor for RejectOutput {
         &self,
         first: uplink_ingest::MediaEvent,
         _: tokio::sync::mpsc::Receiver<uplink_ingest::MediaEvent>,
+        _source_termination: tokio::sync::watch::Receiver<uplink_media::SourceTermination>,
     ) -> Result<(), &'static str> {
         first.authorization_retention().unwrap().downcast::<uplink_service::registry::Reservation>().unwrap()
             .media_diagnostic(serde_json::json!({"phase":"prepare","error":"UnsupportedProfile","probe":{"pix_fmt":"nv12"}}));
@@ -389,6 +390,7 @@ impl uplink_service::runtime::SessionProcessor for DelayedCleanup {
         &self,
         first: uplink_ingest::MediaEvent,
         events: tokio::sync::mpsc::Receiver<uplink_ingest::MediaEvent>,
+        _source_termination: tokio::sync::watch::Receiver<uplink_media::SourceTermination>,
     ) -> Result<(), &'static str> {
         let receiver = if self.keep_receiver {
             Some(events)
