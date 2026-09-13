@@ -179,13 +179,57 @@ impl ChatNachricht {
     }
 }
 
+/// Steuerereignisse, die bereits angezeigte Chatzeilen veraendern. Sie sind
+/// bewusst eigene Drahtobjekte statt erfundene Chatnachrichten: ein Delete
+/// hat keinen Nachrichtentext, ein Clear keine einzelne Nachrichten-ID.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "art")]
+pub enum ChatSteuerung {
+    #[serde(rename = "message_delete")]
+    NachrichtLoeschen {
+        platform: Platform,
+        channel_id: String,
+        message_id: String,
+        occurred_at: DateTime<Utc>,
+        dedupe_key: String,
+    },
+    #[serde(rename = "clear_user")]
+    NutzerLeeren {
+        platform: Platform,
+        channel_id: String,
+        target_user_id: String,
+        occurred_at: DateTime<Utc>,
+        dedupe_key: String,
+    },
+    #[serde(rename = "clear")]
+    ChatLeeren {
+        platform: Platform,
+        channel_id: String,
+        occurred_at: DateTime<Utc>,
+        dedupe_key: String,
+    },
+}
+
+impl ChatSteuerung {
+    pub fn dedupe_key(&self) -> &str {
+        match self {
+            Self::NachrichtLoeschen { dedupe_key, .. }
+            | Self::NutzerLeeren { dedupe_key, .. }
+            | Self::ChatLeeren { dedupe_key, .. } => dedupe_key,
+        }
+    }
+}
+
 /// Was ueber den Bus und den WebSocket geht. Tag `typ`, wie beim Bot
-/// (`chat`, `activity`, `info`); `points` kennt nur das Relay.
+/// (`chat`, `activity`, `info`); `points` und `chat_control` sind Uplink-
+/// Erweiterungen. `chat_control` gehoert fachlich zum Chatfilter.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "typ")]
 pub enum Ereignis {
     #[serde(rename = "chat")]
     Chat(ChatNachricht),
+    #[serde(rename = "chat_control")]
+    ChatSteuerung(ChatSteuerung),
     #[serde(rename = "activity")]
     Activity(crate::ereignis::ActivityEvent),
     #[serde(rename = "points")]
@@ -198,6 +242,7 @@ impl Ereignis {
     pub fn dedupe_key(&self) -> String {
         match self {
             Self::Chat(n) => n.dedupe_key(),
+            Self::ChatSteuerung(s) => s.dedupe_key().to_owned(),
             Self::Activity(a) => a.meta().dedupe_key.clone(),
             Self::Punkte(p) => p.meta().dedupe_key.clone(),
             Self::Info(i) => i.dedupe_key(),

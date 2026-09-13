@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use crate::Platform;
 use crate::ereignis::{ActivityEvent, ActivityMeta, Actor, PunkteEreignis, StreamInfo};
-use crate::nachricht::Ereignis;
+use crate::nachricht::{ChatSteuerung, Ereignis, dedupe_key};
 
 fn str_field(value: &Value, keys: &[&str]) -> Option<String> {
     for key in keys {
@@ -108,6 +108,11 @@ pub fn uebersetzen(
         "channel.cheer" => cheer(event, message_id, jetzt),
         "channel.raid" => raid(event, message_id, jetzt),
         "channel.update" => channel_update(event),
+        "channel.chat.message_delete" => chat_message_delete(event, jetzt),
+        "channel.chat.clear_user_messages" => chat_clear_user(event, message_id, jetzt),
+        "channel.chat.clear" => chat_clear(event, message_id, jetzt),
+        "stream.online" => stream_online(event, message_id, jetzt),
+        "stream.offline" => stream_offline(event, message_id, jetzt),
         "channel.channel_points_custom_reward_redemption.add"
         | "channel.channel_points_custom_reward_redemption.update" => redemption(event, jetzt),
         _ => None,
@@ -238,6 +243,82 @@ fn raid(event: &Value, message_id: Option<&str>, jetzt: DateTime<Utc>) -> Option
         from: from_login,
         viewers: u32_field(event, &["viewers", "viewer_count"]).unwrap_or(0),
     }))
+}
+
+fn chat_message_delete(event: &Value, jetzt: DateTime<Utc>) -> Option<Ereignis> {
+    let channel_id = str_field(event, &["broadcaster_user_id"])?;
+    let message_id = str_field(event, &["message_id"])?;
+    Some(Ereignis::ChatSteuerung(ChatSteuerung::NachrichtLoeschen {
+        dedupe_key: dedupe_key(Platform::Twitch, &channel_id, "chat_delete", &message_id),
+        platform: Platform::Twitch,
+        channel_id,
+        message_id,
+        occurred_at: jetzt,
+    }))
+}
+
+fn chat_clear_user(
+    event: &Value,
+    message_id: Option<&str>,
+    jetzt: DateTime<Utc>,
+) -> Option<Ereignis> {
+    let channel_id = str_field(event, &["broadcaster_user_id"])?;
+    let target_user_id = str_field(event, &["target_user_id"])?;
+    Some(Ereignis::ChatSteuerung(ChatSteuerung::NutzerLeeren {
+        dedupe_key: dedupe_key(
+            Platform::Twitch,
+            &channel_id,
+            "chat_clear_user",
+            &kennzeichen(message_id, jetzt),
+        ),
+        platform: Platform::Twitch,
+        channel_id,
+        target_user_id,
+        occurred_at: jetzt,
+    }))
+}
+
+fn chat_clear(event: &Value, message_id: Option<&str>, jetzt: DateTime<Utc>) -> Option<Ereignis> {
+    let channel_id = str_field(event, &["broadcaster_user_id"])?;
+    Some(Ereignis::ChatSteuerung(ChatSteuerung::ChatLeeren {
+        dedupe_key: dedupe_key(
+            Platform::Twitch,
+            &channel_id,
+            "chat_clear",
+            &kennzeichen(message_id, jetzt),
+        ),
+        platform: Platform::Twitch,
+        channel_id,
+        occurred_at: jetzt,
+    }))
+}
+
+fn stream_online(
+    event: &Value,
+    message_id: Option<&str>,
+    jetzt: DateTime<Utc>,
+) -> Option<Ereignis> {
+    let zeit = str_field(event, &["started_at"])
+        .and_then(|t| t.parse::<DateTime<Utc>>().ok())
+        .unwrap_or(jetzt);
+    let id = str_field(event, &["id"]).unwrap_or_else(|| kennzeichen(message_id, jetzt));
+    let meta = meta(event, "stream_online", &id, zeit, None)?;
+    Some(Ereignis::Activity(ActivityEvent::StreamOnline { meta }))
+}
+
+fn stream_offline(
+    event: &Value,
+    message_id: Option<&str>,
+    jetzt: DateTime<Utc>,
+) -> Option<Ereignis> {
+    let meta = meta(
+        event,
+        "stream_offline",
+        &kennzeichen(message_id, jetzt),
+        jetzt,
+        None,
+    )?;
+    Some(Ereignis::Activity(ActivityEvent::StreamOffline { meta }))
 }
 
 /// `channel.update` wird zur Momentaufnahme fuer das Stream-Info-Dock.
@@ -506,6 +587,81 @@ mod tests {
             panic!()
         };
         assert_eq!(info.dedupe_key(), nochmal.dedupe_key());
+    }
+
+    #[test]
+    fn chat_loeschungen_bleiben_eigene_steuerereignisse() {
+        let e = mit(json!({
+            "target_user_id": "777",
+            "target_user_login": "zuschauer",
+            "target_user_name": "Zuschauer",
+            "message_id": "chat-42"
+        }));
+        let Some(Ereignis::ChatSteuerung(ChatSteuerung::NachrichtLoeschen {
+            platform,
+            channel_id,
+            message_id,
+            dedupe_key: key,
+            ..
+        })) = uebersetzen(
+            "channel.chat.message_delete",
+            &e,
+            Some("evt-delete"),
+            zeitpunkt(),
+        )
+        else {
+            panic!("chat_control erwartet")
+        };
+        assert_eq!(platform, Platform::Twitch);
+        assert_eq!(channel_id, "12345");
+        assert_eq!(message_id, "chat-42");
+        assert_eq!(key, "twitch:12345:chat_delete:chat-42");
+
+        let Some(Ereignis::ChatSteuerung(ChatSteuerung::NutzerLeeren {
+            target_user_id,
+            dedupe_key: key,
+            ..
+        })) = uebersetzen(
+            "channel.chat.clear_user_messages",
+            &e,
+            Some("evt-user-clear"),
+            zeitpunkt(),
+        )
+        else {
+            panic!("clear_user erwartet")
+        };
+        assert_eq!(target_user_id, "777");
+        assert_eq!(key, "twitch:12345:chat_clear_user:evt-user-clear");
+
+        let Some(Ereignis::ChatSteuerung(ChatSteuerung::ChatLeeren {
+            dedupe_key: key, ..
+        })) = uebersetzen("channel.chat.clear", &e, Some("evt-clear"), zeitpunkt())
+        else {
+            panic!("clear erwartet")
+        };
+        assert_eq!(key, "twitch:12345:chat_clear:evt-clear");
+    }
+
+    #[test]
+    fn stream_online_und_offline_werden_als_aktivitaet_geliefert() {
+        let online = mit(json!({
+            "id": "stream-7",
+            "type": "live",
+            "started_at": "2026-08-23T20:14:00Z"
+        }));
+        let a = activity(uebersetzen("stream.online", &online, Some("m-on"), zeitpunkt()).unwrap());
+        assert_eq!(a.art(), "stream_online");
+        assert_eq!(a.meta().dedupe_key, "twitch:12345:stream_online:stream-7");
+        assert_eq!(
+            a.meta().occurred_at,
+            "2026-08-23T20:14:00Z".parse::<DateTime<Utc>>().unwrap()
+        );
+
+        let offline = basis();
+        let a =
+            activity(uebersetzen("stream.offline", &offline, Some("m-off"), zeitpunkt()).unwrap());
+        assert_eq!(a.art(), "stream_offline");
+        assert_eq!(a.meta().dedupe_key, "twitch:12345:stream_offline:m-off");
     }
 
     #[test]
