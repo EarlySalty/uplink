@@ -1383,6 +1383,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "851ca9db4932932d69f3ea811b1abe63087a0f740a47692619dd40d4899b68be"
 dependencies = [
  "bytes",
+ "chrono",
  "fallible-iterator",
  "postgres-protocol",
  "serde_core",
@@ -2563,6 +2564,24 @@ dependencies = [
  "toml",
  "uplink-infisical-transport",
  "webpki-roots 1.0.9",
+ "zeroize",
+]
+
+[[package]]
+name = "uplink-youtube-live"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "futures",
+ "getrandom 0.4.3",
+ "hex",
+ "reqwest",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-postgres",
+ "uplink-chat",
+ "wiremock",
  "zeroize",
 ]
 
