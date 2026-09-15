@@ -1,3 +1,5 @@
+@AGENTS.md
+
 # Arbeitskontext
 
 Uplink wird in einem neuen Repository vollständig neu implementiert. Der bisherige `rs-relay`-Medienkern wird nicht übernommen. Er dient nur als lesbare Funktionsreferenz; geprüfte Oberflächen, Overlays und Docks dürfen separat erhalten bleiben. Der Auftrag wurde am 8. September 2026 ausdrücklich bestätigt: neuer Code im anderen Repository, keine erneute Überarbeitung des alten Kerns.
