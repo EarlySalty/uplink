@@ -31,6 +31,16 @@ pub struct Reservation {
     id: u64,
     tenant: u64,
     registry: Weak<Mutex<State>>,
+    report: Mutex<Option<uplink_ingest::SessionReport>>,
+    completion: Option<Box<dyn FnOnce(SessionCompletion) + Send + Sync>>,
+}
+pub struct SessionCompletion {
+    pub streamer_id: u64,
+    pub ended_at: std::time::SystemTime,
+    pub duration: std::time::Duration,
+    pub source_tracks: usize,
+    pub end_reason: String,
+    pub profile: serde_json::Value,
 }
 pub struct TenantChange {
     tenant: u64,
@@ -101,6 +111,8 @@ impl Registry {
             id,
             tenant,
             registry: Arc::downgrade(&self.0),
+            report: Mutex::new(None),
+            completion: None,
         })
     }
     pub fn begin_change(&self, tenant: u64) -> Result<Arc<TenantChange>, &'static str> {
@@ -151,6 +163,20 @@ impl Registry {
     }
 }
 impl Reservation {
+    pub fn on_completion(
+        &mut self,
+        completion: impl FnOnce(SessionCompletion) + Send + Sync + 'static,
+    ) {
+        self.completion = Some(Box::new(completion));
+    }
+    pub fn ingest_report(&self, report: &uplink_ingest::SessionReport) {
+        self.generation(report.generation);
+        self.ingest_ended(&report.reason);
+        *self
+            .report
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(report.clone());
+    }
     pub fn generation(&self, generation: uplink_ingest::ConnectionGeneration) {
         // Nur servergenerierte Zufallsinstanz und Zähler, keine Zugangsdaten.
         self.update(|state| state.generation = Some(format!("{generation:?}")));
@@ -222,6 +248,38 @@ impl Drop for Reservation {
                 status.active = false;
                 if status.error.is_none() {
                     status.state = "Beendet";
+                }
+                if let Some(completion) = self.completion.take() {
+                    let report = self
+                        .report
+                        .get_mut()
+                        .unwrap_or_else(|error| error.into_inner());
+                    let reason = report
+                        .as_ref()
+                        .map_or(uplink_ingest::EndReason::TaskFailed, |report| report.reason);
+                    let end_reason = match (reason, status.error) {
+                        (uplink_ingest::EndReason::ConsumerClosed, Some(error)) => {
+                            format!("ConsumerClosed: {error}")
+                        }
+                        _ => format!("{reason:?}"),
+                    };
+                    status.ingest_end_reason = Some(end_reason.clone());
+                    completion(SessionCompletion {
+                        streamer_id: tenant,
+                        ended_at: std::time::SystemTime::now(),
+                        duration: report
+                            .as_ref()
+                            .map_or(std::time::Duration::ZERO, |report| report.duration),
+                        source_tracks: report.as_ref().map_or(0, |report| report.track_count),
+                        end_reason,
+                        profile: serde_json::json!({
+                            "source_observation": status.source_observation,
+                            "outputs": status.outputs,
+                            "received_events": report.as_ref().map_or(0, |report| report.received_events),
+                            "received_bytes": report.as_ref().map_or(0, |report| report.received_bytes),
+                            "source_tracks": report.as_ref().map_or(0, |report| report.track_count),
+                        }),
+                    });
                 }
                 state.recent.retain(|(t, _)| *t != tenant);
                 state.recent.push_back((tenant, status));

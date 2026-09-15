@@ -11,6 +11,10 @@ pub async fn apply(store: &Store) -> Result<(), &'static str> {
             "20260908_twitch_audio_mode",
             include_str!("../../../db/migrations/20260908_twitch_audio_mode.sql"),
         ),
+        (
+            "20260909_twitch_audio_automatic",
+            include_str!("../../../db/migrations/20260909_twitch_audio_automatic.sql"),
+        ),
     ] {
         store.migrate(name, statement).await?;
     }

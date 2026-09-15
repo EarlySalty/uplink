@@ -99,24 +99,11 @@ impl Coordinator {
                 .filter(|value| *value > 0)
                 .ok_or("Gewünschtes Ausgabeprofil ist noch unvollständig.")
         };
-        let audio_mode: Option<String> = row.try_get(7).map_err(|_| "Audiowahl fehlt.")?;
-        let use_vod_audio = match (platform.as_str(), audio_mode.as_deref()) {
-            ("twitch", Some("live")) => false,
-            ("twitch", Some("separate_vod")) => true,
-            (_, None) => policy.use_vod_audio,
-            _ => return Err("Gespeicherte Audiowahl ist ungültig."),
-        };
-        let vod_audio_track = if use_vod_audio {
-            Some(
-                self.state
-                    .config
-                    .media
-                    .vod_audio_track
-                    .filter(|track| *track != self.state.config.media.live_audio_track)
-                    .ok_or("Für separaten VOD-Ton fehlt die eigene Audiozuordnung.")?,
-            )
-        } else {
-            None
+        let capped = |index: usize, field: &str| -> Result<u32, &'static str> {
+            let cap = row.try_get::<_, Option<i32>>(field).ok().flatten()
+                .and_then(|value| u32::try_from(value).ok()).filter(|value| *value > 0)
+                .ok_or("Für dieses Ziel fehlen die Plattformgrenzen.")?;
+            Ok(positive(index)?.min(cap))
         };
         Ok(DesiredOutput {
             target: PublishTarget {
@@ -131,15 +118,15 @@ impl Coordinator {
                 allow_unencrypted: policy.allow_unencrypted,
             },
             video: DesiredVideo {
-                width: positive(3)?,
-                height: positive(4)?,
-                fps: uplink_core::FrameRate::new(positive(5)?, 1)
+                width: capped(3, "recommended_width")?,
+                height: capped(4, "recommended_height")?,
+                fps: uplink_core::FrameRate::new(capped(5, "recommended_fps")?, 1)
                     .map_err(|_| "Bildrate ist ungültig.")?,
-                bitrate_kbps: positive(6)?,
+                bitrate_kbps: capped(6, "recommended_bitrate_kbps")?,
                 codec: policy.video_codec,
             },
-            live_audio_track: self.state.config.media.live_audio_track,
-            vod_audio_track,
+            live_audio_track: 0,
+            vod_audio_track: None,
             layout: None,
         })
     }
@@ -179,7 +166,7 @@ impl SessionProcessor for Coordinator {
             .ok_or("Sessionreservierung fehlt.")?;
         let tenant = i64::try_from(first.identity.session.tenant_id())
             .map_err(|_| "Nutzeridentität ist ungültig.")?;
-        let rows=self.state.store.query("SELECT platform,rtmp_url,stream_key_enc,width,height,fps,bitrate_kbps,twitch_audio_mode FROM relay.destinations WHERE streamer_id=$1 AND enabled=true ORDER BY platform",&[&tenant]).await?;
+        let rows=self.state.store.query("SELECT d.platform,d.rtmp_url,d.stream_key_enc,d.width,d.height,d.fps,d.bitrate_kbps,c.recommended_width,c.recommended_height,c.recommended_fps,c.recommended_bitrate_kbps FROM relay.destinations d LEFT JOIN relay.platform_caps c USING(platform) WHERE d.streamer_id=$1 AND d.enabled=true ORDER BY d.platform",&[&tenant]).await?;
         if rows.is_empty() {
             return Err("Kein Ausgabeziel ist aktiviert.");
         }
@@ -198,7 +185,7 @@ impl SessionProcessor for Coordinator {
             .engine
             .prepare_and_start(DesiredSessionSpec { first, outputs }, events)
             .await
-            .map_err(|_| "Medienprofil konnte nicht sicher vorbereitet werden.")?;
+            .map_err(media_error)?;
         if let Some(observation) = running.source_observation() {
             reservation.observation(
                 serde_json::to_value(observation)
@@ -219,8 +206,8 @@ impl SessionProcessor for Coordinator {
             serde_json::to_value(&report.status)
                 .map_err(|_| "Ausgangsstatus konnte nicht dargestellt werden.")?,
         );
-        if report.error.is_some() {
-            return Err("Medienausgabe wurde mit Fehler beendet.");
+        if let Some(error) = report.error {
+            return Err(media_error(error));
         }
         if report.status.outputs.is_empty()
             || report
@@ -235,8 +222,37 @@ impl SessionProcessor for Coordinator {
     }
 }
 
+fn media_error(error: uplink_media::MediaError) -> &'static str {
+    match error {
+        uplink_media::MediaError::MissingTrack => "Der Eingang enthält noch kein vollständiges Bild mit Ton.",
+        uplink_media::MediaError::UnsupportedProfile => "Bild oder Ton des Eingangs kann hier nicht verarbeitet werden.",
+        uplink_media::MediaError::PublishRejected => "Die Plattform hat den Streamstart abgelehnt. Zugang und Ausgabeprofil prüfen.",
+        uplink_media::MediaError::StartTimeout => "Die Medienverarbeitung konnte nicht rechtzeitig starten.",
+        _ => "Die Medienverarbeitung wurde mit einem Fehler beendet.",
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    mod database {
+        use crate as uplink_service;
+        include!("../tests/support/database.rs");
+    }
+    #[tokio::test]
+    #[ignore = "Benötigt isolierte PostgreSQL-16-Testinstanz."]
+    async fn regression_twitch_1440p_26000_is_clamped_to_database_caps() {
+        let (database, mut state) = database::fixture().await;
+        let config = &mut std::sync::Arc::get_mut(&mut state).unwrap().config;
+        config.media.work_directory = database.directory.join("media");
+        config.media.ffmpeg = "/usr/bin/ffmpeg".into();
+        config.media.ffprobe = "/usr/bin/ffprobe".into();
+        let encrypted = state.secrets.encryption.seal(b"synthetic", "destination:11:twitch").unwrap();
+        let rows = state.store.query("SELECT 'twitch'::text, 'rtmps://live.twitch.tv/app'::text, $1::bytea, 2560::integer, 1440::integer, 60::integer, 26000::integer, NULL::text, 1920::integer AS recommended_width, 1080::integer AS recommended_height, 60::integer AS recommended_fps, 8000::integer AS recommended_bitrate_kbps", &[&encrypted]).await.unwrap();
+        let coordinator = super::Coordinator::new(state).unwrap();
+        let output = coordinator.output(&rows[0], 11, "twitch".into()).unwrap();
+        assert_eq!((output.video.width, output.video.height, output.video.bitrate_kbps), (1920, 1080, 8000), "Plattformgrenzen müssen den Twitch-Wunsch klemmen");
+        database.stop().await;
+    }
     use super::secure_default;
     #[test]
     fn only_known_twitch_default_uses_the_official_tls_endpoint() {

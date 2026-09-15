@@ -69,156 +69,52 @@ async fn destination_save_enforces_its_platform_transport_policy() {
 
 #[tokio::test]
 #[ignore = "Benötigt isolierte PostgreSQL-16-Testinstanz."]
-async fn explicit_twitch_audio_choice_survives_omitted_updates() {
+async fn automatic_audio_has_status_without_a_saved_choice() {
     let (database, state) = fixture().await;
-    let response = router(state.clone()).oneshot(request("PUT", "/v1/me/destinations", r#"{"streamer_id":11,"destinations":[{"platform":"twitch","connection_generation":1,"rtmp_url":"rtmps://live.twitch.tv/app","stream_key":"synthetic","twitch_audio_mode":"live"}]}"#)).await.unwrap();
+    let response = router(state.clone()).oneshot(request("PUT", "/v1/me/destinations", r#"{"streamer_id":11,"destinations":[{"platform":"twitch","connection_generation":1,"rtmp_url":"rtmps://live.twitch.tv/app","stream_key":"synthetic"}]}"#)).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    for body in [
-        r#"{"streamer_id":11,"destinations":[{"platform":"twitch","connection_generation":1,"width":1280}]}"#,
-        r#"{"streamer_id":11,"destinations":[{"platform":"twitch","connection_generation":2,"stream_key":"replacement"}]}"#,
-    ] {
-        assert_eq!(
-            router(state.clone())
-                .oneshot(request("PUT", "/v1/me/destinations", body))
-                .await
-                .unwrap()
-                .status(),
-            StatusCode::OK
-        );
-    }
-    let response = router(state.clone())
-        .oneshot(request("GET", "/v1/me/destinations?streamer_id=11", ""))
-        .await
-        .unwrap();
-    let value: serde_json::Value =
-        serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
-    assert_eq!(value["destinations"][0]["twitch_audio_mode"], "live");
-    assert_eq!(value["destinations"][0]["effective_audio_mode"], "live");
-    assert!(value["destinations"][0]["active_audio_mode"].is_null());
-    for (platform, mode) in [("kick", "live"), ("twitch", "fallback")] {
-        let body = serde_json::json!({"streamer_id":11,"destinations":[{"platform":platform,"connection_generation":2,"twitch_audio_mode":mode}]}).to_string();
-        assert_eq!(
-            router(state.clone())
-                .oneshot(request("PUT", "/v1/me/destinations", body))
-                .await
-                .unwrap()
-                .status(),
-            StatusCode::BAD_REQUEST
-        );
-    }
-    database.stop().await;
-}
-
-#[tokio::test]
-#[ignore = "Benötigt isolierte PostgreSQL-16-Testinstanz."]
-async fn omitted_audio_mode_preserves_concurrently_committed_choice() {
-    let (database, state) = fixture().await;
-    state.store.query("INSERT INTO relay.destinations VALUES(11,'twitch','rtmps://live.twitch.tv/app',$1,true,1920,1080,60,6000,'live')", &[&vec![0u8]]).await.unwrap();
-    let (mut writer, driver) = database.raw().await;
-    let transaction = writer.transaction().await.unwrap();
-    transaction.execute("UPDATE relay.destinations SET twitch_audio_mode='separate_vod' WHERE streamer_id=11 AND platform='twitch'", &[]).await.unwrap();
-    let app = router(state.clone());
-    let omitted = tokio::spawn(async move {
-        app.oneshot(request("PUT", "/v1/me/destinations", r#"{"streamer_id":11,"destinations":[{"platform":"twitch","connection_generation":1,"width":1280}]}"#)).await.unwrap()
-    });
-    tokio::time::timeout(Duration::from_millis(800), async {
-        loop {
-            transaction.batch_execute("SELECT pg_stat_clear_snapshot()").await.unwrap();
-            if transaction.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE wait_event_type='Lock' AND query LIKE '%INSERT INTO relay.destinations%')", &[]).await.unwrap().get::<_,bool>(0) { break; }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+    for count in 0..=3 {
+        let reservation = (count > 0).then(|| state.registry.reserve(11).unwrap());
+        if let Some(reservation) = &reservation {
+            reservation.observation(serde_json::json!({"audio":(0..count).map(|wire|serde_json::json!({"wire_track":wire})).collect::<Vec<_>>()}));
         }
-    }).await.unwrap();
-    transaction.commit().await.unwrap();
-    assert_eq!(omitted.await.unwrap().status(), StatusCode::OK);
-    let row = state.store.query("SELECT twitch_audio_mode,width FROM relay.destinations WHERE streamer_id=11 AND platform='twitch'", &[]).await.unwrap();
-    assert_eq!(row[0].get::<_, String>(0), "separate_vod");
-    assert_eq!(row[0].get::<_, i32>(1), 1280);
-    drop(writer);
-    driver.await.unwrap();
+        let response = router(state.clone()).oneshot(request("GET", "/v1/me/destinations?streamer_id=11", "")).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
+        let output = &value["destinations"][0];
+        assert_eq!(output["audio"], if count == 0 {serde_json::json!({"source_tracks":null,"vod":null})} else {serde_json::json!({"source_tracks":count,"vod":if count == 1 {"gleich"} else {"zweite_spur"}})});
+        for field in ["twitch_audio_mode", "effective_audio_mode", "active_audio_mode"] { assert!(output.get(field).is_none()); }
+    }
     database.stop().await;
 }
 
 #[tokio::test]
 #[ignore = "Benötigt isolierte PostgreSQL-16-Testinstanz."]
-async fn release_migrations_are_repeatable_and_keep_existing_audio_choice() {
+async fn release_migrations_drop_audio_choice_and_remain_repeatable() {
     let (database, state) = fixture().await;
-    state
-        .store
-        .query(
-            "ALTER TABLE relay.destinations DROP COLUMN twitch_audio_mode",
-            &[],
-        )
-        .await
-        .unwrap();
-    state
-        .store
-        .query("DROP TABLE relay.destination_fences", &[])
-        .await
-        .unwrap();
-    state.store.query("INSERT INTO relay.destinations VALUES(11,'twitch','rtmps://live.twitch.tv/app',$1,true,1920,1080,60,6000)", &[&vec![0u8]]).await.unwrap();
-    uplink_service::migrations::apply(&state.store)
-        .await
-        .unwrap();
-    let row = state
-        .store
-        .query("SELECT twitch_audio_mode FROM relay.destinations", &[])
-        .await
-        .unwrap();
-    assert_eq!(
-        row[0].get::<_, Option<String>>(0),
-        None,
-        "Keine stille Altbestandswahl"
-    );
-    state
-        .store
-        .query(
-            "UPDATE relay.destinations SET twitch_audio_mode='live'",
-            &[],
-        )
-        .await
-        .unwrap();
-    uplink_service::migrations::apply(&state.store)
-        .await
-        .unwrap();
-    assert_eq!(
-        state
-            .store
-            .query("SELECT twitch_audio_mode FROM relay.destinations", &[])
-            .await
-            .unwrap()[0]
-            .get::<_, String>(0),
-        "live"
-    );
-    assert!(
-        state
-            .store
-            .query(
-                "UPDATE relay.destinations SET twitch_audio_mode='fallback'",
-                &[]
-            )
-            .await
-            .is_err()
-    );
-    state.store.query("UPDATE relay.uplink_schema_migrations SET checksum='changed' WHERE name='20260908_twitch_audio_mode'", &[]).await.unwrap();
-    assert_eq!(
-        uplink_service::migrations::apply(&state.store).await,
-        Err(
-            "Uplink-Migrationsprüfsumme stimmt nicht. Release und Migrationsledger prüfen; Start abgebrochen."
-        ),
-        "Geänderte Migration bleibt fatal"
-    );
-    assert_eq!(
-        state
-            .store
-            .query(
-                "DO $$ BEGIN RAISE EXCEPTION 'Uplink-Migrationsprüfsumme stimmt nicht'; END $$",
-                &[]
-            )
-            .await
-            .err(),
-        Some("Datenbankanfrage fehlgeschlagen oder Frist überschritten."),
-        "Ein generischer Datenbankfehler darf nicht anhand seines Texts zum Migrationsfehler werden"
-    );
+    state.store.query("ALTER TABLE relay.destinations ADD COLUMN twitch_audio_mode text", &[]).await.unwrap();
+    state.store.query("INSERT INTO relay.destinations VALUES(11,'twitch','rtmps://live.twitch.tv/app',$1,true,1920,1080,60,6000,'separate_vod')", &[&vec![0u8]]).await.unwrap();
+    for _ in 0..2 { uplink_service::migrations::apply(&state.store).await.unwrap(); }
+    assert!(state.store.query("SELECT twitch_audio_mode FROM relay.destinations", &[]).await.is_err());
+    assert_eq!(state.store.query("SELECT width FROM relay.destinations", &[]).await.unwrap()[0].get::<_,i32>(0),1920);
+    state.store.query("UPDATE relay.uplink_schema_migrations SET checksum='changed' WHERE name='20260909_twitch_audio_automatic'", &[]).await.unwrap();
+    assert_eq!(uplink_service::migrations::apply(&state.store).await, Err("Uplink-Migrationsprüfsumme stimmt nicht. Release und Migrationsledger prüfen; Start abgebrochen."));
+    database.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "Benötigt isolierte PostgreSQL-16-Testinstanz."]
+async fn clamped_twitch_profile_has_public_reason_and_keeps_saved_wish() {
+    let (database, state) = fixture().await;
+    state.store.query("INSERT INTO relay.destinations VALUES(11,'twitch','rtmps://live.twitch.tv/app',$1,true,2560,1440,60,26000)", &[&vec![0u8]]).await.unwrap();
+    let reservation = state.registry.reserve(11).unwrap();
+    reservation.media_status(serde_json::json!({"outputs":[{"id":"twitch","state":"publishing","received_events":4}],"graph":[{"id":"twitch","profile_origin":"running_graph","video":[{"mode":"encode","profile":{"width":1920,"height":1080,"fps_numerator":60,"fps_denominator":1,"codec":"h264","target_bitrate_kbps":8000}}]}]}));
+    let response = router(state.clone()).oneshot(request("GET", "/v1/me/destinations?streamer_id=11", "")).await.unwrap();
+    let value:serde_json::Value=serde_json::from_slice(&to_bytes(response.into_body(),65536).await.unwrap()).unwrap();
+    let output=&value["destinations"][0];
+    assert_eq!(output["output_state"],"sending");
+    assert_eq!(output["requested"]["bitrate_kbps"],26000);
+    assert_eq!(output["active_profile"]["bitrate_kbps"],8000);
+    assert_eq!(output["reason"],"Twitch bekommt 1080p60 mit 8000 kbit/s, mehr trägt der Twitch-Weg nicht.");
     database.stop().await;
 }
 impl database::Database {
@@ -1459,6 +1355,7 @@ async fn controlplane_preserves_credentials_and_rejects_unauthorized_changes() {
         "CREATE TABLE relay.waitlist(streamer_id bigint PRIMARY KEY)",
         include_str!("../../../db/migrations/20260908_destination_fences.sql"),
         include_str!("../../../db/migrations/20260908_twitch_audio_mode.sql"),
+        include_str!("../../../db/migrations/20260909_twitch_audio_automatic.sql"),
     ] {
         store.query(statement, &[]).await.unwrap();
     }

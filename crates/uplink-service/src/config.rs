@@ -57,8 +57,6 @@ pub struct MediaConfig {
     pub max_queued_bytes: usize,
     pub max_queued_events: usize,
     pub max_tracks: usize,
-    pub live_audio_track: u8,
-    pub vod_audio_track: Option<u8>,
 }
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -67,7 +65,6 @@ pub struct PlatformConfig {
     pub allowed_hosts: Vec<String>,
     pub allow_unencrypted: bool,
     pub video_codec: uplink_core::Codec,
-    pub use_vod_audio: bool,
 }
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -227,9 +224,8 @@ impl Config {
             || config.media.max_queued_events > 4096
             || config.media.max_tracks == 0
             || config.media.max_tracks > 32
-            || config.media.vod_audio_track == Some(config.media.live_audio_track)
         {
-            return Err("Mediengrenzen oder Audiozuordnung sind ungültig.");
+            return Err("Mediengrenzen sind ungültig.");
         }
         config.ingest_limits()?;
         let mut platforms = std::collections::HashSet::new();
@@ -247,7 +243,6 @@ impl Config {
                             .bytes()
                             .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
                 })
-                || (platform.use_vod_audio && config.media.vod_audio_track.is_none())
             {
                 return Err("Plattformkonfiguration ist ungültig.");
             }

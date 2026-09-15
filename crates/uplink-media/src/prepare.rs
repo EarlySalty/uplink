@@ -85,13 +85,11 @@ impl MediaEngine {
         if spec.outputs.is_empty() || spec.outputs.len() > self.config.limits.max_outputs {
             return Err(MediaError::InvalidConfiguration);
         }
-        let audio = spec
-            .outputs
-            .iter()
-            .flat_map(|output| {
-                std::iter::once(output.live_audio_track).chain(output.vod_audio_track)
-            })
-            .collect();
+        let audio = if spec.outputs.iter().any(|output| matches!(output.target.id.as_str(), "twitch" | "youtube" | "kick" | "tiktok")) {
+            (0..=u8::MAX).collect()
+        } else {
+            spec.outputs.iter().flat_map(|output| std::iter::once(output.live_audio_track).chain(output.vod_audio_track)).collect()
+        };
         let prepared = self.prepare_source(spec.first, &mut input, &audio).await?;
         let graph = Graph::observed(&prepared.observation, &spec.outputs)?;
         let routes = spec

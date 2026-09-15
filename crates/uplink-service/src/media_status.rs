@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 pub fn failure_reason(reason: &Value) -> &'static str {
     match reason.as_str() {
         Some("missing_track") => {
-            "Eine für dieses Ziel benötigte Medienspur fehlt. Live- und VOD-Audiospuren in OBS prüfen."
+            "Der Eingang enthält noch kein vollständiges Bild mit Ton."
         }
         Some("unsupported_profile" | "invalid_plan") => {
             "Dieses Ausgabeprofil passt nicht zur erkannten Quelle oder ist hier noch nicht freigegeben. Zieleinstellungen prüfen."
@@ -64,37 +64,40 @@ pub fn active_profile(session: Option<&SessionStatus>, platform: &str, state: &s
     json!({"width":width,"height":height,"fps":numerator as f64 / denominator as f64,"codec":profile["codec"],"bitrate_kbps":bitrate,"profile_origin":"running_graph"})
 }
 
-/// Lokales Audio-Routing, keine Bestätigung eines Plattform-VODs.
-pub fn active_audio_mode(session: Option<&SessionStatus>, platform: &str, state: &str) -> Value {
-    let Some(session) =
-        session.filter(|session| session.active && state == "sending" && platform == "twitch")
-    else {
-        return Value::Null;
+pub fn audio(session: Option<&SessionStatus>, platform: &str) -> Value {
+    let unknown = || json!({"source_tracks":null,"vod":null});
+    let Some(session) = session.filter(|session| session.active && platform == "twitch") else {
+        return unknown();
     };
-    let Some(audio) = session
-        .outputs
-        .as_ref()
-        .and_then(|status| status["graph"].as_array())
-        .and_then(|graphs| {
-            graphs
-                .iter()
-                .find(|graph| graph["id"] == platform && graph["profile_origin"] == "running_graph")
-        })
-        .and_then(|graph| graph["audio"].as_array())
-    else {
-        return Value::Null;
+    let Some(tracks) = session.source_observation.as_ref().and_then(|source| source["audio"].as_array()) else {
+        return unknown();
     };
-    match audio.as_slice() {
-        [live] if live["destination_wire_track"] == 0 => json!("live"),
-        [live, vod]
-            if live["destination_wire_track"] == 0
-                && vod["destination_wire_track"] == 1
-                && live["source_wire_track"] != vod["source_wire_track"] =>
-        {
-            json!("separate_vod")
-        }
-        _ => Value::Null,
+    if tracks.is_empty() {
+        return unknown();
     }
+    json!({"source_tracks":tracks.len(),"vod":if tracks.iter().any(|track| track["wire_track"] == 1) {"zweite_spur"} else {"gleich"}})
+}
+
+pub fn profile_reason(platform: &str, requested: &Value, active: &Value) -> Option<String> {
+    let name = match platform {
+        "twitch" => "Twitch",
+        "youtube" => "YouTube",
+        "kick" => "Kick",
+        "tiktok" => "TikTok",
+        _ => return None,
+    };
+    let width = active["width"].as_u64()?;
+    let height = active["height"].as_u64()?;
+    let fps = active["fps"].as_f64()?;
+    let bitrate = active["bitrate_kbps"].as_u64()?;
+    if requested["width"].as_u64() == Some(width)
+        && requested["height"].as_u64() == Some(height)
+        && requested["fps"].as_f64() == Some(fps)
+        && requested["bitrate_kbps"].as_u64() == Some(bitrate)
+    {
+        return None;
+    }
+    Some(format!("{name} bekommt {height}p{fps} mit {bitrate} kbit/s, mehr trägt der {name}-Weg nicht."))
 }
 
 #[cfg(test)]

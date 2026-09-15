@@ -40,33 +40,27 @@ max_event_bytes = 2097152
 max_queued_bytes = 16777216
 max_queued_events = 512
 max_tracks = 8
-live_audio_track = 0
-vod_audio_track = 1
 
 [[platforms]]
 name = "twitch"
 allowed_hosts = ["live.twitch.tv", "ingest.global-contribute.live-video.net"]
 allow_unencrypted = false
 video_codec = "h264"
-use_vod_audio = true
 
 [[platforms]]
 name = "youtube"
 allowed_hosts = ["a.rtmps.youtube.com", "b.rtmps.youtube.com"]
 allow_unencrypted = false
 video_codec = "h264"
-use_vod_audio = false
 
 [[platforms]]
 name = "kick"
 allowed_hosts = ["fa723fc1b171.global-contribute.live-video.net"]
 allow_unencrypted = false
 video_codec = "h264"
-use_vod_audio = false
 
 [[platforms]]
 name = "tiktok"
 allowed_hosts = ["push-rtmp-f5-tt04.tiktokcdn-eu.com"]
 allow_unencrypted = false
 video_codec = "h264"
-use_vod_audio = false

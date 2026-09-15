@@ -42,33 +42,27 @@ max_queued_bytes = 16777216
 max_queued_events = 512
 max_tracks = 8
 # Explizite Quellzuordnung, keine aus dem Codec erratene Audio-Rolle.
-live_audio_track = 0
-vod_audio_track = 1
 
 [[platforms]]
 name = "twitch"
 allowed_hosts = ["live.twitch.tv", "ingest.global-contribute.live-video.net"]
 allow_unencrypted = false
 video_codec = "h264"
-use_vod_audio = true
 
 [[platforms]]
 name = "kick"
 allowed_hosts = ["live-video.net"]
 allow_unencrypted = false
 video_codec = "h264"
-use_vod_audio = false
 
 [[platforms]]
 name = "youtube"
 allowed_hosts = ["a.rtmps.youtube.com", "b.rtmps.youtube.com"]
 allow_unencrypted = false
 video_codec = "h264"
-use_vod_audio = false
 
 [[platforms]]
 name = "tiktok"
 allowed_hosts = ["tiktok.com"]
 allow_unencrypted = false
 video_codec = "h264"
-use_vod_audio = false

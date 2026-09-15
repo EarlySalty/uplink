@@ -226,7 +226,8 @@ impl Graph {
         let selected = outputs
             .iter()
             .flat_map(|output| {
-                std::iter::once(output.live_audio_track).chain(output.vod_audio_track)
+                let (live, vod) = observed_audio(source, output);
+                std::iter::once(live).chain(vod)
             })
             .collect();
         Self::observed_selected(source, outputs, &selected)
@@ -300,7 +301,11 @@ impl Graph {
             }
             let prior_profiles = profiles.len();
             let route = (|| {
-                let desired = &output.video;
+                let mut desired = output.video.clone();
+                desired.width = desired.width.min(4096).min(source.width) & !1;
+                desired.height = desired.height.min(4096).min(source.height) & !1;
+                desired.fps = desired.fps.min(source_fps).min(FrameRate::new(60, 1).map_err(|_| MediaError::InvalidConfiguration)?);
+                desired.bitrate_kbps = desired.bitrate_kbps.min(20000);
                 if desired.width < 2
                     || desired.height < 2
                     || desired.width > 4096
@@ -379,8 +384,9 @@ impl Graph {
                     }
                 };
                 let mut audio = Vec::new();
+                let (live, vod) = observed_audio(source, output);
                 for (destination, wire_id) in
-                    [Some(output.live_audio_track), output.vod_audio_track]
+                    [Some(live), vod]
                         .into_iter()
                         .enumerate()
                 {
@@ -622,6 +628,14 @@ impl Graph {
             ]);
         }
         Ok(args)
+    }
+}
+
+fn observed_audio(source: &SourceObservation, output: &DesiredOutput) -> (u8, Option<u8>) {
+    match output.target.id.as_str() {
+        "twitch" => (0, source.audio.iter().any(|audio| audio.wire_track == 1).then_some(1)),
+        "kick" | "youtube" | "tiktok" => (0, None),
+        _ => (output.live_audio_track, output.vod_audio_track),
     }
 }
 
@@ -913,6 +927,56 @@ mod tests {
         }
     }
     #[test]
+    fn regression_twitch_single_audio_with_vod_request_uses_live_mix() {
+        let mut source = source();
+        source.audio.truncate(1);
+        source.width = 2560;
+        source.height = 1440;
+        source.fps_numerator = 60;
+        let mut desired = output("twitch", 0, Some(1));
+        desired.video.width = 1920;
+        desired.video.height = 1080;
+        desired.video.fps = FrameRate::new(60, 1).unwrap();
+        desired.video.bitrate_kbps = 6000;
+        let graph = Graph::observed(&source, &[desired]).unwrap();
+        assert_eq!(graph.routes[0].failure, None, "Eine Quellspur muss Twitch samt VOD starten");
+        assert_eq!(graph.routes[0].audio, vec![(0, 0)]);
+    }
+
+    #[test]
+    fn twitch_automatic_audio_uses_one_two_or_three_source_tracks_without_extra_encodes() {
+        for count in 1..=3 {
+            let mut source = source();
+            source.audio = (0..count).map(|wire_track| AudioObservation {wire_track,codec:"aac".into(),sample_rate:48000,channels:2}).collect();
+            let graph = Graph::observed(&source, &[output("twitch", 7, Some(12)),output("youtube",1,Some(1)),output("kick",1,Some(1)),output("tiktok",1,Some(1))]).unwrap();
+            assert_eq!(graph.profiles.len(),1);
+            assert!(graph.routes.iter().all(|route|route.failure.is_none()));
+            let twitch=graph.describe_route(&graph.routes[0], "twitch");
+            let mapped:Vec<_>=twitch.audio.iter().map(|audio|(audio.source_wire_track,audio.destination_wire_track)).collect();
+            assert_eq!(mapped,if count==1 {vec![(0,0)]} else {vec![(0,0),(1,1)]});
+            for route in &graph.routes[1..] { assert_eq!(route.audio,vec![(0,0)]); }
+            assert_eq!(graph.input_audio.len(),usize::from(count.min(2)));
+        }
+    }
+
+    #[test]
+    fn excessive_video_wish_is_clamped_to_source_and_engine_limits() {
+        let mut source=source();
+        source.width=7680;
+        source.height=4320;
+        source.fps_numerator=120;
+        let mut desired=output("twitch",0,None);
+        desired.video.width=8192;
+        desired.video.height=8192;
+        desired.video.fps=FrameRate::new(240,1).unwrap();
+        desired.video.bitrate_kbps=100000;
+        let graph=Graph::observed(&source,&[desired]).unwrap();
+        assert_eq!(graph.routes[0].failure,None);
+        let video=&graph.profiles[0].video;
+        assert_eq!((video.width,video.height,video.fps,video.rate.target_kbps),(4096,4096,FrameRate::new(60,1).unwrap(),20000));
+    }
+
+    #[test]
     fn observed_source_never_invents_copy_or_cbr_and_audio_does_not_duplicate_encode() {
         let graph = Graph::observed(
             &source(),
@@ -949,7 +1013,7 @@ mod tests {
         ));
     }
     #[test]
-    fn observed_hdr_missing_audio_and_unapproved_upscale_are_rejected() {
+    fn observed_hdr_and_missing_audio_are_rejected_but_large_wishes_are_clamped() {
         let mut hdr = source();
         hdr.color_transfer = Some("smpte2084".into());
         assert!(matches!(
@@ -961,10 +1025,8 @@ mod tests {
         let mut upscale = output("one", 0, None);
         upscale.video.width = 640;
         let upscale = Graph::observed(&source(), &[upscale]).unwrap();
-        assert_eq!(
-            upscale.routes[0].failure,
-            Some(MediaError::UnsupportedProfile)
-        );
+        assert_eq!(upscale.routes[0].failure, None);
+        assert_eq!(upscale.profiles[0].video.width, 320);
     }
     #[test]
     fn multivideo_shares_profiles_but_keeps_one_audio_anchor_and_unique_track_ids() {
@@ -1052,7 +1114,7 @@ mod tests {
     #[test]
     fn missing_vod_or_incompatible_target_does_not_cancel_healthy_outputs() {
         let mut invalid = output("incompatible", 0, None);
-        invalid.video.width = 640;
+        invalid.video.width = 1;
         let graph = Graph::observed(
             &source(),
             &[

@@ -82,9 +82,13 @@ pub(crate) async fn fixture() -> (Database, Arc<ServiceState>) {
         "CREATE SCHEMA relay",
         "CREATE TABLE relay.users(streamer_id bigint PRIMARY KEY,enabled boolean NOT NULL,ingest_key_enc bytea,dock_token_enc bytea,ingest_key_hash text,reconnect_wait_s integer NOT NULL DEFAULT 0)",
         "CREATE TABLE relay.destinations(streamer_id bigint REFERENCES relay.users(streamer_id),platform text NOT NULL,rtmp_url text NOT NULL,stream_key_enc bytea NOT NULL,enabled boolean NOT NULL,width integer,height integer,fps integer,bitrate_kbps integer,UNIQUE(streamer_id,platform))",
+        "CREATE TABLE relay.sessions(id bigserial PRIMARY KEY,streamer_id bigint NOT NULL,started_at timestamptz NOT NULL,ended_at timestamptz,ingest_protocol text NOT NULL,ingest_codec text,profile_json jsonb NOT NULL,end_reason text)",
         "CREATE TABLE relay.waitlist(streamer_id bigint PRIMARY KEY)",
         include_str!("../../../../db/migrations/20260908_destination_fences.sql"),
         include_str!("../../../../db/migrations/20260908_twitch_audio_mode.sql"),
+        include_str!("../../../../db/migrations/20260909_twitch_audio_automatic.sql"),
+        "CREATE TABLE relay.platform_caps(platform text PRIMARY KEY,recommended_width integer,recommended_height integer,recommended_fps integer,recommended_bitrate_kbps integer,force_cbr boolean)",
+        "INSERT INTO relay.platform_caps VALUES('twitch',1920,1080,60,8000,true),('youtube',3840,2160,60,40000,true),('kick',1920,1080,60,8000,true),('tiktok',1080,1920,60,8000,true)",
     ] {
         store.query(sql, &[]).await.unwrap();
     }
