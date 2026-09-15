@@ -146,6 +146,119 @@ impl GoLiveEncoder {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Native2kClientProfile {
+    pub capabilities: ClientCapabilities,
+    /// OBS-Encoder-ID der HEVC-Fähigkeit des Quellrechners, z. B. h265_texture_amf.
+    pub hevc_encoder: String,
+    /// OBS-Encoder-ID der H.264-Fähigkeit desselben Quellrechners.
+    /// Uplink nutzt sie nur für die Twitch-Vertragsaushandlung; die niedrigeren
+    /// Stufen werden anschließend auf dem Server mit libx264 erzeugt.
+    pub h264_encoder: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ClientCapabilities {
+    pub cpu: ClientCpu,
+    pub memory: ClientMemory,
+    pub system: ClientSystem,
+    pub gpu: Vec<ClientGpu>,
+    #[serde(default)]
+    pub gaming_features: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ClientCpu {
+    pub physical_cores: u32,
+    pub logical_cores: u32,
+    pub name: Option<String>,
+    pub speed: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ClientMemory {
+    pub total: u64,
+    pub free: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ClientSystem {
+    pub name: String,
+    pub version: String,
+    pub release: String,
+    pub revision: String,
+    pub bits: u32,
+    pub arm: bool,
+    pub build: i32,
+    #[serde(rename = "armEmulation")]
+    pub arm_emulation: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ClientGpu {
+    pub model: String,
+    pub vendor_id: u32,
+    pub device_id: u32,
+    pub dedicated_video_memory: u64,
+    pub shared_system_memory: u64,
+    pub driver_version: String,
+}
+
+impl Native2kClientProfile {
+    pub fn validate(&self) -> Result<(GoLiveEncoder, GoLiveEncoder)> {
+        validate_client_capabilities(&self.capabilities)?;
+        let hevc = GoLiveEncoder::audited(&self.hevc_encoder).ok_or(GoLiveError::InvalidRequest)?;
+        let h264 = GoLiveEncoder::audited(&self.h264_encoder).ok_or(GoLiveError::InvalidRequest)?;
+        if hevc.codec() != Codec::Hevc
+            || h264.codec() != Codec::H264
+            || matches!(hevc, GoLiveEncoder::ObsX264)
+            || matches!(h264, GoLiveEncoder::ObsX264)
+        {
+            return Err(GoLiveError::InvalidRequest);
+        }
+        Ok((hevc, h264))
+    }
+}
+
+fn validate_client_capabilities(c: &ClientCapabilities) -> Result<()> {
+    let valid_text = |value: &str, max: usize| {
+        !value.trim().is_empty() && value.len() <= max && !value.chars().any(char::is_control)
+    };
+    if c.cpu.physical_cores == 0
+        || c.cpu.logical_cores == 0
+        || c.cpu.physical_cores > c.cpu.logical_cores
+        || c.cpu.logical_cores > 1024
+        || c.cpu.name.as_deref().is_some_and(|v| !valid_text(v, 256))
+        || c.cpu.speed.is_some_and(|v| v == 0 || v > 20_000)
+        || c.memory.total == 0
+        || c.memory.free > c.memory.total
+        || !matches!(c.system.bits, 32 | 64)
+        || !valid_text(&c.system.name, 128)
+        || !valid_text(&c.system.version, 512)
+        || !valid_text(&c.system.release, 256)
+        || !valid_text(&c.system.revision, 256)
+        || c.gpu.is_empty()
+        || c.gpu.len() > 8
+        || c.gpu.iter().any(|gpu| {
+            !valid_text(&gpu.model, 256)
+                || !valid_text(&gpu.driver_version, 256)
+                || gpu.vendor_id == 0
+                || gpu.device_id == 0
+                || gpu.dedicated_video_memory == 0
+        })
+        || c.gaming_features.is_some()
+    {
+        return Err(GoLiveError::InvalidRequest);
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Rational {
     pub numerator: u32,
@@ -271,6 +384,7 @@ pub struct VideoConfiguration {
     pub codec: Codec,
     pub bitrate_kbps: u32,
     pub keyframe_seconds: u32,
+    pub bframes: u32,
     pub profile: String,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -344,12 +458,60 @@ impl GoLiveClient {
             .await
             .map_err(|_| GoLiveError::Transport)?;
         let bytes = read_response(response).await?;
-        parse_configuration(
+        parse_configuration_mode(
             &bytes,
             preferences,
             authentication,
             allowed_ingest_hosts,
             &codecs,
+            ConfigurationMode::ServerSoftware,
+        )
+    }
+
+    /// Hybrid-2K: Die Hardwarebeschreibung stammt vom tatsächlich HEVC-kodierenden
+    /// Quellrechner. Uplink fordert HEVC + H.264 an, reicht die 1440p-HEVC-Spur
+    /// unverändert durch und erzeugt nur niedrigere H.264-Stufen selbst.
+    pub async fn configure_native_2k(
+        &self,
+        authentication: &PublishSecret,
+        client: &Native2kClientProfile,
+        preferences: &Preferences,
+        allowed_ingest_hosts: &[String],
+    ) -> Result<TwitchConfiguration> {
+        let (hevc_encoder, h264_encoder) = client.validate()?;
+        if preferences.maximum_video_tracks < 5
+            || preferences.canvases.len() != 1
+            || preferences.canvases[0].width != 2560
+            || preferences.canvases[0].height != 1440
+            || preferences.canvases[0].framerate
+                != (Rational {
+                    numerator: 60,
+                    denominator: 1,
+                })
+        {
+            return Err(GoLiveError::InvalidRequest);
+        }
+        let codecs = [Codec::Hevc, Codec::H264];
+        let body = request_native_2k_body(authentication, client, preferences, &codecs)?;
+        let response = self
+            .http
+            .post(ENDPOINT)
+            .header("content-type", "application/json")
+            .body(bytes::Bytes::from_owner(body))
+            .send()
+            .await
+            .map_err(|_| GoLiveError::Transport)?;
+        let bytes = read_response(response).await?;
+        parse_configuration_mode(
+            &bytes,
+            preferences,
+            authentication,
+            allowed_ingest_hosts,
+            &codecs,
+            ConfigurationMode::Native2k {
+                hevc_encoder,
+                h264_encoder,
+            },
         )
     }
 
@@ -523,6 +685,16 @@ struct PostData<'a> {
     preferences: RequestPreferences<'a>,
 }
 #[derive(Serialize)]
+struct Native2kPostData<'a> {
+    service: &'static str,
+    schema_version: &'static str,
+    authentication: &'a str,
+    client: ClientDescription,
+    capabilities: &'a ClientCapabilities,
+    preferences: RequestPreferences<'a>,
+}
+
+#[derive(Serialize)]
 struct RequestPreferences<'a> {
     #[serde(flatten)]
     preferences: &'a Preferences,
@@ -590,6 +762,43 @@ fn request_body(
     }
     Ok(bytes)
 }
+fn request_native_2k_body(
+    authentication: &PublishSecret,
+    client_profile: &Native2kClientProfile,
+    preferences: &Preferences,
+    codecs: &[Codec],
+) -> Result<Zeroizing<Vec<u8>>> {
+    validate_preferences(preferences)?;
+    client_profile.validate()?;
+    if codecs != [Codec::Hevc, Codec::H264] {
+        return Err(GoLiveError::InvalidRequest);
+    }
+    let authentication = std::str::from_utf8(authentication.expose_for_pipe())
+        .map_err(|_| GoLiveError::InvalidRequest)?;
+    let client = ClientDescription {
+        name: "uplink",
+        version: env!("CARGO_PKG_VERSION"),
+        supported_codecs: vec!["h265", "h264"],
+    };
+    let request = Native2kPostData {
+        service: "IVS",
+        schema_version: SCHEMA,
+        authentication,
+        client,
+        capabilities: &client_profile.capabilities,
+        preferences: RequestPreferences {
+            preferences,
+            composition_gpu_index: Some(0),
+        },
+    };
+    let mut bytes = Zeroizing::new(Vec::new());
+    serde_json::to_writer(&mut *bytes, &request).map_err(|_| GoLiveError::InvalidRequest)?;
+    if bytes.len() > MAX_RESPONSE {
+        return Err(GoLiveError::InvalidRequest);
+    }
+    Ok(bytes)
+}
+
 fn validate_preferences(p: &Preferences) -> Result<()> {
     if p.maximum_video_tracks == 0
         || p.maximum_video_tracks > 16
@@ -730,12 +939,22 @@ struct RawAudioSettings {
     bitrate: u32,
 }
 
-fn parse_configuration(
+#[derive(Clone, Copy)]
+enum ConfigurationMode {
+    ServerSoftware,
+    Native2k {
+        hevc_encoder: GoLiveEncoder,
+        h264_encoder: GoLiveEncoder,
+    },
+}
+
+fn parse_configuration_mode(
     bytes: &[u8],
     preferences: &Preferences,
     authentication: &PublishSecret,
     hosts: &[String],
     codecs: &[Codec],
+    mode: ConfigurationMode,
 ) -> Result<TwitchConfiguration> {
     validate_preferences(preferences)?;
     if bytes.len() > MAX_RESPONSE {
@@ -786,22 +1005,34 @@ fn parse_configuration(
             return Err(GoLiveError::InvalidResponse);
         }
         let audited = GoLiveEncoder::audited(v.encoder).ok_or(GoLiveError::UnsupportedEncoder)?;
-        if audited.executable_encoder().is_none()
-            || !codecs.contains(&audited.codec())
+        let common_invalid = !codecs.contains(&audited.codec())
             || v.settings.rate_control != "CBR"
             || v.settings.bitrate == 0
             || v.settings.bitrate > 20_000
             || !(1..=4).contains(&v.settings.keyint_sec)
             || !["baseline", "main", "high"].contains(&v.settings.profile)
-            || v.settings.bf.is_some_and(|bf| bf != 0)
-            || v.settings.preset.is_some_and(|s| s != "veryfast")
-            || v.settings.tune.is_some_and(|s| s != "zerolatency")
-            || v.settings.x264opts.is_some_and(|s| !s.is_empty())
             || v.colorspace.is_some_and(|s| s != "VIDEO_CS_709")
             || v.range.is_some_and(|s| s != "VIDEO_RANGE_PARTIAL")
             || v.format
-                .is_some_and(|s| !matches!(s, "VIDEO_FORMAT_NV12" | "VIDEO_FORMAT_I420"))
-        {
+                .is_some_and(|s| !matches!(s, "VIDEO_FORMAT_NV12" | "VIDEO_FORMAT_I420"));
+        let mode_invalid = match mode {
+            ConfigurationMode::ServerSoftware => {
+                audited.executable_encoder().is_none()
+                    || v.settings.bf.is_some_and(|bf| bf != 0)
+                    || v.settings.preset.is_some_and(|s| s != "veryfast")
+                    || v.settings.tune.is_some_and(|s| s != "zerolatency")
+                    || v.settings.x264opts.is_some_and(|s| !s.is_empty())
+            }
+            ConfigurationMode::Native2k {
+                hevc_encoder,
+                h264_encoder,
+            } => match audited.codec() {
+                Codec::Hevc => audited != hevc_encoder || v.settings.profile != "main",
+                Codec::H264 => audited != h264_encoder || v.settings.bf.is_some_and(|bf| bf > 2),
+                Codec::Av1 => true,
+            },
+        };
+        if common_invalid || mode_invalid {
             return Err(GoLiveError::UnsupportedEncoder);
         }
         bitrate += u64::from(v.settings.bitrate);
@@ -815,8 +1046,41 @@ fn parse_configuration(
             codec: audited.codec(),
             bitrate_kbps: v.settings.bitrate,
             keyframe_seconds: v.settings.keyint_sec,
+            bframes: v.settings.bf.unwrap_or(0),
             profile: v.settings.profile.into(),
         });
+    }
+    if matches!(mode, ConfigurationMode::Native2k { .. }) {
+        if video
+            .iter()
+            .any(|item| item.canvas_index != 0 || item.codec == Codec::Av1)
+            || video
+                .iter()
+                .filter(|item| {
+                    item.codec == Codec::Hevc
+                        && item.width == 2560
+                        && item.height == 1440
+                        && item.framerate
+                            == Rational {
+                                numerator: 60,
+                                denominator: 1,
+                            }
+                })
+                .count()
+                != 1
+            || video
+                .iter()
+                .any(|item| item.codec == Codec::Hevc && (item.width, item.height) != (2560, 1440))
+            || video.iter().any(|item| {
+                item.codec == Codec::H264
+                    && (item.width > 1920
+                        || item.height > 1080
+                        || u64::from(item.framerate.numerator)
+                            > 60 * u64::from(item.framerate.denominator))
+            })
+        {
+            return Err(GoLiveError::UnsupportedEncoder);
+        }
     }
     let vod = raw.audio_configurations.vod.as_deref().unwrap_or_default();
     if raw.audio_configurations.live.is_empty()
@@ -926,6 +1190,24 @@ fn parse_configuration(
         audio,
         encoders,
     })
+}
+
+#[cfg(test)]
+fn parse_configuration(
+    bytes: &[u8],
+    preferences: &Preferences,
+    authentication: &PublishSecret,
+    hosts: &[String],
+    codecs: &[Codec],
+) -> Result<TwitchConfiguration> {
+    parse_configuration_mode(
+        bytes,
+        preferences,
+        authentication,
+        hosts,
+        codecs,
+        ConfigurationMode::ServerSoftware,
+    )
 }
 
 #[cfg(test)]

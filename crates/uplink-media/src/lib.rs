@@ -267,6 +267,9 @@ pub struct ProgramVideo {
     pub wire_track: u8,
     pub canvas_index: u8,
     pub profile: VideoProfile,
+    /// Vom Plattformvertrag geforderte B-Frames für serverseitige Encodes.
+    /// Passthrough-Spuren werden nicht neu kodiert und ignorieren diesen Wert.
+    pub bframes: u32,
     pub layout: Option<LayoutSpec>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -17,6 +17,7 @@ pub(crate) struct EncodeProfile {
     pub video: VideoProfile,
     pub audio_encoding: Vec<(u8, crate::AudioEncoding)>,
     pub layout: Option<LayoutSpec>,
+    pub bframes: u32,
     /// Fehlende Farbmetadaten der Quelle bleiben unbekannt und werden nicht umetikettiert.
     pub signal_bt709: bool,
 }
@@ -181,6 +182,7 @@ impl Graph {
             profiles.push(EncodeProfile {
                 video: request.video.clone(),
                 layout,
+                bframes: 0,
                 signal_bt709: true,
                 audio_encoding: Vec::new(),
             });
@@ -396,6 +398,7 @@ impl Graph {
                         profiles.push(EncodeProfile {
                             video,
                             layout: output.layout.clone(),
+                            bframes: 0,
                             signal_bt709: false,
                             audio_encoding: Vec::new(),
                         });
@@ -552,6 +555,8 @@ impl Graph {
                         || profile.gop.keyframe_interval_frames == 0
                         || profile.gop.keyframe_interval_frames > 480
                         || !profile.gop.closed
+                        || request.bframes > 2
+                        || (profile.codec != Codec::H264 && request.bframes != 0)
                     {
                         return Err(MediaError::UnsupportedProfile);
                     }
@@ -574,8 +579,21 @@ impl Graph {
                     if let Some(layout) = &request.layout {
                         validate_layout_dimensions(layout, source.width, source.height, profile)?;
                     }
+                    let copy_source = request.canvas_index == 0
+                        && request.layout.is_none()
+                        && profile.codec == Codec::Hevc
+                        && source.codec == "hevc"
+                        && profile.width == source.width
+                        && profile.height == source.height
+                        && profile.fps == source_fps;
+                    if copy_source {
+                        video.push((None, request.wire_track));
+                        continue;
+                    }
                     let group = match graph.profiles.iter().position(|existing| {
-                        existing.video == *profile && existing.layout == request.layout
+                        existing.video == *profile
+                            && existing.layout == request.layout
+                            && existing.bframes == request.bframes
                     }) {
                         Some(index) => {
                             graph.profiles[index].signal_bt709 = true;
@@ -585,6 +603,7 @@ impl Graph {
                             graph.profiles.push(EncodeProfile {
                                 video: profile.clone(),
                                 layout: request.layout.clone(),
+                                bframes: request.bframes,
                                 signal_bt709: true,
                                 audio_encoding: audio_encoding.clone(),
                             });
@@ -593,15 +612,19 @@ impl Graph {
                     };
                     video.push((Some(group), request.wire_track));
                 }
-                for encoding in audio_encoding {
+                for &encoding in &audio_encoding {
                     if !shared_audio.contains(&encoding) {
                         shared_audio.push(encoding);
                     }
                 }
                 shared_audio_requests.extend(audio_requests);
+                let audio_group = video.iter().find_map(|(group, _)| *group);
+                if !audio_encoding.is_empty() && audio_group.is_none() {
+                    return Err(MediaError::UnsupportedProfile);
+                }
                 Ok(Routing {
                     timestamp_offset_ms: 0,
-                    group: video[0].0,
+                    group: audio_group,
                     video,
                     audio,
                     failure: None,
@@ -906,28 +929,42 @@ impl EncodeProfile {
     }
     fn encoder_args(&self, args: &mut Vec<OsString>, threads: usize) {
         let video = &self.video;
-        let codec_args: &[&str] = match video.codec {
-            Codec::H264 => &[
-                "-c:v",
-                "libx264",
-                "-preset",
-                "veryfast",
-                "-tune",
-                "zerolatency",
-                "-x264-params",
-                "nal-hrd=cbr:force-cfr=1",
-            ],
-            Codec::Hevc => &["-c:v", "libx265", "-preset", "fast"],
-            Codec::Av1 => &[
-                "-c:v",
-                "libsvtav1",
-                "-preset",
-                "8",
-                "-flags",
-                "+global_header",
-            ],
-        };
-        args.extend(codec_args.iter().map(OsString::from));
+        match video.codec {
+            Codec::H264 => {
+                args.extend(
+                    [
+                        "-c:v",
+                        "libx264",
+                        "-preset",
+                        "veryfast",
+                        "-x264-params",
+                        "nal-hrd=cbr:force-cfr=1",
+                    ]
+                    .into_iter()
+                    .map(OsString::from),
+                );
+                if self.bframes == 0 {
+                    args.extend(["-tune".into(), "zerolatency".into()]);
+                }
+            }
+            Codec::Hevc => args.extend(
+                ["-c:v", "libx265", "-preset", "fast"]
+                    .into_iter()
+                    .map(OsString::from),
+            ),
+            Codec::Av1 => args.extend(
+                [
+                    "-c:v",
+                    "libsvtav1",
+                    "-preset",
+                    "8",
+                    "-flags",
+                    "+global_header",
+                ]
+                .into_iter()
+                .map(OsString::from),
+            ),
+        }
         if video.codec == Codec::Hevc {
             args.extend(["-x265-params".into(),format!("log-level=error:strict-cbr=1:pools={threads}:frame-threads={threads}:rc-lookahead=0:bframes=0:open-gop=0").into()]);
         }
@@ -954,7 +991,7 @@ impl EncodeProfile {
                 video.gop.keyframe_interval_frames.to_string(),
             ),
             ("-sc_threshold", "0".into()),
-            ("-bf", "0".into()),
+            ("-bf", self.bframes.to_string()),
             ("-enc_time_base:v", "1:1000".into()),
             ("-fps_mode:v", "passthrough".into()),
         ] {
@@ -1043,6 +1080,7 @@ mod tests {
             wire_track,
             canvas_index,
             profile,
+            bframes: 0,
             layout,
         }
     }
@@ -1075,6 +1113,82 @@ mod tests {
             }),
         }
     }
+    #[test]
+    fn native_2k_program_copies_hevc_top_and_encodes_only_lower_h264() {
+        let mut source = program_source();
+        source.codec = "hevc".into();
+        source.width = 2560;
+        source.height = 1440;
+        source.fps_numerator = 60;
+        source.fps_denominator = 1;
+        let mut top = program_profile(Codec::Hevc, 2560, 1440);
+        top.fps = FrameRate::new(60, 1).unwrap();
+        top.rate.target_kbps = 9_000;
+        top.rate.max_kbps = 9_000;
+        top.rate.buffer_kbits = 18_000;
+        top.gop.keyframe_interval_frames = 120;
+        let mut lower = program_profile(Codec::H264, 1920, 1080);
+        lower.fps = FrameRate::new(60, 1).unwrap();
+        lower.rate.target_kbps = 7_500;
+        lower.rate.max_kbps = 7_500;
+        lower.rate.buffer_kbits = 15_000;
+        lower.gop.keyframe_interval_frames = 120;
+        let graph = Graph::program(
+            &source,
+            &[program_output(
+                "twitch",
+                vec![
+                    crate::ProgramVideo {
+                        wire_track: 0,
+                        canvas_index: 0,
+                        profile: top,
+                        bframes: 0,
+                        layout: None,
+                    },
+                    crate::ProgramVideo {
+                        wire_track: 1,
+                        canvas_index: 0,
+                        profile: lower,
+                        bframes: 2,
+                        layout: None,
+                    },
+                ],
+                vec![program_audio(0, 0)],
+            )],
+        )
+        .unwrap();
+        assert!(graph.routes[0].failure.is_none());
+        assert_eq!(
+            graph.profiles.len(),
+            1,
+            "1440p HEVC darf keinen Encode belegen"
+        );
+        assert_eq!(graph.profiles[0].video.codec, Codec::H264);
+        assert_eq!(graph.profiles[0].bframes, 2);
+        assert_eq!(graph.routes[0].video[0], (None, 0));
+        assert_eq!(graph.routes[0].video[1].1, 1);
+        assert!(graph.routes[0].video[1].0.is_some());
+        let status = graph.describe_route(&graph.routes[0], "twitch");
+        assert_eq!(status.video[0].mode, "copy");
+        assert_eq!(status.video[0].encoder, None);
+        assert_eq!(status.video[1].mode, "encode");
+        assert_eq!(status.video[1].encoder, Some("libx264"));
+        let args = graph
+            .arguments(&[PathBuf::from("/private/native-2k.sock")], 4, 0)
+            .unwrap();
+        let args: Vec<_> = args.iter().map(|value| value.to_string_lossy()).collect();
+        assert_eq!(
+            args.iter().filter(|arg| arg.as_ref() == "libx264").count(),
+            1
+        );
+        assert!(!args.iter().any(|arg| arg.as_ref() == "libx265"));
+        assert!(!args.iter().any(|arg| arg.as_ref() == "zerolatency"));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0].as_ref() == "-bf" && pair[1].as_ref() == "2")
+        );
+    }
+
     #[test]
     fn program_caps_output_frame_rate_like_the_single_track_path() {
         let mut source = program_source();
@@ -1486,6 +1600,7 @@ mod tests {
             wire_track: id,
             canvas_index: 0,
             profile: profile.clone(),
+            bframes: 0,
             layout: None,
         };
         let outputs = [

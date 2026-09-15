@@ -169,12 +169,14 @@ pub(super) async fn run(ffmpeg: &std::path::Path, ffprobe: &std::path::Path) -> 
                     wire_track: 0,
                     canvas_index: 0,
                     profile: horizontal.clone(),
+                    bframes: 0,
                     layout: None,
                 },
                 ProgramVideo {
                     wire_track: 5,
                     canvas_index: 1,
                     profile: vertical,
+                    bframes: 0,
                     layout: Some(LayoutSpec {
                         revision: LayoutRevision { id: 1, revision: 1 },
                         composition: Composition::Crop(Crop {
@@ -205,6 +207,7 @@ pub(super) async fn run(ffmpeg: &std::path::Path, ffprobe: &std::path::Path) -> 
                 wire_track: 0,
                 canvas_index: 0,
                 profile: horizontal.clone(),
+                bframes: 0,
                 layout: None,
             }],
             audio: vec![ProgramAudio {
@@ -219,6 +222,7 @@ pub(super) async fn run(ffmpeg: &std::path::Path, ffprobe: &std::path::Path) -> 
                 wire_track: 0,
                 canvas_index: 0,
                 profile: horizontal,
+                bframes: 0,
                 layout: None,
             }],
             audio: vec![ProgramAudio {

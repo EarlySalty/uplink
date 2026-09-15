@@ -193,6 +193,7 @@ async fn start_public(
                             wire_track: 0,
                             canvas_index: 0,
                             profile: profile(),
+                            bframes: 0,
                             layout: None,
                         }],
                         audio: vec![ProgramAudio {
@@ -407,6 +408,7 @@ async fn mixed_program_case(offset: u32) {
                         wire_track: index as u8,
                         canvas_index: 0,
                         profile,
+                        bframes: 0,
                         layout: None,
                     })
                     .collect(),

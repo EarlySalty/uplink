@@ -7,6 +7,11 @@ pub enum TwitchOutputMode {
     #[default]
     Single,
     Enhanced,
+    /// Echter Twitch-2K-Pfad: 2560×1440@60 HEVC kommt bereits vom Quellrechner
+    /// und wird unverändert an Twitch weitergereicht; nur niedrigere H.264-Stufen
+    /// werden auf dem Uplink-Server erzeugt.
+    #[serde(rename = "native_2k")]
+    Native2k,
 }
 
 impl TwitchOutputMode {
@@ -14,6 +19,7 @@ impl TwitchOutputMode {
         match self {
             Self::Single => "single",
             Self::Enhanced => "enhanced",
+            Self::Native2k => "native_2k",
         }
     }
 }

@@ -43,6 +43,17 @@ max_tracks = 8
 live_audio_track = 0
 vod_audio_track = 1
 
+# Native Twitch-2K monopolisiert das gemessene Transcoding-Budget: die
+# 1440p-HEVC-Spur wird nur kopiert, 1080p/720p/360p laufen bei Bedarf ueber x264.
+# 100 ist nur eine relative Admission-Skala, keine Leistungszahl.
+[media.enhanced]
+maximum_video_tracks = 8
+maximum_aggregate_bitrate = 30000
+capacity_units = 100
+legacy_session_units = 1
+native_2k_units = 99
+profiles = []
+
 [[platforms]]
 name = "twitch"
 allowed_hosts = ["live.twitch.tv", "ingest.global-contribute.live-video.net"]

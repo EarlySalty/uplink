@@ -177,6 +177,7 @@ impl Profile {
             wire_track: self.wire_track,
             canvas_index: self.canvas_index,
             profile,
+            bframes: 0,
             layout,
         })
     }

@@ -65,6 +65,12 @@ pub fn router(state: Arc<ServiceState>) -> Router {
             .route("/v1/me/dock/rotate", post(rotate_dock))
             .route("/v1/me/dock-token/rotate", post(rotate_dock))
             .route("/v1/me/reconnect-wait", put(reconnect_wait))
+            .route(
+                "/v1/me/twitch/native-2k-hardware",
+                get(native_2k_hardware)
+                    .put(save_native_2k_hardware)
+                    .delete(delete_native_2k_hardware),
+            )
             .route("/v1/me/destinations/{platform}", delete(delete_destination))
             .route("/v1/caps", get(caps))
             .route("/v1/admin/waitlist", get(admin_waitlist))
@@ -714,6 +720,113 @@ async fn reconnect_wait(
         json!({"reconnect_wait_s":body.reconnect_wait_s,"applied":false,"message":"Frist gespeichert. Die Wiederverbindung der neuen Medienstrecke ist noch nicht freigegeben."}),
     ))
 }
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Native2kHardwareUpdate {
+    streamer_id: i64,
+    profile: uplink_media::platform::twitch::Native2kClientProfile,
+}
+
+async fn native_2k_hardware(
+    State(state): State<Arc<ServiceState>>,
+    headers: HeaderMap,
+    Query(query): Query<TenantQuery>,
+) -> ApiResult {
+    authorize(&state, &headers, query.streamer_id)?;
+    let rows = state
+        .store
+        .query(
+            "SELECT twitch_native_2k_hardware FROM relay.users WHERE streamer_id=$1 AND enabled=true",
+            &[&query.streamer_id],
+        )
+        .await
+        .map_err(|e| failure(StatusCode::SERVICE_UNAVAILABLE, e))?;
+    let Some(row) = rows.first() else {
+        return Err(failure(
+            StatusCode::FORBIDDEN,
+            "Der Zugang ist nicht freigeschaltet.",
+        ));
+    };
+    let value: Option<serde_json::Value> = row.try_get(0).map_err(|_| {
+        failure(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "2K-Hardwareprofil ist nicht lesbar.",
+        )
+    })?;
+    if let Some(value) = value {
+        let profile: uplink_media::platform::twitch::Native2kClientProfile =
+            serde_json::from_value(value)
+                .map_err(|_| failure(StatusCode::CONFLICT, "2K-Hardwareprofil ist ungültig."))?;
+        profile
+            .validate()
+            .map_err(|_| failure(StatusCode::CONFLICT, "2K-Hardwareprofil ist ungültig."))?;
+        Ok(Json(json!({"configured":true,"profile":profile})))
+    } else {
+        Ok(Json(json!({"configured":false,"profile":null})))
+    }
+}
+
+async fn save_native_2k_hardware(
+    State(state): State<Arc<ServiceState>>,
+    headers: HeaderMap,
+    body: Result<Json<Native2kHardwareUpdate>, axum::extract::rejection::JsonRejection>,
+) -> ApiResult {
+    let Json(body) = body.map_err(|_| {
+        failure(
+            StatusCode::BAD_REQUEST,
+            "2K-Hardwareprofil enthält ungültige Daten.",
+        )
+    })?;
+    authorize(&state, &headers, body.streamer_id)?;
+    body.profile
+        .validate()
+        .map_err(|_| failure(StatusCode::BAD_REQUEST, "2K-Hardwareprofil ist ungültig."))?;
+    let value = serde_json::to_value(&body.profile)
+        .map_err(|_| failure(StatusCode::BAD_REQUEST, "2K-Hardwareprofil ist ungültig."))?;
+    let rows = state
+        .store
+        .query(
+            "UPDATE relay.users SET twitch_native_2k_hardware=$2 WHERE streamer_id=$1 AND enabled=true RETURNING streamer_id",
+            &[&body.streamer_id, &value],
+        )
+        .await
+        .map_err(|e| failure(StatusCode::SERVICE_UNAVAILABLE, e))?;
+    if rows.is_empty() {
+        return Err(failure(
+            StatusCode::FORBIDDEN,
+            "Der Zugang ist nicht freigeschaltet.",
+        ));
+    }
+    Ok(Json(json!({
+        "configured":true,
+        "message":"Hardwareprofil gespeichert. Native 2K wird trotzdem erst bei einem echten 2560×1440@60-HEVC-Eingang und einer passenden Twitch-GoLive-Konfiguration aktiviert."
+    })))
+}
+
+async fn delete_native_2k_hardware(
+    State(state): State<Arc<ServiceState>>,
+    headers: HeaderMap,
+    Query(query): Query<TenantQuery>,
+) -> ApiResult {
+    authorize(&state, &headers, query.streamer_id)?;
+    let rows = state
+        .store
+        .query(
+            "UPDATE relay.users SET twitch_native_2k_hardware=NULL WHERE streamer_id=$1 AND enabled=true RETURNING streamer_id",
+            &[&query.streamer_id],
+        )
+        .await
+        .map_err(|e| failure(StatusCode::SERVICE_UNAVAILABLE, e))?;
+    if rows.is_empty() {
+        return Err(failure(
+            StatusCode::FORBIDDEN,
+            "Der Zugang ist nicht freigeschaltet.",
+        ));
+    }
+    Ok(Json(json!({"configured":false})))
+}
+
 #[derive(Deserialize)]
 struct DestinationDeleteQuery {
     streamer_id: i64,

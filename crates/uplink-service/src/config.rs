@@ -252,7 +252,9 @@ impl Config {
             || enhanced.legacy_session_units == 0
             || enhanced.profiles.len() > 128
             || (enhanced.capacity_units > 0
-                && enhanced.legacy_session_units > enhanced.capacity_units)
+                && (enhanced.legacy_session_units > enhanced.capacity_units
+                    || enhanced.native_2k_units > enhanced.capacity_units))
+            || (enhanced.capacity_units == 0 && enhanced.native_2k_units != 0)
             || enhanced.profiles.iter().any(|profile| {
                 profile.key.is_empty()
                     || profile.key.len() > 4096
@@ -307,6 +309,10 @@ pub struct EnhancedConfig {
     pub capacity_units: u32,
     #[serde(default = "legacy_units")]
     pub legacy_session_units: u32,
+    /// Zusaetzliche Einheiten fuer genau einen Native-2K-Hybrid. Null bedeutet:
+    /// nicht fuer Produktion freigegeben.
+    #[serde(default)]
+    pub native_2k_units: u32,
     #[serde(default)]
     pub profiles: Vec<CapacityProfile>,
 }
@@ -320,7 +326,9 @@ fn enhanced_tracks() -> u32 {
     8
 }
 fn enhanced_bitrate() -> u64 {
-    20000
+    // Deckt den bereits gemessenen Twitch-1440p-Vertrag einschließlich
+    // 1080p/720p/360p und zweier AAC-Spuren ab; Twitch darf darunter bleiben.
+    30_000
 }
 fn legacy_units() -> u32 {
     1
@@ -332,6 +340,7 @@ impl Default for EnhancedConfig {
             maximum_aggregate_bitrate: enhanced_bitrate(),
             capacity_units: 0,
             legacy_session_units: 1,
+            native_2k_units: 0,
             profiles: Vec::new(),
         }
     }

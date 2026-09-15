@@ -182,6 +182,115 @@ impl Coordinator {
         .map_err(TwitchOutputError::Blocked)
     }
 
+    async fn native_2k_profile(
+        &self,
+        tenant: i64,
+    ) -> Result<uplink_media::platform::twitch::Native2kClientProfile, &'static str> {
+        let rows = self
+            .state
+            .store
+            .query(
+                "SELECT twitch_native_2k_hardware FROM relay.users WHERE streamer_id=$1 AND enabled=true",
+                &[&tenant],
+            )
+            .await
+            .map_err(|_| "Das 2K-Hardwareprofil konnte nicht gelesen werden.")?;
+        let value: Option<serde_json::Value> = rows
+            .first()
+            .ok_or("Der Uplink-Zugang ist nicht freigeschaltet.")?
+            .try_get(0)
+            .map_err(|_| "Das 2K-Hardwareprofil ist beschädigt.")?;
+        let value = value.ok_or(
+            "Für Native Twitch-2K fehlen die Hardwaredaten des tatsächlich HEVC-kodierenden Quellrechners.",
+        )?;
+        let profile: uplink_media::platform::twitch::Native2kClientProfile =
+            serde_json::from_value(value).map_err(|_| "Das 2K-Hardwareprofil ist beschädigt.")?;
+        profile
+            .validate()
+            .map_err(|_| "Das 2K-Hardwareprofil ist ungültig.")?;
+        Ok(profile)
+    }
+
+    async fn twitch_native_2k_output(
+        &self,
+        tenant: u64,
+        wunsch: &Zielwunsch,
+        source: &uplink_media::SourceObservation,
+    ) -> Result<uplink_media::ProgramOutput, TwitchOutputError> {
+        if wunsch.hochkant.is_some() {
+            return Err(TwitchOutputError::Blocked(
+                "Native 2K und Hochkant werden getrennt freigegeben; für diesen Pfad darf keine zweite Canvas aktiv sein.",
+            ));
+        }
+        if source.codec != "hevc"
+            || source.width != 2560
+            || source.height != 1440
+            || source.fps_numerator != 60
+            || source.fps_denominator != 1
+        {
+            return Err(TwitchOutputError::Blocked(
+                "Native Twitch-2K benötigt als Eingang exakt 2560×1440@60 HEVC; AV1/H.264 werden dafür nicht umkodiert.",
+            ));
+        }
+        let hardware = self
+            .hardware
+            .get_or_init(|| uplink_media::platform::hardware::measure(&self.engine_config))
+            .await
+            .as_ref()
+            .map_err(|_| {
+                TwitchOutputError::Blocked("Die Serverencoder konnten nicht bestätigt werden.")
+            })?;
+        if !hardware.encoders.iter().any(|probe| {
+            probe.initialized
+                && probe.codec == uplink_core::Codec::H264
+                && probe.encoder == "libx264"
+        }) {
+            return Err(TwitchOutputError::Blocked(
+                "Für die niedrigeren Twitch-2K-Stufen ist libx264 auf diesem Server nicht bestätigt.",
+            ));
+        }
+        let tenant = i64::try_from(tenant).map_err(|_| "Nutzeridentität ist ungültig.")?;
+        let client = self.native_2k_profile(tenant).await?;
+        let mut preferences = crate::media_output::preferences(
+            source,
+            &wunsch.output,
+            &self.state.config.media.enhanced,
+            None,
+        )?;
+        if preferences.maximum_video_tracks < 5 {
+            return Err(TwitchOutputError::Blocked(
+                "Native 2K benötigt ein Enhanced-Limit von mindestens fünf Videospuren.",
+            ));
+        }
+        // Der gemessene Querformat-Vertrag lag bei rund 20,5 Mbit/s Video plus
+        // Audio. Unterhalb dieser Grenze soll Twitch nicht zu einer kleineren
+        // Leiter gezwungen werden; der konkrete Vertrag bleibt Twitch-gesteuert.
+        if preferences.maximum_aggregate_bitrate < 21_000 {
+            return Err(TwitchOutputError::Blocked(
+                "Das Enhanced-Bandbreitenlimit ist für Native 2K zu niedrig.",
+            ));
+        }
+        preferences.canvases.truncate(1);
+        let configuration = uplink_media::platform::twitch::GoLiveClient::new()
+            .map_err(|error| TwitchOutputError::Blocked(error.message()))?
+            .configure_native_2k(
+                &wunsch.output.target.playpath,
+                &client,
+                &preferences,
+                &wunsch.output.target.allowed_hosts,
+            )
+            .await
+            .map_err(|error| TwitchOutputError::Blocked(error.message()))?;
+        crate::media_output::twitch_native_2k(
+            configuration,
+            wunsch.output.live_audio_track,
+            wunsch.output.vod_audio_track,
+            source,
+            &client,
+        )
+        .map_err(TwitchOutputError::Blocked)
+    }
+
     async fn gespeicherte_hochkant_wahl(
         &self,
         tenant: i64,
@@ -294,6 +403,7 @@ impl Coordinator {
         {
             "single" => crate::destinations::TwitchOutputMode::Single,
             "enhanced" if platform == "twitch" => crate::destinations::TwitchOutputMode::Enhanced,
+            "native_2k" if platform == "twitch" => crate::destinations::TwitchOutputMode::Native2k,
             _ => return Err("Gespeicherter Ausgabemodus ist ungültig."),
         };
         Ok(Zielwunsch {
@@ -501,6 +611,36 @@ impl SessionProcessor for Coordinator {
                 .await
             {
                 reservation.block_output(platform, reason);
+                continue;
+            }
+            if wunsch.output_mode == crate::destinations::TwitchOutputMode::Native2k {
+                let units = self.state.config.media.enhanced.native_2k_units;
+                if units == 0 {
+                    reservation.block_output(
+                        platform,
+                        "Native Twitch-2K ist auf diesem Server noch nicht durch ein Kapazitätsbudget freigegeben.",
+                    );
+                    continue;
+                }
+                match self
+                    .twitch_native_2k_output(tenant_wert, &wunsch, prepared.observation())
+                    .await
+                {
+                    Ok(program) => {
+                        if let Err(reason) = reservation.reserve_profile_capacity(units) {
+                            reservation.block_output(platform, reason);
+                            continue;
+                        }
+                        reservation.output_notice(
+                            platform.clone(),
+                            "Native 2K: 1440p60 HEVC wird unverändert durchgereicht; nur von Twitch angeforderte niedrigere H.264-Stufen werden serverseitig erzeugt.",
+                        );
+                        programs.push(program);
+                    }
+                    Err(
+                        TwitchOutputError::Blocked(reason) | TwitchOutputError::Fallback(reason),
+                    ) => reservation.block_output(platform, reason),
+                }
                 continue;
             }
             if self.state.config.media.enhanced.profiles.is_empty() {

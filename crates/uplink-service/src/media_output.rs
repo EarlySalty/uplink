@@ -213,6 +213,7 @@ pub fn twitch(
             wire_track: item.wire_track,
             canvas_index: item.canvas_index as u8,
             profile,
+            bframes: item.bframes,
             layout,
         });
     }
@@ -233,6 +234,108 @@ pub fn twitch(
                     channels: item.channels,
                     bitrate_kbps: item.bitrate_kbps,
                 }),
+            })
+        })
+        .collect::<Result<Vec<_>, &'static str>>()?;
+    Ok(ProgramOutput {
+        target: config.target,
+        video,
+        audio,
+    })
+}
+
+pub fn twitch_native_2k(
+    config: TwitchConfiguration,
+    live: u8,
+    vod: Option<u8>,
+    source: &SourceObservation,
+    client: &uplink_media::platform::twitch::Native2kClientProfile,
+) -> Result<ProgramOutput, &'static str> {
+    let (hevc_encoder, h264_encoder) = client
+        .validate()
+        .map_err(|_| "Das gespeicherte 2K-Hardwareprofil ist ungültig.")?;
+    if source.codec != "hevc"
+        || source.width != 2560
+        || source.height != 1440
+        || source.fps_numerator != 60
+        || source.fps_denominator != 1
+        || source.pixel_format != "yuv420p"
+        || source.color_primaries.as_deref() != Some("bt709")
+        || source.color_transfer.as_deref() != Some("bt709")
+        || source.color_matrix.as_deref() != Some("bt709")
+        || source.color_range.as_deref() != Some("tv")
+    {
+        return Err(
+            "Native Twitch-2K benötigt einen gemessenen 2560×1440@60-HEVC-Eingang in 8-Bit YUV420 BT.709.",
+        );
+    }
+    if config.video.is_empty() || config.video.len() != config.encoders.len() {
+        return Err("Twitch hat keinen vollständigen 2K-Videovertrag geliefert.");
+    }
+    let mut top_tracks = 0usize;
+    let mut video = Vec::with_capacity(config.video.len());
+    for (item, encoder) in config.video.into_iter().zip(config.encoders) {
+        if item.canvas_index != 0 || item.codec != encoder.codec() || item.codec == Codec::Av1 {
+            return Err("Twitch hat für Native 2K eine nicht unterstützte Videospur geliefert.");
+        }
+        let top = item.codec == Codec::Hevc
+            && item.width == 2560
+            && item.height == 1440
+            && item.framerate
+                == Rational {
+                    numerator: 60,
+                    denominator: 1,
+                };
+        if top {
+            if encoder != hevc_encoder || item.profile != "main" || item.bframes != 0 {
+                return Err("Die Twitch-2K-HEVC-Spur passt nicht zum Quellrechnervertrag.");
+            }
+            top_tracks += 1;
+        } else if item.codec != Codec::H264
+            || encoder != h264_encoder
+            || item.width > 1920
+            || item.height > 1080
+        {
+            return Err(
+                "Eine niedrigere Twitch-2K-Stufe kann auf diesem Server nicht sicher erzeugt werden.",
+            );
+        }
+        let fps = FrameRate::new(item.framerate.numerator, item.framerate.denominator)
+            .map_err(|_| "Twitch-Bildrate ist ungültig.")?;
+        let profile = profile(
+            item.width,
+            item.height,
+            fps,
+            item.codec,
+            item.bitrate_kbps,
+            item.keyframe_seconds,
+            item.profile,
+        )?;
+        video.push(ProgramVideo {
+            wire_track: item.wire_track,
+            canvas_index: 0,
+            profile,
+            bframes: if top { 0 } else { item.bframes },
+            layout: None,
+        });
+    }
+    if top_tracks != 1 {
+        return Err("Twitch hat nicht genau eine native 2560×1440@60-HEVC-Spur freigegeben.");
+    }
+    let audio = config
+        .audio
+        .into_iter()
+        .map(|item| {
+            Ok(ProgramAudio {
+                source_wire_track: match item.role {
+                    AudioRole::Live => live,
+                    AudioRole::Vod => vod.ok_or("Die von Twitch geforderte VOD-Tonspur fehlt.")?,
+                },
+                destination_wire_track: item.wire_track,
+                // Der Native-2K-Pfad verändert den bereits AAC/48-kHz-validierten
+                // OBS-Ton nicht. So bleibt auch ein Twitch-Vertrag mit nur der
+                // serverseitig transkodierten 2K-Topspur ohne extra Videoencode lauffähig.
+                encoding: None,
             })
         })
         .collect::<Result<Vec<_>, &'static str>>()?;
@@ -293,7 +396,10 @@ pub fn capacity_key(source: &SourceObservation, output: &ProgramOutput) -> Strin
 mod tests {
     use super::*;
     use uplink_core::Codec;
-    use uplink_media::platform::twitch::{AudioConfiguration, VideoConfiguration};
+    use uplink_media::platform::twitch::{
+        AudioConfiguration, ClientCapabilities, ClientCpu, ClientGpu, ClientMemory, ClientSystem,
+        Native2kClientProfile, VideoConfiguration,
+    };
     use uplink_media::{AudioObservation, Crop, DesiredVideo, PublishSecret, PublishTarget};
 
     fn quelle() -> SourceObservation {
@@ -336,6 +442,7 @@ mod tests {
             codec: Codec::H264,
             bitrate_kbps: 4500,
             keyframe_seconds: 2,
+            bframes: 0,
             profile: "high".into(),
         }
     }
@@ -522,6 +629,143 @@ mod tests {
             (mit.canvases[1].width, mit.canvases[1].height),
             (1080, 1920)
         );
+    }
+
+    fn native_client() -> Native2kClientProfile {
+        Native2kClientProfile {
+            capabilities: ClientCapabilities {
+                cpu: ClientCpu {
+                    physical_cores: 12,
+                    logical_cores: 24,
+                    name: Some("Synthetic CPU".into()),
+                    speed: Some(4700),
+                },
+                memory: ClientMemory {
+                    total: 32 * 1024 * 1024 * 1024,
+                    free: 16 * 1024 * 1024 * 1024,
+                },
+                system: ClientSystem {
+                    name: "Windows".into(),
+                    version: "11".into(),
+                    release: "23H2".into(),
+                    revision: "synthetic".into(),
+                    bits: 64,
+                    arm: false,
+                    build: 22631,
+                    arm_emulation: false,
+                },
+                gpu: vec![ClientGpu {
+                    model: "Synthetic Radeon".into(),
+                    vendor_id: 0x1002,
+                    device_id: 0x744c,
+                    dedicated_video_memory: 20 * 1024 * 1024 * 1024,
+                    shared_system_memory: 16 * 1024 * 1024 * 1024,
+                    driver_version: "synthetic".into(),
+                }],
+                gaming_features: None,
+            },
+            hevc_encoder: "h265_texture_amf".into(),
+            h264_encoder: "h264_texture_amf".into(),
+        }
+    }
+
+    #[test]
+    fn native_2k_baut_hevc_copy_top_und_h264_serverstufen() {
+        let mut source = quelle();
+        source.codec = "hevc".into();
+        source.width = 2560;
+        source.height = 1440;
+        source.fps_numerator = 60;
+        source.fps_denominator = 1;
+        source.pixel_format = "yuv420p".into();
+        source.color_primaries = Some("bt709".into());
+        source.color_transfer = Some("bt709".into());
+        source.color_matrix = Some("bt709".into());
+        source.color_range = Some("tv".into());
+        source.audio.push(AudioObservation {
+            wire_track: 1,
+            codec: "aac".into(),
+            sample_rate: 48000,
+            channels: 2,
+        });
+        let target = PublishTarget {
+            id: "twitch".into(),
+            endpoint: "rtmps://ingest.example/app".into(),
+            playpath: PublishSecret::new(b"synthetic-key".to_vec()).unwrap(),
+            tls: None,
+            allowed_hosts: vec!["ingest.example".into()],
+            allow_loopback: false,
+            allow_unencrypted: false,
+        };
+        let video = vec![
+            VideoConfiguration {
+                wire_track: 0,
+                canvas_index: 0,
+                width: 2560,
+                height: 1440,
+                framerate: Rational {
+                    numerator: 60,
+                    denominator: 1,
+                },
+                codec: Codec::Hevc,
+                bitrate_kbps: 9000,
+                keyframe_seconds: 2,
+                bframes: 0,
+                profile: "main".into(),
+            },
+            VideoConfiguration {
+                wire_track: 1,
+                canvas_index: 0,
+                width: 1920,
+                height: 1080,
+                framerate: Rational {
+                    numerator: 60,
+                    denominator: 1,
+                },
+                codec: Codec::H264,
+                bitrate_kbps: 7500,
+                keyframe_seconds: 2,
+                bframes: 2,
+                profile: "high".into(),
+            },
+        ];
+        let config = TwitchConfiguration {
+            target,
+            encoders: vec![GoLiveEncoder::H265TextureAmf, GoLiveEncoder::H264TextureAmf],
+            video,
+            audio: vec![
+                AudioConfiguration {
+                    wire_track: 0,
+                    role: AudioRole::Live,
+                    channels: 2,
+                    bitrate_kbps: 160,
+                },
+                AudioConfiguration {
+                    wire_track: 1,
+                    role: AudioRole::Vod,
+                    channels: 2,
+                    bitrate_kbps: 160,
+                },
+            ],
+        };
+        let program = twitch_native_2k(config, 0, Some(1), &source, &native_client()).unwrap();
+        assert_eq!(program.video.len(), 2);
+        assert_eq!(program.video[0].profile.codec, Codec::Hevc);
+        assert_eq!(program.video[0].bframes, 0);
+        assert_eq!(program.video[1].profile.codec, Codec::H264);
+        assert_eq!(program.video[1].bframes, 2);
+        assert!(program.audio.iter().all(|audio| audio.encoding.is_none()));
+    }
+
+    #[test]
+    fn native_2k_lehnt_av1_oder_1080p_quelle_ab() {
+        let source = quelle();
+        let config = konfiguration(vec![stufe(0, 0, 1920, 1080)]);
+        let error = match twitch_native_2k(config, 0, None, &source, &native_client()) {
+            Err(error) => error,
+            Ok(_) => panic!("1080p/AV1-Quelle darf nicht als Native 2K gelten"),
+        };
+        assert!(error.contains("2560×1440"));
     }
 
     fn test_wunsch() -> DesiredOutput {

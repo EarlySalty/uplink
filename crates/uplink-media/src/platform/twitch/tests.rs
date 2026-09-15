@@ -656,3 +656,134 @@ fn twitch_encoder_identity_is_preserved_for_integration_audit() {
     );
     assert!(format!("{configuration:?}").contains("ObsX264"));
 }
+
+fn native_2k_client() -> Native2kClientProfile {
+    Native2kClientProfile {
+        capabilities: ClientCapabilities {
+            cpu: ClientCpu {
+                physical_cores: 12,
+                logical_cores: 24,
+                name: Some("Synthetic Ryzen".into()),
+                speed: Some(4700),
+            },
+            memory: ClientMemory {
+                total: 32 * 1024 * 1024 * 1024,
+                free: 16 * 1024 * 1024 * 1024,
+            },
+            system: ClientSystem {
+                name: "Windows".into(),
+                version: "11".into(),
+                release: "23H2".into(),
+                revision: "synthetic".into(),
+                bits: 64,
+                arm: false,
+                build: 22631,
+                arm_emulation: false,
+            },
+            gpu: vec![ClientGpu {
+                model: "Synthetic Radeon".into(),
+                vendor_id: 0x1002,
+                device_id: 0x744c,
+                dedicated_video_memory: 20 * 1024 * 1024 * 1024,
+                shared_system_memory: 16 * 1024 * 1024 * 1024,
+                driver_version: "synthetic-driver".into(),
+            }],
+            gaming_features: None,
+        },
+        hevc_encoder: "h265_texture_amf".into(),
+        h264_encoder: "h264_texture_amf".into(),
+    }
+}
+
+fn native_2k_response() -> Vec<u8> {
+    let mut top = hardware_quality("h265_texture_amf", 2560, 1440, 9_000);
+    top["settings"]["profile"] = serde_json::json!("main");
+    let mut full_hd = hardware_quality("h264_texture_amf", 1920, 1080, 7_500);
+    full_hd["settings"]["bf"] = serde_json::json!(2);
+    let mut hd = hardware_quality("h264_texture_amf", 1280, 720, 3_500);
+    hd["settings"]["bf"] = serde_json::json!(2);
+    let mut low = hardware_quality("h264_texture_amf", 640, 360, 500);
+    low["framerate"] = serde_json::json!({"numerator":30,"denominator":1});
+    low["settings"]["profile"] = serde_json::json!("main");
+    low["settings"]["bf"] = serde_json::json!(2);
+    build_response(
+        &[top, full_hd, hd, low],
+        &[audio_track(0, 160)],
+        &[audio_track(1, 160)],
+    )
+}
+
+#[test]
+fn native_2k_request_forwards_source_gpu_and_never_advertises_av1() {
+    let profile = native_2k_client();
+    let bytes = request_native_2k_body(
+        &key(),
+        &profile,
+        &preferences_with(30_000, 5),
+        &[Codec::Hevc, Codec::H264],
+    )
+    .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(value["capabilities"]["gpu"][0]["vendor_id"], 0x1002);
+    assert_eq!(value["capabilities"]["gpu"][0]["device_id"], 0x744c);
+    assert_eq!(value["preferences"]["composition_gpu_index"], 0);
+    assert_eq!(
+        value["client"]["supported_codecs"],
+        serde_json::json!(["h265", "h264"])
+    );
+    assert!(!bytes.windows(3).any(|window| window == b"av1"));
+}
+
+#[test]
+fn native_2k_contract_accepts_hevc_top_and_h264_lower_tiers() {
+    let profile = native_2k_client();
+    let (hevc_encoder, h264_encoder) = profile.validate().unwrap();
+    let config = parse_configuration_mode(
+        &native_2k_response(),
+        &preferences_with(30_000, 5),
+        &key(),
+        &hosts(),
+        &[Codec::Hevc, Codec::H264],
+        ConfigurationMode::Native2k {
+            hevc_encoder,
+            h264_encoder,
+        },
+    )
+    .unwrap();
+    assert_eq!(config.video.len(), 4);
+    assert_eq!(config.video[0].codec, Codec::Hevc);
+    assert_eq!(
+        (config.video[0].width, config.video[0].height),
+        (2560, 1440)
+    );
+    assert_eq!(config.video[0].bitrate_kbps, 9_000);
+    assert_eq!(config.video[1].codec, Codec::H264);
+    assert_eq!(config.video[1].bframes, 2);
+    assert_eq!(
+        config.encoders,
+        vec![hevc_encoder, h264_encoder, h264_encoder, h264_encoder]
+    );
+}
+
+#[test]
+fn native_2k_contract_rejects_av1_and_missing_1440_hevc() {
+    let profile = native_2k_client();
+    let (hevc_encoder, h264_encoder) = profile.validate().unwrap();
+    let mut response = serde_json::from_slice::<serde_json::Value>(&native_2k_response()).unwrap();
+    response["encoder_configurations"][0]["type"] = serde_json::json!("av1_texture_amf");
+    let bytes = response.to_string().into_bytes();
+    assert!(matches!(
+        parse_configuration_mode(
+            &bytes,
+            &preferences_with(30_000, 5),
+            &key(),
+            &hosts(),
+            &[Codec::Hevc, Codec::H264],
+            ConfigurationMode::Native2k {
+                hevc_encoder,
+                h264_encoder,
+            },
+        ),
+        Err(GoLiveError::UnsupportedEncoder)
+    ));
+}

@@ -322,12 +322,14 @@ fn mehrspur_video() -> Vec<ProgramVideo> {
             wire_track: 0,
             canvas_index: 0,
             profile: profil(Codec::H264, 256, 144),
+            bframes: 0,
             layout: None,
         },
         ProgramVideo {
             wire_track: 5,
             canvas_index: 1,
             profile: profil(Codec::Hevc, 144, 256),
+            bframes: 0,
             layout: Some(hochkant_layout()),
         },
     ]
@@ -455,6 +457,7 @@ async fn mixed_codec_program_output_preserves_headers_tracks_and_timebase() {
                             wire_track: 0,
                             canvas_index: 0,
                             profile: profil(Codec::H264, 256, 144),
+                            bframes: 0,
                             layout: None,
                         }],
                         audio: vec![ProgramAudio {

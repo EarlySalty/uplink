@@ -65,6 +65,7 @@ async fn output_mode_migration_keeps_legacy_rows_and_enforces_platform_constrain
     assert!(rows.iter().all(|row| row.get::<_, String>(0) == "single"));
     for statement in [
         "UPDATE relay.destinations SET twitch_output_mode='enhanced' WHERE platform='kick'",
+        "UPDATE relay.destinations SET twitch_output_mode='native_2k' WHERE platform='kick'",
         "UPDATE relay.destinations SET twitch_output_mode='automatic' WHERE platform='twitch'",
         "UPDATE relay.destinations SET twitch_output_mode=NULL WHERE platform='twitch'",
     ] {
@@ -225,6 +226,151 @@ async fn twitch_output_mode_survives_refresh_and_rejects_invalid_choices() {
         .await
         .unwrap();
     assert_eq!(rows[0].get::<_, String>(0), "enhanced");
+    database.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "Benötigt isolierte PostgreSQL-16-Testinstanz."]
+async fn native_2k_hardware_roundtrips_and_mode_is_twitch_only() {
+    let (database, state) = fixture().await;
+    let app = router(state.clone());
+    let profile = serde_json::json!({
+        "capabilities": {
+            "cpu": {
+                "physical_cores": 12,
+                "logical_cores": 24,
+                "name": "Synthetic Ryzen",
+                "speed": 4700
+            },
+            "memory": {
+                "total": 34359738368u64,
+                "free": 17179869184u64
+            },
+            "system": {
+                "name": "Windows",
+                "version": "11",
+                "release": "23H2",
+                "revision": "synthetic",
+                "bits": 64,
+                "arm": false,
+                "build": 22631,
+                "armEmulation": false
+            },
+            "gpu": [{
+                "model": "Synthetic Radeon",
+                "vendor_id": 4098,
+                "device_id": 29772,
+                "dedicated_video_memory": 21474836480u64,
+                "shared_system_memory": 17179869184u64,
+                "driver_version": "synthetic-driver"
+            }],
+            "gaming_features": null
+        },
+        "hevc_encoder": "h265_texture_amf",
+        "h264_encoder": "h264_texture_amf"
+    });
+    let save = serde_json::json!({"streamer_id":11,"profile":profile});
+    assert_eq!(
+        app.clone()
+            .oneshot(request(
+                "PUT",
+                "/v1/me/twitch/native-2k-hardware",
+                save.to_string(),
+            ))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    let response = app
+        .clone()
+        .oneshot(request(
+            "GET",
+            "/v1/me/twitch/native-2k-hardware?streamer_id=11",
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
+    assert_eq!(body["configured"], true);
+    assert_eq!(body["profile"]["capabilities"]["gpu"][0]["vendor_id"], 4098);
+    assert_eq!(body["profile"]["hevc_encoder"], "h265_texture_amf");
+
+    let destination = serde_json::json!({
+        "streamer_id":11,
+        "destinations":[{
+            "platform":"twitch",
+            "connection_generation":1,
+            "rtmp_url":"rtmps://live.twitch.tv/app",
+            "stream_key":"synthetic",
+            "width":1920,
+            "height":1080,
+            "fps":60,
+            "bitrate_kbps":6000,
+            "twitch_output_mode":"native_2k"
+        }]
+    });
+    assert_eq!(
+        app.clone()
+            .oneshot(request(
+                "PUT",
+                "/v1/me/destinations",
+                destination.to_string()
+            ))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    let row = state
+        .store
+        .query(
+            "SELECT twitch_output_mode FROM relay.destinations WHERE streamer_id=11 AND platform='twitch'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(row[0].get::<_, String>(0), "native_2k");
+
+    let invalid = serde_json::json!({
+        "streamer_id":11,
+        "destinations":[{
+            "platform":"kick",
+            "connection_generation":1,
+            "twitch_output_mode":"native_2k"
+        }]
+    });
+    assert_eq!(
+        app.clone()
+            .oneshot(request("PUT", "/v1/me/destinations", invalid.to_string()))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+
+    assert_eq!(
+        app.oneshot(request(
+            "DELETE",
+            "/v1/me/twitch/native-2k-hardware?streamer_id=11",
+            "",
+        ))
+        .await
+        .unwrap()
+        .status(),
+        StatusCode::OK
+    );
+    let row = state
+        .store
+        .query(
+            "SELECT twitch_native_2k_hardware FROM relay.users WHERE streamer_id=11",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert!(row[0].get::<_, Option<serde_json::Value>>(0).is_none());
     database.stop().await;
 }
 

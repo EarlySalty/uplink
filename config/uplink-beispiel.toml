@@ -45,6 +45,14 @@ max_tracks = 8
 live_audio_track = 0
 vod_audio_track = 1
 
+[media.enhanced]
+maximum_video_tracks = 8
+maximum_aggregate_bitrate = 30000
+capacity_units = 100
+legacy_session_units = 1
+native_2k_units = 99
+profiles = []
+
 [[platforms]]
 name = "twitch"
 allowed_hosts = ["live.twitch.tv", "ingest.global-contribute.live-video.net"]

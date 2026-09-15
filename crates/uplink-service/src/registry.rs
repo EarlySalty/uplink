@@ -387,7 +387,23 @@ impl Reservation {
                     .and_then(|graph| graph["video"].as_array());
                 mode.active = if sending {
                     video.map(|tracks| {
-                        if tracks
+                        let native_source =
+                            state.source_observation.as_ref().is_some_and(|source| {
+                                source["codec"] == "hevc"
+                                    && source["width"] == 2560
+                                    && source["height"] == 1440
+                                    && source["fps_numerator"] == 60
+                                    && source["fps_denominator"] == 1
+                            });
+                        let native_copy = tracks
+                            .iter()
+                            .any(|track| track["canvas_index"] == 0 && track["mode"] == "copy");
+                        if mode.requested == TwitchOutputMode::Native2k
+                            && native_source
+                            && native_copy
+                        {
+                            TwitchOutputMode::Native2k
+                        } else if tracks
                             .iter()
                             .filter(|track| track["canvas_index"] == 0)
                             .filter_map(|track| track.get("profile"))
