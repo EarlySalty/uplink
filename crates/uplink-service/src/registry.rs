@@ -23,8 +23,18 @@ struct State {
     active: HashMap<u64, (u64, SessionStatus)>,
     total: usize,
     per_tenant: usize,
+    cast_per_tenant: usize,
     recent: VecDeque<(u64, SessionStatus)>,
     output_blocks: VecDeque<(u64, String, &'static str, std::time::Instant)>,
+    cast_previews: HashMap<(u64, u64), CastPreviewEntry>,
+}
+struct CastPreviewEntry {
+    video_header: Option<uplink_ingest::MediaEvent>,
+    sender: tokio::sync::broadcast::Sender<uplink_ingest::MediaEvent>,
+}
+pub(crate) struct CastPreviewSubscription {
+    pub video_header: Option<uplink_ingest::MediaEvent>,
+    pub receiver: tokio::sync::broadcast::Receiver<uplink_ingest::MediaEvent>,
 }
 #[derive(Clone, serde::Serialize)]
 pub struct SessionStatus {
@@ -33,6 +43,8 @@ pub struct SessionStatus {
     pub id: u64,
     pub active: bool,
     pub generation: Option<String>,
+    pub source_id: Option<u64>,
+    pub cast_role: &'static str,
     pub state: &'static str,
     pub received_events: u64,
     pub received_bytes: u64,
@@ -54,6 +66,7 @@ impl SessionStatus {
 pub struct Reservation {
     id: u64,
     tenant: u64,
+    source_id: Option<u64>,
     registry: Weak<Mutex<State>>,
     report: Mutex<Option<uplink_ingest::SessionReport>>,
     ingest_ended_at: Mutex<Option<std::time::SystemTime>>,
@@ -97,8 +110,10 @@ impl Registry {
             active: HashMap::new(),
             total,
             per_tenant,
+            cast_per_tenant: per_tenant,
             recent: VecDeque::new(),
             output_blocks: VecDeque::new(),
+            cast_previews: HashMap::new(),
         }))))
     }
     pub fn configure_capacity(&self, limit: u32, legacy_units: u32) -> Result<(), &'static str> {
@@ -113,21 +128,67 @@ impl Registry {
         state.legacy_units = legacy_units;
         Ok(())
     }
-    pub fn reserve(&self, tenant: u64) -> Result<Reservation, &'static str> {
+    pub fn configure_cast_limit(&self, per_tenant: usize) -> Result<(), &'static str> {
         let mut state = self
             .0
             .lock()
             .map_err(|_| "Sessionverwaltung ist nicht verfügbar.")?;
+        if !state.active.is_empty() || per_tenant == 0 || per_tenant > state.total {
+            return Err("Casting-Sessiongrenze ist ungültig.");
+        }
+        state.cast_per_tenant = per_tenant;
+        Ok(())
+    }
+    pub fn reserve(&self, tenant: u64) -> Result<Reservation, &'static str> {
+        self.reserve_source(tenant, None)
+    }
+    pub fn reserve_source(
+        &self,
+        tenant: u64,
+        source_id: Option<u64>,
+    ) -> Result<Reservation, &'static str> {
+        if source_id == Some(0) {
+            return Err("Quellenidentität ist ungültig.");
+        }
+        let mut state = self
+            .0
+            .lock()
+            .map_err(|_| "Sessionverwaltung ist nicht verfügbar.")?;
+        let same_tenant: Vec<_> = state
+            .active
+            .values()
+            .filter(|(owner, _)| *owner == tenant)
+            .collect();
+        let tenant_limit = if source_id.is_some() {
+            state.cast_per_tenant
+        } else {
+            state.per_tenant
+        };
+        let mixed_mode = same_tenant
+            .iter()
+            .any(|(_, status)| status.source_id.is_some() != source_id.is_some());
+        let duplicate_source = source_id.is_some_and(|source| {
+            same_tenant
+                .iter()
+                .any(|(_, status)| status.source_id == Some(source))
+        });
         if tenant == 0
             || state.changes.contains(&tenant)
             || state.active.len() >= state.total
-            || state.active.values().filter(|(t, _)| *t == tenant).count() >= state.per_tenant
+            || same_tenant.len() >= tenant_limit
+            || mixed_mode
+            || duplicate_source
         {
             return Err("Sessionkapazität ist belegt.");
         }
+        let initial_units = if source_id.is_some() {
+            0
+        } else {
+            state.legacy_units
+        };
         let used: u64 = state.capacity.values().map(|value| u64::from(*value)).sum();
         if state.capacity_limit > 0
-            && used + u64::from(state.legacy_units) > u64::from(state.capacity_limit)
+            && used + u64::from(initial_units) > u64::from(state.capacity_limit)
         {
             return Err("Gemessene Medienkapazität ist belegt.");
         }
@@ -136,8 +197,7 @@ impl Registry {
             .next
             .checked_add(1)
             .ok_or("Sessionidentitäten sind ausgeschöpft.")?;
-        let legacy_units = state.legacy_units;
-        state.capacity.insert(id, legacy_units);
+        state.capacity.insert(id, initial_units);
         state.active.insert(
             id,
             (
@@ -147,6 +207,12 @@ impl Registry {
                     id,
                     active: true,
                     generation: None,
+                    source_id,
+                    cast_role: if source_id.is_some() {
+                        "standby"
+                    } else {
+                        "single"
+                    },
                     state: "Eingang wird geprüft",
                     received_events: 0,
                     received_bytes: 0,
@@ -165,6 +231,7 @@ impl Registry {
         Ok(Reservation {
             id,
             tenant,
+            source_id,
             registry: Arc::downgrade(&self.0),
             report: Mutex::new(None),
             ingest_ended_at: Mutex::new(None),
@@ -218,8 +285,121 @@ impl Registry {
             active
         }
     }
+    pub fn source_active(&self, tenant: u64, source_id: u64) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .active
+            .values()
+            .any(|(owner, status)| {
+                *owner == tenant && status.active && status.source_id == Some(source_id)
+            })
+    }
+    pub fn set_cast_selection(
+        &self,
+        tenant: u64,
+        program_source: Option<u64>,
+        preview_source: Option<u64>,
+    ) {
+        let mut state = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        for (owner, status) in state.active.values_mut() {
+            if *owner != tenant || status.source_id.is_none() {
+                continue;
+            }
+            status.cast_role = if status.source_id == program_source {
+                "program"
+            } else if status.source_id == preview_source {
+                "preview"
+            } else {
+                "standby"
+            };
+        }
+    }
+    pub fn open_cast_preview_source(&self, tenant: u64, source_id: u64) {
+        if tenant == 0 || source_id == 0 {
+            return;
+        }
+        let mut state = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        state
+            .cast_previews
+            .entry((tenant, source_id))
+            .or_insert_with(|| {
+                let (sender, _) = tokio::sync::broadcast::channel(16);
+                CastPreviewEntry {
+                    video_header: None,
+                    sender,
+                }
+            });
+    }
+    pub fn publish_cast_preview(
+        &self,
+        tenant: u64,
+        source_id: u64,
+        event: &uplink_ingest::MediaEvent,
+    ) {
+        use uplink_ingest::{EventKind, MediaKind};
+        if event.identity.track.kind != MediaKind::Video {
+            return;
+        }
+        let mut state = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        let Some(entry) = state.cast_previews.get_mut(&(tenant, source_id)) else {
+            return;
+        };
+        if event.event_kind == EventKind::SequenceHeader {
+            entry.video_header = Some(event.clone());
+        }
+        // Ohne geöffnetes Regiefenster bleibt der Standby-Pfad kopierfrei.
+        // Bei Abonnenten hält der Broadcast höchstens 64 komprimierte Pakete.
+        if entry.sender.receiver_count() > 0 {
+            let _ = entry.sender.send(event.clone());
+        }
+    }
+    pub(crate) fn subscribe_cast_preview(
+        &self,
+        tenant: u64,
+        source_id: u64,
+    ) -> Option<CastPreviewSubscription> {
+        let state = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        let entry = state.cast_previews.get(&(tenant, source_id))?;
+        if entry.sender.receiver_count() >= 4 {
+            return None;
+        }
+        Some(CastPreviewSubscription {
+            video_header: entry.video_header.clone(),
+            receiver: entry.sender.subscribe(),
+        })
+    }
+    pub fn close_cast_preview_source(&self, tenant: u64, source_id: u64) {
+        self.0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .cast_previews
+            .remove(&(tenant, source_id));
+    }
 }
 impl Reservation {
+    pub fn reserve_legacy_capacity(&self) -> Result<(), &'static str> {
+        let registry = self.registry.upgrade().ok_or("Session ist beendet.")?;
+        let mut state = registry
+            .lock()
+            .map_err(|_| "Sessionverwaltung ist nicht verfügbar.")?;
+        if state.capacity_limit == 0 {
+            return Ok(());
+        }
+        let current = *state.capacity.get(&self.id).ok_or("Session ist beendet.")?;
+        if current >= state.legacy_units {
+            return Ok(());
+        }
+        let legacy_units = state.legacy_units;
+        let additional = legacy_units - current;
+        let used: u64 = state.capacity.values().map(|value| u64::from(*value)).sum();
+        if used + u64::from(additional) > u64::from(state.capacity_limit) {
+            return Err("Gemessene Medienkapazität ist belegt.");
+        }
+        state.capacity.insert(self.id, legacy_units);
+        Ok(())
+    }
+
     pub fn reserve_profile_capacity(&self, units: u32) -> Result<(), &'static str> {
         let registry = self.registry.upgrade().ok_or("Session ist beendet.")?;
         let mut state = registry
@@ -440,11 +620,30 @@ impl Reservation {
             }
         }
     }
+    pub fn set_cast_role(&self, role: &'static str) {
+        debug_assert!(matches!(role, "single" | "standby" | "preview" | "program"));
+        self.update(|state| state.cast_role = role);
+    }
     pub fn id(&self) -> u64 {
         self.id
     }
     pub fn tenant(&self) -> u64 {
         self.tenant
+    }
+    pub fn source_id(&self) -> Option<u64> {
+        self.source_id
+    }
+    pub fn cast_role(&self) -> &'static str {
+        let Some(registry) = self.registry.upgrade() else {
+            return "standby";
+        };
+        registry
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .active
+            .get(&self.id)
+            .map(|(_, status)| status.cast_role)
+            .unwrap_or("standby")
     }
     pub fn record(&self, bytes: usize) {
         self.update(|status| {
@@ -541,6 +740,55 @@ impl Drop for Reservation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cast_sources_share_ingest_capacity_but_only_program_reserves_media_units() {
+        let registry = Registry::new(4, 1).unwrap();
+        registry.configure_cast_limit(3).unwrap();
+        registry.configure_capacity(2, 1).unwrap();
+        let first = registry.reserve_source(11, Some(1)).unwrap();
+        assert!(
+            registry.reserve_source(11, Some(1)).is_err(),
+            "Ein Quellschlüssel darf nicht zweimal gleichzeitig senden"
+        );
+        let second = registry.reserve_source(11, Some(2)).unwrap();
+        let third = registry.reserve_source(11, Some(3)).unwrap();
+        assert!(registry.reserve_source(11, Some(4)).is_err());
+        assert!(
+            registry.reserve(11).is_err(),
+            "Einzel- und Cast-Modus dürfen nicht parallel laufen"
+        );
+        assert_eq!(
+            registry
+                .0
+                .lock()
+                .unwrap()
+                .capacity
+                .values()
+                .copied()
+                .sum::<u32>(),
+            0,
+            "Standby-Quellen dürfen keine Encoderreserve verbrauchen"
+        );
+        first.reserve_legacy_capacity().unwrap();
+        assert_eq!(
+            registry
+                .0
+                .lock()
+                .unwrap()
+                .capacity
+                .values()
+                .copied()
+                .sum::<u32>(),
+            1
+        );
+        second.reserve_legacy_capacity().unwrap();
+        assert!(third.reserve_legacy_capacity().is_err());
+        drop(first);
+        drop(second);
+        drop(third);
+        assert!(registry.reserve(11).is_ok());
+    }
 
     #[test]
     fn output_mode_is_active_only_while_its_publisher_sends() {

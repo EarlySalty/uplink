@@ -1,4 +1,5 @@
 pub mod api;
+mod cast;
 pub mod chat;
 pub mod config;
 pub mod crypto;

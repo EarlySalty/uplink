@@ -78,7 +78,7 @@ impl Database {
 pub(crate) async fn fixture() -> (Database, Arc<ServiceState>) {
     let database = Database::start().await;
     let store = Arc::new(database.connect().await);
-    for sql in [
+    for (index, sql) in [
         "CREATE SCHEMA relay",
         "CREATE TABLE relay.users(streamer_id bigint PRIMARY KEY,enabled boolean NOT NULL,ingest_key_enc bytea,dock_token_enc bytea,ingest_key_hash text,reconnect_wait_s integer NOT NULL DEFAULT 0)",
         "CREATE TABLE relay.destinations(streamer_id bigint REFERENCES relay.users(streamer_id),platform text NOT NULL,rtmp_url text NOT NULL,stream_key_enc bytea NOT NULL,enabled boolean NOT NULL,width integer,height integer,fps integer,bitrate_kbps integer,UNIQUE(streamer_id,platform))",
@@ -89,8 +89,18 @@ pub(crate) async fn fixture() -> (Database, Arc<ServiceState>) {
         include_str!("../../../../db/migrations/20260909_hochkant_layouts.sql"),
         include_str!("../../../../db/migrations/20260909_hochkant_destinations.sql"),
         include_str!("../../../../db/migrations/20260910_twitch_output_mode.sql"),
-    ] {
-        store.query(sql, &[]).await.unwrap();
+        include_str!("../../../../db/migrations/20260912_cast_sources.sql"),
+        include_str!("../../../../db/migrations/20260912_cast_scenes.sql"),
+        include_str!("../../../../db/migrations/20260912_cast_state.sql"),
+        include_str!("../../../../db/migrations/20260912_cast_indexes.sql"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        store
+            .query(sql, &[])
+            .await
+            .unwrap_or_else(|error| panic!("Testmigration {index} fehlgeschlagen: {error}"));
     }
     let encryption = Secret::new(vec![7; 32]);
     let key = encryption

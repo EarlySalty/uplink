@@ -23,6 +23,22 @@ pub async fn apply(store: &Store) -> Result<(), &'static str> {
             "20260910_twitch_output_mode",
             include_str!("../../../db/migrations/20260910_twitch_output_mode.sql"),
         ),
+        (
+            "20260912_cast_sources",
+            include_str!("../../../db/migrations/20260912_cast_sources.sql"),
+        ),
+        (
+            "20260912_cast_scenes",
+            include_str!("../../../db/migrations/20260912_cast_scenes.sql"),
+        ),
+        (
+            "20260912_cast_state",
+            include_str!("../../../db/migrations/20260912_cast_state.sql"),
+        ),
+        (
+            "20260912_cast_indexes",
+            include_str!("../../../db/migrations/20260912_cast_indexes.sql"),
+        ),
     ] {
         store.migrate(name, statement).await?;
     }

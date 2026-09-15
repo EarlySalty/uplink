@@ -22,10 +22,10 @@ pub struct TenantQuery {
     pub streamer_id: i64,
 }
 pub type ApiResult = Result<Json<Value>, (StatusCode, Json<Value>)>;
-fn failure(status: StatusCode, message: &'static str) -> (StatusCode, Json<Value>) {
+pub(crate) fn failure(status: StatusCode, message: &'static str) -> (StatusCode, Json<Value>) {
     (status, Json(json!({"error": message})))
 }
-fn authorize(
+pub(crate) fn authorize(
     state: &ServiceState,
     headers: &HeaderMap,
     tenant: i64,
@@ -71,7 +71,9 @@ pub fn router(state: Arc<ServiceState>) -> Router {
             .route("/v1/admin/waitlist/{id}", delete(reject_waitlist))
             .route("/v1/admin/users", post(admit_user))
     };
-    let routes = routes.with_state(state.clone());
+    let routes = routes
+        .with_state(state.clone())
+        .merge(crate::cast::router(state.clone()));
     let routes = if let Some(hub) = &state.chat {
         routes.merge(uplink_chat::router(hub.clone()))
     } else {
@@ -379,7 +381,7 @@ fn service_status(state: &ServiceState) -> &'static str {
     }
 }
 fn capabilities() -> Value {
-    json!({"reconnect":false,"layout":false,"delay":false,"vod":false})
+    json!({"reconnect":false,"layout":false,"delay":false,"vod":false,"cast_studio":true})
 }
 fn dashboard_state(state: &ServiceState, id: u64) -> Value {
     let statuses = state.registry.status(id);

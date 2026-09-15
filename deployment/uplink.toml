@@ -7,6 +7,7 @@ dock_base_url = "https://deutsche-deadlock-community.de/uplink"
 max_sessions = 4
 max_pending_connections = 8
 max_sessions_per_tenant = 1
+max_cast_sessions_per_tenant = 4
 database_max_queries = 4
 request_timeout_seconds = 10
 tls_reload_seconds = 60

@@ -20,6 +20,8 @@ pub struct Config {
     #[serde(default = "pending_connections_default")]
     pub max_pending_connections: usize,
     pub max_sessions_per_tenant: usize,
+    #[serde(default)]
+    pub max_cast_sessions_per_tenant: Option<usize>,
     pub database_max_queries: u32,
     pub request_timeout_seconds: u64,
     pub infisical: InfisicalConfig,
@@ -107,6 +109,10 @@ pub enum TlsConfig {
     },
 }
 impl Config {
+    pub fn cast_session_limit(&self) -> usize {
+        self.max_cast_sessions_per_tenant
+            .unwrap_or(self.max_sessions_per_tenant)
+    }
     pub fn permits_tenant(&self, tenant: u64) -> bool {
         tenant > 0
             && self
@@ -191,6 +197,9 @@ impl Config {
             || !(1..=128).contains(&config.max_pending_connections)
             || config.max_sessions_per_tenant == 0
             || config.max_sessions_per_tenant > config.max_sessions
+            || config
+                .max_cast_sessions_per_tenant
+                .is_some_and(|limit| limit == 0 || limit > config.max_sessions)
             || config.database_max_queries == 0
             || config.database_max_queries > 64
             || config.request_timeout_seconds == 0

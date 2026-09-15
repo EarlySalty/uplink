@@ -264,6 +264,7 @@ fn fetch_config(args: &Arguments, meta: Metadata) -> Result<Config> {
         max_sessions: 1,
         max_pending_connections: 1,
         max_sessions_per_tenant: 1,
+        max_cast_sessions_per_tenant: None,
         database_max_queries: 1,
         request_timeout_seconds: 5,
         infisical: InfisicalConfig {

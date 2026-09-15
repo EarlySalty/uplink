@@ -107,6 +107,7 @@ async fn run() -> Result<(), &'static str> {
     let reload_seconds = config.tls_reload_seconds;
     let store = Arc::new(Store::connect(&secrets.database, config.database_max_queries).await?);
     let registry = Registry::new(config.max_sessions, config.max_sessions_per_tenant)?;
+    registry.configure_cast_limit(config.cast_session_limit())?;
     let chat = config
         .chat
         .as_ref()

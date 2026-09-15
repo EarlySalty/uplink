@@ -168,6 +168,7 @@ pub struct SessionReport {
 
 /// Ausschließlich empfangene Wire-Metadaten, kein vollständiges Planner-Profil.
 /// Die Rohbytes enthalten keine geprüfte Auflösung/FPS oder Live-/VOD-Rolle.
+#[derive(Clone)]
 pub struct MediaEvent {
     pub identity: TrackIdentity,
     pub event_kind: EventKind,
@@ -175,10 +176,10 @@ pub struct MediaEvent {
     pub dts_ms: u32,
     pub pts_ms: i64,
     pub configuration_revision: u64,
-    body: Box<[u8]>,
+    body: Arc<[u8]>,
     payload: Range<usize>,
-    _budget: OwnedSemaphorePermit,
-    _event_budget: OwnedSemaphorePermit,
+    _budget: Arc<OwnedSemaphorePermit>,
+    _event_budget: Arc<OwnedSemaphorePermit>,
     _slot: Arc<SessionSlot>,
     retention: Option<Arc<dyn Any + Send + Sync>>,
 }
@@ -191,6 +192,17 @@ impl MediaEvent {
     }
     pub fn wire_body(&self) -> &[u8] {
         &self.body
+    }
+    /// Leichtgewichtige interne Umleitung desselben begrenzten Pakets auf eine
+    /// bereits autorisierte virtuelle Program-Zeitlinie. Die Rohbytes und ihre
+    /// Ingest-Permits werden geteilt; es entsteht keine zweite unbudgetierte
+    /// Medienkopie.
+    pub fn routed_as(&self, identity: TrackIdentity, dts_ms: u32, pts_ms: i64) -> Self {
+        let mut routed = self.clone();
+        routed.identity = identity;
+        routed.dts_ms = dts_ms;
+        routed.pts_ms = pts_ms;
+        routed
     }
 }
 
@@ -658,10 +670,10 @@ impl<A: Authorizer> Handler<A> {
             dts_ms: corrected_timestamp,
             pts_ms: parsed.pts_ms + i64::from(corrected_timestamp - timestamp),
             configuration_revision: track.map_or(0, |track| track.revision),
-            body: data.as_ref().into(),
+            body: Arc::from(data.as_ref()),
             payload: parsed.payload,
-            _budget: permit,
-            _event_budget: event_permit,
+            _budget: Arc::new(permit),
+            _event_budget: Arc::new(event_permit),
             _slot: self.slot.clone(),
             retention: self.retention.clone(),
         };

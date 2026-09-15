@@ -1,20 +1,287 @@
 use crate::{api::ServiceState, runtime::SessionProcessor};
-use std::sync::Arc;
-use uplink_ingest::{MediaEvent, rustls};
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+};
+use uplink_ingest::{
+    EventKind, MediaEvent, MediaKind, TrackIdentity, WireCodec, WireTrack, rustls,
+};
 use uplink_media::{
     DesiredOutput, DesiredVideo, EngineConfig, MediaEngine, PublishSecret, PublishTarget,
 };
 
+#[derive(Clone)]
 pub struct Coordinator {
     state: Arc<ServiceState>,
-    engine: MediaEngine,
+    engine: Arc<MediaEngine>,
     tls: Arc<rustls::ClientConfig>,
-    engine_config: EngineConfig,
-    hardware: tokio::sync::OnceCell<
-        Result<uplink_media::platform::hardware::HardwareReport, uplink_media::MediaError>,
+    engine_config: Arc<EngineConfig>,
+    hardware: Arc<
+        tokio::sync::OnceCell<
+            Result<uplink_media::platform::hardware::HardwareReport, uplink_media::MediaError>,
+        >,
     >,
-    broker: Option<crate::chat::BotBroker>,
+    broker: Option<Arc<crate::chat::BotBroker>>,
+    cast: CastMixer,
 }
+
+#[derive(Clone, Default)]
+struct CastMixer(Arc<CastMixerState>);
+
+#[derive(Default)]
+struct CastMixerState {
+    programs: Mutex<HashMap<u64, Arc<CastProgram>>>,
+    next_id: AtomicU64,
+}
+
+struct CastProgram {
+    id: u64,
+    tenant: u64,
+    owner_source: u64,
+    identity: TrackIdentity,
+    sender: tokio::sync::mpsc::Sender<CastMessage>,
+    timeline: Mutex<CastTimeline>,
+    codecs: Mutex<HashMap<WireTrack, WireCodec>>,
+}
+
+enum CastMessage {
+    Event(MediaEvent),
+    Stop,
+}
+
+#[derive(Default)]
+struct CastTimeline {
+    source_id: Option<u64>,
+    source_base_dts: u32,
+    canonical_base_dts: u32,
+    last_dts: Option<u32>,
+}
+
+impl CastMixer {
+    fn current(&self, tenant: u64) -> Option<Arc<CastProgram>> {
+        self.0
+            .programs
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&tenant)
+            .cloned()
+    }
+
+    fn install(
+        &self,
+        tenant: u64,
+        owner_source: u64,
+        identity: TrackIdentity,
+        sender: tokio::sync::mpsc::Sender<CastMessage>,
+    ) -> (Arc<CastProgram>, bool) {
+        let mut programs = self
+            .0
+            .programs
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(existing) = programs.get(&tenant) {
+            return (existing.clone(), false);
+        }
+        let id = self
+            .0
+            .next_id
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        let program = Arc::new(CastProgram {
+            id,
+            tenant,
+            owner_source,
+            identity,
+            sender,
+            timeline: Mutex::new(CastTimeline::default()),
+            codecs: Mutex::new(HashMap::new()),
+        });
+        programs.insert(tenant, program.clone());
+        (program, true)
+    }
+
+    fn remove_if_current(&self, program: &CastProgram) {
+        let mut programs = self
+            .0
+            .programs
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if programs
+            .get(&program.tenant)
+            .is_some_and(|current| current.id == program.id)
+        {
+            programs.remove(&program.tenant);
+        }
+    }
+
+    fn stop_source(&self, program: &CastProgram, source_id: u64) {
+        let is_current = program
+            .timeline
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .source_id
+            == Some(source_id);
+        // Der Outputtask hält die Reservation der Quelle, die ihn gestartet
+        // hat. Trennt sich diese Owner-Quelle oder die aktuell ausgespielte
+        // Quelle, wird der Programmpfad kontrolliert beendet. Eine weiterhin
+        // ausgewählte aktive Quelle kann ihn am nächsten Keyframe neu öffnen;
+        // dadurch bleibt keine Zombie-Reservation zurück.
+        if program.owner_source != source_id && !is_current {
+            return;
+        }
+        self.remove_if_current(program);
+        let _ = program.sender.try_send(CastMessage::Stop);
+    }
+}
+
+impl CastProgram {
+    fn source_is_active(&self, source_id: u64) -> bool {
+        self.timeline
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .source_id
+            == Some(source_id)
+    }
+
+    fn validate_codecs(
+        &self,
+        headers: &HashMap<WireTrack, MediaEvent>,
+    ) -> Result<(), &'static str> {
+        let offered: HashMap<_, _> = headers
+            .iter()
+            .map(|(track, event)| (*track, event.codec))
+            .collect();
+        if !offered.keys().any(|track| track.kind == MediaKind::Video)
+            || !offered.keys().any(|track| track.kind == MediaKind::Audio)
+        {
+            return Err(
+                "Casting-Quelle hat noch kein vollständiges Audio-/Video-Profil geliefert.",
+            );
+        }
+        let mut expected = self
+            .codecs
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if expected.is_empty() {
+            *expected = offered;
+            return Ok(());
+        }
+        if *expected != offered {
+            return Err(
+                "Casting-Quelle verwendet andere Codec- oder Track-Rollen als das laufende Program. Alle POVs müssen dasselbe Eingangsprofil senden.",
+            );
+        }
+        Ok(())
+    }
+
+    fn begin_source(
+        &self,
+        source_id: u64,
+        headers: &HashMap<WireTrack, MediaEvent>,
+        keyframe: &MediaEvent,
+    ) -> Result<(), &'static str> {
+        if !is_video_keyframe(keyframe) {
+            return Err("Casting-Schnitt wartet auf den nächsten Video-Keyframe.");
+        }
+        self.validate_codecs(headers)?;
+        let mut timeline = self
+            .timeline
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let canonical_base = timeline
+            .last_dts
+            .map(|last| last.saturating_add(1))
+            .unwrap_or(0);
+        timeline.source_id = Some(source_id);
+        timeline.source_base_dts = keyframe.dts_ms;
+        timeline.canonical_base_dts = canonical_base;
+        let mut ordered: Vec<_> = headers.values().collect();
+        ordered.sort_by_key(|event| {
+            (
+                u8::from(event.identity.track.kind == MediaKind::Audio),
+                event.identity.track.wire_id,
+            )
+        });
+        for header in ordered {
+            let identity = TrackIdentity {
+                session: self.identity.session,
+                generation: self.identity.generation,
+                track: header.identity.track,
+            };
+            let routed = header.routed_as(identity, canonical_base, i64::from(canonical_base));
+            self.sender
+                .try_send(CastMessage::Event(routed))
+                .map_err(|_| "Casting-Programmpuffer ist ausgelastet.")?;
+        }
+        let identity = TrackIdentity {
+            session: self.identity.session,
+            generation: self.identity.generation,
+            track: keyframe.identity.track,
+        };
+        let pts_delta = keyframe.pts_ms - i64::from(keyframe.dts_ms);
+        let routed = keyframe.routed_as(
+            identity,
+            canonical_base,
+            i64::from(canonical_base).saturating_add(pts_delta),
+        );
+        self.sender
+            .try_send(CastMessage::Event(routed))
+            .map_err(|_| "Casting-Programmpuffer ist ausgelastet.")?;
+        timeline.last_dts = Some(canonical_base);
+        Ok(())
+    }
+
+    fn route(&self, source_id: u64, event: &MediaEvent) -> Result<bool, &'static str> {
+        let mut timeline = self
+            .timeline
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if timeline.source_id != Some(source_id) {
+            return Ok(false);
+        }
+        if event.configuration_revision > 1 {
+            return Err(
+                "Casting-Quelle hat ihr Codecprofil im laufenden Program geändert. Quelle mit stabilem Profil neu verbinden.",
+            );
+        }
+        let relative = match event.dts_ms.checked_sub(timeline.source_base_dts) {
+            Some(value) => value,
+            None => return Ok(false),
+        };
+        let dts = timeline
+            .canonical_base_dts
+            .checked_add(relative)
+            .ok_or("Casting-Zeitlinie ist übergelaufen.")?;
+        if timeline.last_dts.is_some_and(|last| dts < last) {
+            return Ok(false);
+        }
+        let identity = TrackIdentity {
+            session: self.identity.session,
+            generation: self.identity.generation,
+            track: event.identity.track,
+        };
+        let pts_delta = event.pts_ms - i64::from(event.dts_ms);
+        let routed = event.routed_as(identity, dts, i64::from(dts).saturating_add(pts_delta));
+        self.sender
+            .try_send(CastMessage::Event(routed))
+            .map_err(|_| "Casting-Programmpuffer ist ausgelastet.")?;
+        timeline.last_dts = Some(dts);
+        Ok(true)
+    }
+}
+
+fn is_video_keyframe(event: &MediaEvent) -> bool {
+    event.identity.track.kind == MediaKind::Video
+        && event.event_kind == EventKind::Frame
+        && event
+            .wire_body()
+            .first()
+            .is_some_and(|first| first & 0x70 == 0x10)
+}
+
 impl Coordinator {
     pub fn new(state: Arc<ServiceState>) -> Result<Self, &'static str> {
         let config = &state.config.media;
@@ -85,12 +352,13 @@ impl Coordinator {
             })
             .transpose()?;
         Ok(Self {
-            engine_config,
-            hardware: tokio::sync::OnceCell::new(),
-            broker,
+            engine_config: Arc::new(engine_config),
+            hardware: Arc::new(tokio::sync::OnceCell::new()),
+            broker: broker.map(Arc::new),
             state,
-            engine,
+            engine: Arc::new(engine),
             tls: Arc::new(tls),
+            cast: CastMixer::default(),
         })
     }
     async fn twitch_publish_erlaubt(
@@ -414,21 +682,177 @@ pub(crate) fn secure_default(platform: &str, endpoint: String) -> String {
     }
 }
 
-impl SessionProcessor for Coordinator {
-    async fn process(
+fn cast_video_codec(codec: WireCodec) -> Option<&'static str> {
+    match codec {
+        WireCodec::Av1 => Some("av1"),
+        WireCodec::H264 => Some("h264"),
+        WireCodec::Hevc => Some("hevc"),
+        WireCodec::Aac => None,
+    }
+}
+
+fn observe_cast_source(event: &MediaEvent, reservation: &crate::registry::Reservation) {
+    if event.identity.track.kind != MediaKind::Video
+        || event.event_kind != EventKind::SequenceHeader
+    {
+        return;
+    }
+    let Some(codec) = cast_video_codec(event.codec) else {
+        return;
+    };
+    reservation.observation(serde_json::json!({
+        "codec":codec,
+        "cast_input":true,
+        "platform_encode":reservation.cast_role() == "program"
+    }));
+}
+
+impl Coordinator {
+    fn spawn_cast_program(
+        &self,
+        _program: Arc<CastProgram>,
+        mut messages: tokio::sync::mpsc::Receiver<CastMessage>,
+        reservation: Arc<crate::registry::Reservation>,
+        tenant: i64,
+    ) {
+        let coordinator = self.clone();
+        tokio::spawn(async move {
+            let first = match messages.recv().await {
+                Some(CastMessage::Event(event)) => event,
+                Some(CastMessage::Stop) | None => return,
+            };
+            let (media_tx, media_rx) = tokio::sync::mpsc::channel(256);
+            let bridge = tokio::spawn(async move {
+                while let Some(message) = messages.recv().await {
+                    match message {
+                        CastMessage::Event(event) => {
+                            if media_tx.send(event).await.is_err() {
+                                break;
+                            }
+                        }
+                        CastMessage::Stop => break,
+                    }
+                }
+            });
+            let result = coordinator
+                .process_output(first, media_rx, reservation.clone(), tenant)
+                .await;
+            bridge.abort();
+            let _ = bridge.await;
+            if let Err(error) = result {
+                reservation.fail(error);
+            }
+        });
+    }
+
+    async fn process_cast_source(
+        &self,
+        first: MediaEvent,
+        mut events: tokio::sync::mpsc::Receiver<MediaEvent>,
+        reservation: Arc<crate::registry::Reservation>,
+        tenant: i64,
+        source_id: u64,
+    ) -> Result<(), &'static str> {
+        let tenant_u64 = u64::try_from(tenant).map_err(|_| "Nutzeridentität ist ungültig.")?;
+        let (selected_program, selected_preview, _) =
+            crate::cast::selected_source(&self.state, tenant).await?;
+        self.state
+            .registry
+            .set_cast_selection(tenant_u64, selected_program, selected_preview);
+        self.state
+            .registry
+            .open_cast_preview_source(tenant_u64, source_id);
+
+        let mut headers = HashMap::<WireTrack, MediaEvent>::new();
+        let mut next = Some(first);
+        let result = loop {
+            let event = match next.take() {
+                Some(event) => event,
+                None => match events.recv().await {
+                    Some(event) => event,
+                    None => break Ok(()),
+                },
+            };
+            observe_cast_source(&event, &reservation);
+            self.state
+                .registry
+                .publish_cast_preview(tenant_u64, source_id, &event);
+            if event.event_kind == EventKind::SequenceHeader {
+                headers.insert(event.identity.track, event.clone());
+            }
+
+            // Quellen, die nicht auf Program liegen, werden nur bis hierhin
+            // analysiert. Der komprimierte Frame verlässt danach den Scope und
+            // gibt sein Ingest-Budget frei; es wird weder FFmpeg noch ein
+            // Plattform-Pusher für Standby gestartet.
+            if reservation.cast_role() != "program" {
+                continue;
+            }
+
+            let mut program = self.cast.current(tenant_u64);
+            if program.is_none() && is_video_keyframe(&event) {
+                let (sender, receiver) = tokio::sync::mpsc::channel(512);
+                let (installed, is_new) =
+                    self.cast
+                        .install(tenant_u64, source_id, event.identity, sender);
+                if is_new {
+                    self.spawn_cast_program(
+                        installed.clone(),
+                        receiver,
+                        reservation.clone(),
+                        tenant,
+                    );
+                }
+                program = Some(installed);
+            }
+            let Some(program) = program else {
+                continue;
+            };
+
+            if program.source_is_active(source_id) {
+                if event.event_kind == EventKind::SequenceHeader {
+                    // Laufende Quellen dürfen ihren Header nicht still gegen
+                    // ein anderes Codecprofil tauschen. Revisionen > 1 werden
+                    // beim nächsten Medienpaket explizit abgewiesen.
+                    continue;
+                }
+                if let Err(error) = program.route(source_id, &event) {
+                    break Err(error);
+                }
+                continue;
+            }
+
+            if is_video_keyframe(&event) {
+                if let Err(error) = program.begin_source(source_id, &headers, &event) {
+                    break Err(error);
+                }
+                if let Some(codec) = cast_video_codec(event.codec) {
+                    reservation.observation(serde_json::json!({
+                        "codec": codec,
+                        "cast_input": true,
+                        "platform_encode": true,
+                        "cast_program_routed": true
+                    }));
+                }
+            }
+        };
+        self.state
+            .registry
+            .close_cast_preview_source(tenant_u64, source_id);
+        if let Some(program) = self.cast.current(tenant_u64) {
+            self.cast.stop_source(&program, source_id);
+        }
+        result
+    }
+
+    async fn process_output(
         &self,
         first: MediaEvent,
         events: tokio::sync::mpsc::Receiver<MediaEvent>,
+        reservation: Arc<crate::registry::Reservation>,
+        tenant: i64,
     ) -> Result<(), &'static str> {
-        if self.state.config.test_ingest.is_some() {
-            return crate::test_ingest::receive(first, events).await;
-        }
-        let reservation = first
-            .authorization_retention()
-            .and_then(|value| value.downcast::<crate::registry::Reservation>().ok())
-            .ok_or("Sessionreservierung fehlt.")?;
-        let tenant = i64::try_from(first.identity.session.tenant_id())
-            .map_err(|_| "Nutzeridentität ist ungültig.")?;
+        reservation.reserve_legacy_capacity()?;
         let rows=self.state.store.query("SELECT d.platform,d.rtmp_url,d.stream_key_enc,d.width,d.height,d.fps,d.bitrate_kbps,d.twitch_audio_mode,COALESCE(f.generation,0),d.hochkant_enabled,d.hochkant_width,d.hochkant_height,d.twitch_output_mode FROM relay.destinations d LEFT JOIN relay.destination_fences f USING(streamer_id,platform) WHERE d.streamer_id=$1 AND d.enabled=true ORDER BY d.platform",&[&tenant]).await?;
         if rows.is_empty() {
             return Err("Kein Ausgabeziel ist aktiviert.");
@@ -611,6 +1035,31 @@ impl SessionProcessor for Coordinator {
             return Err("Alle Plattformausgänge sind fehlgeschlagen; siehe Zielstatus.");
         }
         Ok(())
+    }
+}
+
+impl SessionProcessor for Coordinator {
+    async fn process(
+        &self,
+        first: MediaEvent,
+        events: tokio::sync::mpsc::Receiver<MediaEvent>,
+    ) -> Result<(), &'static str> {
+        if self.state.config.test_ingest.is_some() {
+            return crate::test_ingest::receive(first, events).await;
+        }
+        let reservation = first
+            .authorization_retention()
+            .and_then(|value| value.downcast::<crate::registry::Reservation>().ok())
+            .ok_or("Sessionreservierung fehlt.")?;
+        let tenant = i64::try_from(first.identity.session.tenant_id())
+            .map_err(|_| "Nutzeridentität ist ungültig.")?;
+        if let Some(source_id) = reservation.source_id() {
+            return self
+                .process_cast_source(first, events, reservation, tenant, source_id)
+                .await;
+        }
+        self.process_output(first, events, reservation, tenant)
+            .await
     }
 }
 

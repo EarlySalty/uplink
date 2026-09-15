@@ -147,16 +147,21 @@ impl Authorizer for ServiceAuthorizer {
             .clone()
             .try_acquire_owned()
             .map_err(|_| ())?;
-        let tenant = self
+        let ingest = self
             .state
             .store
-            .authenticate_ingest(stream)
+            .authenticate_ingest_route(stream)
             .await
             .map_err(|_| ())?;
+        let tenant = ingest.tenant_id;
         if !self.state.config.permits_tenant(tenant) {
             return Err(());
         }
-        let mut reservation = self.state.registry.reserve(tenant).map_err(|_| ())?;
+        let mut reservation = self
+            .state
+            .registry
+            .reserve_source(tenant, ingest.source_id)
+            .map_err(|_| ())?;
         let recorder = self.recorder.clone();
         let ingest_report = Arc::new(Mutex::new(None));
         let completion_report = ingest_report.clone();

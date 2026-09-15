@@ -14,6 +14,12 @@ pub(crate) struct CheckedStatement<'a> {
     pub expected_rows: Option<usize>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IngestIdentity {
+    pub tenant_id: u64,
+    pub source_id: Option<u64>,
+}
+
 pub struct Store {
     connection: tokio_postgres::Config,
     slots: Arc<Semaphore>,
@@ -236,29 +242,67 @@ impl Store {
         result
     }
     pub async fn authenticate_ingest(&self, key: &str) -> Result<u64, &'static str> {
-        if key.len() != 36
-            || !key.starts_with("rsr_")
-            || !key[4..]
+        self.authenticate_ingest_route(key)
+            .await
+            .map(|identity| identity.tenant_id)
+    }
+
+    pub async fn authenticate_ingest_route(
+        &self,
+        key: &str,
+    ) -> Result<IngestIdentity, &'static str> {
+        let valid_key = key.len() == 36
+            && (key.starts_with("rsr_") || key.starts_with("cst_"))
+            && key[4..]
                 .bytes()
-                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-        {
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase());
+        if !valid_key {
             return Err("Streamzugang ist ungültig.");
         }
         let hash = hex::encode(Sha256::digest(key.as_bytes()));
-        let rows = self
-            .query(
-                "SELECT streamer_id FROM relay.users WHERE ingest_key_hash=$1 AND enabled=true",
-                &[&hash],
+        let (rows, source) = if key.starts_with("cst_") {
+            (
+                self.query(
+                    "SELECT s.streamer_id,s.source_id FROM relay.cast_sources s JOIN relay.users u USING(streamer_id) WHERE s.ingest_key_hash=$1 AND s.enabled=true AND u.enabled=true",
+                    &[&hash],
+                )
+                .await?,
+                true,
             )
-            .await?;
-        let id: i64 = rows
-            .first()
-            .ok_or("Streamzugang wurde abgewiesen.")?
+        } else {
+            (
+                self.query(
+                    "SELECT streamer_id,NULL::bigint FROM relay.users WHERE ingest_key_hash=$1 AND enabled=true",
+                    &[&hash],
+                )
+                .await?,
+                false,
+            )
+        };
+        let row = rows.first().ok_or("Streamzugang wurde abgewiesen.")?;
+        let tenant: i64 = row
             .try_get(0)
             .map_err(|_| "Nutzeridentität ist ungültig.")?;
-        u64::try_from(id)
+        let tenant_id = u64::try_from(tenant)
             .ok()
             .filter(|id| *id > 0)
-            .ok_or("Nutzeridentität ist ungültig.")
+            .ok_or("Nutzeridentität ist ungültig.")?;
+        let source_id = if source {
+            let source: i64 = row
+                .try_get(1)
+                .map_err(|_| "Quellenidentität ist ungültig.")?;
+            Some(
+                u64::try_from(source)
+                    .ok()
+                    .filter(|id| *id > 0)
+                    .ok_or("Quellenidentität ist ungültig.")?,
+            )
+        } else {
+            None
+        };
+        Ok(IngestIdentity {
+            tenant_id,
+            source_id,
+        })
     }
 }
