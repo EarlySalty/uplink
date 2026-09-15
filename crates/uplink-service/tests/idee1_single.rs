@@ -51,6 +51,16 @@ async fn fixture(codec: &str) -> Vec<u8> {
         "lavfi",
         "-i",
         "sine=frequency=997:sample_rate=48000",
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=frequency=1499:sample_rate=48000",
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a:0",
+        "-map",
+        "2:a:0",
         "-t",
         "6",
         "-pix_fmt",
@@ -200,7 +210,7 @@ async fn case(codec: &str) {
         let mut file = tokio::fs::File::create(capture_path).await.unwrap();
         file.write_all(HEADER).await.unwrap();
         let mut video = 0u64;
-        let mut audio = Vec::new();
+        let mut audio = std::collections::BTreeMap::<u8, Vec<Vec<u8>>>::new();
         while let Some(event) = connection.next().await {
             let kind = if event.identity.track.kind == MediaKind::Video {
                 9
@@ -220,7 +230,10 @@ async fn case(codec: &str) {
                     assert_eq!(event.codec, uplink_ingest::WireCodec::H264);
                     video += 1;
                 } else {
-                    audio.push(event.payload().to_vec());
+                    audio
+                        .entry(event.identity.track.wire_id)
+                        .or_default()
+                        .push(event.payload().to_vec());
                 }
             }
         }
@@ -248,11 +261,20 @@ async fn case(codec: &str) {
         let producer = RunningPusher::start(PublishTarget { id:"idee1-local-input".into(), endpoint:format!("rtmps://localhost:{}/live",input.port()), playpath:PublishSecret::new(b"rsr_00000000000000000000000000000000".to_vec()).unwrap(), tls:Some(certificates.client), allowed_hosts:vec!["localhost".into()], allow_loopback:true, allow_unencrypted:false }, MediaLimits::default()).await.unwrap();
         let mut source = FlvReader::new(source_bytes.as_slice(), 2 * 1024 * 1024);
         let start = tokio::time::Instant::now();
-        let mut input_audio = Vec::new();
+        let mut input_audio = std::collections::BTreeMap::<u8, Vec<Vec<u8>>>::new();
         while let Some(tag) = source.next().await.unwrap() {
             if !matches!(tag.kind(),8|9) { continue; }
             tokio::time::sleep_until(start + Duration::from_millis(u64::from(tag.timestamp_ms()))).await;
-            if tag.kind()==8 && !tag.is_sequence_header() { input_audio.push(tag.body()[2..].to_vec()); }
+            if tag.kind()==8 {
+                let body = tag.body();
+                let is_frame = (body[0] >> 4 == 10 && body[1] == 1)
+                    || (body[0] == 0x95 && matches!(body[1], 1 | 3));
+                if is_frame {
+                    let track = tag.audio_track().unwrap().expect("AAC-Paket braucht eine Spur");
+                    let payload = if body[0] >> 4 == 10 { &body[2..] } else { &body[7..] };
+                    input_audio.entry(track).or_default().push(payload.to_vec());
+                }
+            }
             producer.try_send(Arc::new(tag)).expect("Gepacete Quelle muss ohne Rückstau ankommen");
         }
         let http = reqwest::Client::builder().no_proxy().timeout(Duration::from_secs(2)).build().unwrap();
@@ -286,7 +308,15 @@ async fn case(codec: &str) {
         producer.finish().await.unwrap();
         let (video,audio,end)=tokio::time::timeout(Duration::from_secs(15),&mut receiving).await.unwrap().unwrap();
         assert_eq!(video,FRAMES,"Alle Videoframes müssen ankommen");
-        assert_eq!(audio,input_audio,"AAC bleibt vollständig und bytegleich");
+        assert_eq!(audio.keys().collect::<Vec<_>>(), input_audio.keys().collect::<Vec<_>>(), "Live- und VOD-Audiospur müssen beide ankommen");
+        for (track, expected) in &input_audio {
+            let actual = &audio[track];
+            for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+                assert_eq!(actual.len(), expected.len(), "AAC-Paketlänge Spur {track}, Paket {index}");
+                assert!(actual == expected, "AAC-Payload weicht ab: Spur {track}, Paket {index}");
+            }
+            assert_eq!(actual.len(), expected.len(), "AAC-Paketanzahl für Spur {track}; gemeinsamer Präfix war bytegleich");
+        }
         assert_eq!(end,EndReason::ExplicitStop);
         tokio::time::timeout(Duration::from_secs(5),async { while state.registry.active_count()!=0 {tokio::time::sleep(Duration::from_millis(20)).await;} }).await.unwrap();
         let sessions=state.registry.status(11);
