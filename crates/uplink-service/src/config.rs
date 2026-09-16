@@ -253,10 +253,13 @@ impl Config {
             || enhanced.profiles.len() > 128
             || (enhanced.capacity_units > 0
                 && (enhanced.legacy_session_units > enhanced.capacity_units
+                    || enhanced.av1_1080_enhanced_units > enhanced.capacity_units
                     || enhanced.native_2k_units > enhanced.capacity_units
                     || enhanced.native_2k_av1_units > enhanced.capacity_units))
             || (enhanced.capacity_units == 0
-                && (enhanced.native_2k_units != 0 || enhanced.native_2k_av1_units != 0))
+                && (enhanced.av1_1080_enhanced_units != 0
+                    || enhanced.native_2k_units != 0
+                    || enhanced.native_2k_av1_units != 0))
             || enhanced.profiles.iter().any(|profile| {
                 profile.key.is_empty()
                     || profile.key.len() > 4096
@@ -311,6 +314,10 @@ pub struct EnhancedConfig {
     pub capacity_units: u32,
     #[serde(default = "legacy_units")]
     pub legacy_session_units: u32,
+    /// Gemessener AV1-1080p60-Uplink-Korridor fuer genau eine Twitch-Enhanced-Leiter.
+    /// Null bedeutet: nur exakt hinterlegte Lastprofile duerfen Enhanced starten.
+    #[serde(default)]
+    pub av1_1080_enhanced_units: u32,
     /// Zusaetzliche Einheiten fuer genau einen Native-2K-Hybrid. Null bedeutet:
     /// nicht fuer Produktion freigegeben.
     #[serde(default)]
@@ -347,6 +354,7 @@ impl Default for EnhancedConfig {
             maximum_aggregate_bitrate: enhanced_bitrate(),
             capacity_units: 0,
             legacy_session_units: 1,
+            av1_1080_enhanced_units: 0,
             native_2k_units: 0,
             native_2k_av1_units: 0,
             profiles: Vec::new(),

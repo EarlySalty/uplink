@@ -687,7 +687,9 @@ impl SessionProcessor for Coordinator {
                 }
                 continue;
             }
-            if self.state.config.media.enhanced.profiles.is_empty() {
+            if self.state.config.media.enhanced.profiles.is_empty()
+                && self.state.config.media.enhanced.av1_1080_enhanced_units == 0
+            {
                 reservation.single_fallback(&platform, "Enhanced ist für diese Serverleistung noch nicht freigegeben. Es läuft ein Einzelstream ohne zusätzliche Qualitätsstufen oder Hochkantfassung.");
                 desired.push(wunsch.output);
                 continue;
@@ -714,11 +716,22 @@ impl SessionProcessor for Coordinator {
                     if platform == "twitch" {
                         let key =
                             crate::media_output::capacity_key(prepared.observation(), &program);
-                        let admitted = reserve_twitch_profile(
+                        let av1_1080 = av1_1080_enhanced_envelope(
                             &self.state.config.media.enhanced,
-                            &reservation,
-                            &key,
+                            prepared.observation(),
+                            &program,
                         );
+                        let admitted = if av1_1080 {
+                            reservation.reserve_profile_capacity(
+                                self.state.config.media.enhanced.av1_1080_enhanced_units,
+                            )
+                        } else {
+                            reserve_twitch_profile(
+                                &self.state.config.media.enhanced,
+                                &reservation,
+                                &key,
+                            )
+                        };
                         if let Err(reason) = admitted {
                             reservation.media_diagnostic(
                                 serde_json::json!({"phase":"capacity", "profile_key":key}),
@@ -726,6 +739,12 @@ impl SessionProcessor for Coordinator {
                             reservation.single_fallback(&platform, reason);
                             desired.push(wunsch.output);
                             continue;
+                        }
+                        if av1_1080 {
+                            reservation.output_notice(
+                                platform.clone(),
+                                "Upload-Sparmodus: ein 1080p60-AV1-Masterstream wird serverseitig in die von Twitch angeforderte H.264-Enhanced-Leiter umgesetzt.",
+                            );
                         }
                         if let Some(video) =
                             program.video.iter().find(|video| video.canvas_index == 1)
@@ -819,6 +838,46 @@ fn reserve_twitch_profile(
     reservation.reserve_profile_capacity(units)
 }
 
+fn av1_1080_enhanced_envelope(
+    enhanced: &crate::config::EnhancedConfig,
+    source: &uplink_media::SourceObservation,
+    output: &uplink_media::ProgramOutput,
+) -> bool {
+    if enhanced.av1_1080_enhanced_units == 0
+        || source.codec != "av1"
+        || source.width != 1920
+        || source.height != 1080
+        || source.fps_numerator != 60
+        || source.fps_denominator != 1
+        || !(2..=5).contains(&output.video.len())
+    {
+        return false;
+    }
+    let mut aggregate = 0u64;
+    let mut top = false;
+    for video in &output.video {
+        let profile = &video.profile;
+        if video.canvas_index != 0
+            || video.layout.is_some()
+            || profile.codec != uplink_core::Codec::H264
+            || profile.width > 1920
+            || profile.height > 1080
+            || u64::from(profile.fps.numerator()) > 60 * u64::from(profile.fps.denominator())
+            || profile.rate.target_kbps > 7_500
+            || profile.rate.max_kbps != profile.rate.target_kbps
+            || video.bframes != 0
+        {
+            return false;
+        }
+        aggregate = aggregate.saturating_add(u64::from(profile.rate.target_kbps));
+        top |= profile.width == 1920
+            && profile.height == 1080
+            && profile.fps.numerator() == 60
+            && profile.fps.denominator() == 1;
+    }
+    top && aggregate <= 20_000
+}
+
 fn probe_dump_allowed(config: &crate::config::MediaConfig, authenticated_tenant: u64) -> bool {
     config.probe_dump_streamer_id == Some(authenticated_tenant)
 }
@@ -886,6 +945,115 @@ mod tests {
                 assert!(result.unwrap_err().contains("Lastmessung"));
             }
         }
+    }
+
+    #[test]
+    fn measured_av1_1080_envelope_is_narrow_and_fail_closed() {
+        use uplink_core::{
+            Chroma, Codec, Color, ColorPrimaries, ColorRange, FrameRate, Gop, Matrix,
+            RateControl, RateMode, Transfer, VideoProfile,
+        };
+        use uplink_media::{
+            ProgramOutput, ProgramVideo, PublishSecret, PublishTarget, SourceObservation,
+        };
+
+        let source = SourceObservation {
+            video_wire_track: 0,
+            codec: "av1".into(),
+            width: 1920,
+            height: 1080,
+            fps_numerator: 60,
+            fps_denominator: 1,
+            pixel_format: "yuv420p".into(),
+            color_primaries: Some("bt709".into()),
+            color_transfer: Some("bt709".into()),
+            color_matrix: Some("bt709".into()),
+            color_range: Some("tv".into()),
+            rate_control: None,
+            gop_frames: None,
+            audio: Vec::new(),
+            sampled_events: 1,
+            sampled_bytes: 1,
+            sampled_duration_ms: 1000,
+        };
+        let video = |wire_track, width, height, fps, bitrate| ProgramVideo {
+            wire_track,
+            canvas_index: 0,
+            profile: VideoProfile {
+                width,
+                height,
+                fps: FrameRate::new(fps, 1).unwrap(),
+                codec: Codec::H264,
+                codec_profile: "high".into(),
+                level: "4.2".into(),
+                bit_depth: 8,
+                chroma: Chroma::Yuv420,
+                color: Color {
+                    primaries: ColorPrimaries::Bt709,
+                    transfer: Transfer::Bt709,
+                    matrix: Matrix::Bt709,
+                    range: ColorRange::Limited,
+                },
+                rate: RateControl {
+                    mode: RateMode::Cbr,
+                    target_kbps: bitrate,
+                    max_kbps: bitrate,
+                    buffer_kbits: bitrate * 2,
+                },
+                gop: Gop {
+                    keyframe_interval_frames: fps * 2,
+                    closed: true,
+                },
+            },
+            bframes: 0,
+            layout: None,
+        };
+        let target = || PublishTarget {
+            id: "twitch".into(),
+            endpoint: "rtmps://test.example/app".into(),
+            playpath: PublishSecret::new(b"synthetic-key".to_vec()).unwrap(),
+            tls: None,
+            allowed_hosts: vec!["test.example".into()],
+            allow_loopback: false,
+            allow_unencrypted: false,
+        };
+        let mut output = ProgramOutput {
+            target: target(),
+            video: vec![
+                video(0, 1920, 1080, 60, 7_500),
+                video(1, 1280, 720, 60, 4_500),
+                video(2, 854, 480, 30, 2_500),
+                video(3, 640, 360, 30, 1_200),
+                video(4, 426, 240, 30, 500),
+            ],
+            audio: Vec::new(),
+        };
+        let enhanced = crate::config::EnhancedConfig {
+            capacity_units: 100,
+            av1_1080_enhanced_units: 100,
+            ..Default::default()
+        };
+        assert!(super::av1_1080_enhanced_envelope(
+            &enhanced, &source, &output
+        ));
+
+        output.video.push(video(5, 320, 180, 30, 200));
+        assert!(!super::av1_1080_enhanced_envelope(
+            &enhanced, &source, &output
+        ));
+        output.video.pop();
+        output.video[0].profile.width = 2560;
+        assert!(!super::av1_1080_enhanced_envelope(
+            &enhanced, &source, &output
+        ));
+        output.video[0].profile.width = 1920;
+        let mut wrong_source = source.clone();
+        wrong_source.codec = "hevc".into();
+        assert!(!super::av1_1080_enhanced_envelope(
+            &enhanced,
+            &wrong_source,
+            &output
+        ));
     }
 
     #[test]
