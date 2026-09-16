@@ -387,9 +387,17 @@ impl Reservation {
                     .and_then(|graph| graph["video"].as_array());
                 mode.active = if sending {
                     video.map(|tracks| {
-                        let native_source =
+                        let native_hevc_source =
                             state.source_observation.as_ref().is_some_and(|source| {
                                 source["codec"] == "hevc"
+                                    && source["width"] == 2560
+                                    && source["height"] == 1440
+                                    && source["fps_numerator"] == 60
+                                    && source["fps_denominator"] == 1
+                            });
+                        let native_av1_source =
+                            state.source_observation.as_ref().is_some_and(|source| {
+                                source["codec"] == "av1"
                                     && source["width"] == 2560
                                     && source["height"] == 1440
                                     && source["fps_numerator"] == 60
@@ -398,11 +406,23 @@ impl Reservation {
                         let native_copy = tracks
                             .iter()
                             .any(|track| track["canvas_index"] == 0 && track["mode"] == "copy");
+                        let hevc_encode = tracks.iter().any(|track| {
+                            track["canvas_index"] == 0
+                                && track["mode"] == "encode"
+                                && track["profile"]["codec"] == "hevc"
+                                && track["profile"]["width"] == 2560
+                                && track["profile"]["height"] == 1440
+                        });
                         if mode.requested == TwitchOutputMode::Native2k
-                            && native_source
+                            && native_hevc_source
                             && native_copy
                         {
                             TwitchOutputMode::Native2k
+                        } else if mode.requested == TwitchOutputMode::Native2kAv1
+                            && native_av1_source
+                            && hevc_encode
+                        {
+                            TwitchOutputMode::Native2kAv1
                         } else if tracks
                             .iter()
                             .filter(|track| track["canvas_index"] == 0)

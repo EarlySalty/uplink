@@ -12,6 +12,12 @@ pub enum TwitchOutputMode {
     /// werden auf dem Uplink-Server erzeugt.
     #[serde(rename = "native_2k")]
     Native2k,
+    /// Experimenteller 2K-Pfad: 2560×1440@60 AV1 kommt vom Quellrechner;
+    /// Uplink decodiert AV1 und erzeugt die von Twitch geforderte HEVC-Topspur
+    /// sowie die niedrigeren H.264-Stufen. Produktion bleibt bis zur Lastmessung
+    /// über ein eigenes Kapazitätsbudget gesperrt.
+    #[serde(rename = "native_2k_av1")]
+    Native2kAv1,
 }
 
 impl TwitchOutputMode {
@@ -20,6 +26,7 @@ impl TwitchOutputMode {
             Self::Single => "single",
             Self::Enhanced => "enhanced",
             Self::Native2k => "native_2k",
+            Self::Native2kAv1 => "native_2k_av1",
         }
     }
 }

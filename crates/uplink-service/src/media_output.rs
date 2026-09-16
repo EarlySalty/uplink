@@ -250,11 +250,13 @@ pub fn twitch_native_2k(
     vod: Option<u8>,
     source: &SourceObservation,
     client: &uplink_media::platform::twitch::Native2kClientProfile,
+    av1_transcode: bool,
 ) -> Result<ProgramOutput, &'static str> {
     let (hevc_encoder, h264_encoder) = client
         .validate()
         .map_err(|_| "Das gespeicherte 2K-Hardwareprofil ist ungültig.")?;
-    if source.codec != "hevc"
+    let expected_codec = if av1_transcode { "av1" } else { "hevc" };
+    if source.codec != expected_codec
         || source.width != 2560
         || source.height != 1440
         || source.fps_numerator != 60
@@ -265,9 +267,11 @@ pub fn twitch_native_2k(
         || source.color_matrix.as_deref() != Some("bt709")
         || source.color_range.as_deref() != Some("tv")
     {
-        return Err(
-            "Native Twitch-2K benötigt einen gemessenen 2560×1440@60-HEVC-Eingang in 8-Bit YUV420 BT.709.",
-        );
+        return Err(if av1_transcode {
+            "Native Twitch-2K AV1 benötigt einen gemessenen 2560×1440@60-AV1-Eingang in 8-Bit YUV420 BT.709."
+        } else {
+            "Native Twitch-2K benötigt einen gemessenen 2560×1440@60-HEVC-Eingang in 8-Bit YUV420 BT.709."
+        });
     }
     if config.video.is_empty() || config.video.len() != config.encoders.len() {
         return Err("Twitch hat keinen vollständigen 2K-Videovertrag geliefert.");
@@ -748,7 +752,7 @@ mod tests {
                 },
             ],
         };
-        let program = twitch_native_2k(config, 0, Some(1), &source, &native_client()).unwrap();
+        let program = twitch_native_2k(config, 0, Some(1), &source, &native_client(), false).unwrap();
         assert_eq!(program.video.len(), 2);
         assert_eq!(program.video[0].profile.codec, Codec::Hevc);
         assert_eq!(program.video[0].bframes, 0);
@@ -761,7 +765,7 @@ mod tests {
     fn native_2k_lehnt_av1_oder_1080p_quelle_ab() {
         let source = quelle();
         let config = konfiguration(vec![stufe(0, 0, 1920, 1080)]);
-        let error = match twitch_native_2k(config, 0, None, &source, &native_client()) {
+        let error = match twitch_native_2k(config, 0, None, &source, &native_client(), false) {
             Err(error) => error,
             Ok(_) => panic!("1080p/AV1-Quelle darf nicht als Native 2K gelten"),
         };

@@ -53,9 +53,11 @@ Die HEVC-Topspur erzeugt **keine** `EncodeProfile`-Gruppe. H.264-Unterstufen tei
 
 ## Kapazität
 
-Das Deployment verwendet ein separates `native_2k_units`-Budget. Die aktuelle Konfiguration reserviert damit praktisch die gesamte gemessene Transcoding-Kapazität für einen Native-2K-Hybrid gleichzeitig. Das ist eine Admission-Skala, keine Aussage wie „99 % CPU“.
+Das Deployment verwendet getrennte Budgets: `native_2k_units` für HEVC-Passthrough und `native_2k_av1_units` für den experimentellen AV1-Eingang. Die aktuelle Produktivkonfiguration setzt `native_2k_av1_units = 0`; AV1→Twitch-2K kann damit nicht versehentlich live starten.
 
-Die frühere Servermessung HEVC-1440p dekodieren plus 1080p60/720p60/360p30 mit x264 lag oberhalb Echtzeit; ein serverseitiger 1440p-HEVC-Neuencode war dagegen nicht echtzeitfähig genug. Deshalb ist HEVC-Passthrough eine feste Sicherheitsgrenze dieses Modus.
+Die frühere Servermessung HEVC-1440p dekodieren plus 1080p60/720p60/360p30 mit x264 lag oberhalb Echtzeit. Der erneute AV1-Test am 15./16. September 2026 zeigt dieselbe Grenze noch deutlicher: AV1-Decoding allein schafft etwa 8–10× Echtzeit, der vollständige Pfad AV1 1440p60 → HEVC 1440p60 + H.264 1080p/720p/360p erreicht mit x265 `fast` nur etwa 0,27–0,42×. Selbst x265 `ultrafast` erreicht für die vollständige Leiter nur etwa 0,81–0,83×. Nur die einzelne AV1→HEVC-Topspur erreicht mit 8 Threads und `ultrafast` knapp 1,01× und hat damit keine belastbare Reserve. Auf diesem CPU-Host bleibt AV1-2K deshalb gesperrt.
+
+Der Modus `native_2k_av1` ist trotzdem als expliziter Versuchspfad modelliert: OBS liefert 2560×1440@60 AV1, Uplink handelt mit Twitch weiterhin eine HEVC/H.264-Leiter aus und würde die 1440p-HEVC-Spur selbst erzeugen. Die Quellhost-Hardwaredaten werden dabei genauso an Twitch weitergegeben wie beim HEVC-Passthrough. Eine spätere Freigabe braucht eine neue Lastmessung auf der tatsächlich eingesetzten Serverhardware und ein eigenes positives Kapazitätsbudget.
 
 ## Noch echter Live-Nachweis
 

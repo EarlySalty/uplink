@@ -253,8 +253,10 @@ impl Config {
             || enhanced.profiles.len() > 128
             || (enhanced.capacity_units > 0
                 && (enhanced.legacy_session_units > enhanced.capacity_units
-                    || enhanced.native_2k_units > enhanced.capacity_units))
-            || (enhanced.capacity_units == 0 && enhanced.native_2k_units != 0)
+                    || enhanced.native_2k_units > enhanced.capacity_units
+                    || enhanced.native_2k_av1_units > enhanced.capacity_units))
+            || (enhanced.capacity_units == 0
+                && (enhanced.native_2k_units != 0 || enhanced.native_2k_av1_units != 0))
             || enhanced.profiles.iter().any(|profile| {
                 profile.key.is_empty()
                     || profile.key.len() > 4096
@@ -313,6 +315,11 @@ pub struct EnhancedConfig {
     /// nicht fuer Produktion freigegeben.
     #[serde(default)]
     pub native_2k_units: u32,
+    /// Experimenteller AV1→HEVC-2K-Pfad. Null bedeutet: nicht freigegeben.
+    /// Das Budget bleibt getrennt, weil zusätzlich zur H.264-Leiter auch die
+    /// 1440p-HEVC-Topspur auf diesem Server neu encodiert werden muss.
+    #[serde(default)]
+    pub native_2k_av1_units: u32,
     #[serde(default)]
     pub profiles: Vec<CapacityProfile>,
 }
@@ -341,6 +348,7 @@ impl Default for EnhancedConfig {
             capacity_units: 0,
             legacy_session_units: 1,
             native_2k_units: 0,
+            native_2k_av1_units: 0,
             profiles: Vec::new(),
         }
     }

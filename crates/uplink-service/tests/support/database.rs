@@ -91,6 +91,7 @@ pub(crate) async fn fixture() -> (Database, Arc<ServiceState>) {
         include_str!("../../../../db/migrations/20260910_twitch_output_mode.sql"),
         include_str!("../../../../db/migrations/20260915_twitch_native_2k_hardware.sql"),
         include_str!("../../../../db/migrations/20260915_twitch_native_2k_mode.sql"),
+        include_str!("../../../../db/migrations/20260915_twitch_native_2k_av1_mode.sql"),
     ] {
         store.query(sql, &[]).await.unwrap();
     }

@@ -1190,6 +1190,73 @@ mod tests {
     }
 
     #[test]
+    fn native_2k_av1_program_encodes_hevc_top_and_lower_h264() {
+        let mut source = program_source();
+        source.codec = "av1".into();
+        source.width = 2560;
+        source.height = 1440;
+        source.fps_numerator = 60;
+        source.fps_denominator = 1;
+        let mut top = program_profile(Codec::Hevc, 2560, 1440);
+        top.fps = FrameRate::new(60, 1).unwrap();
+        top.rate.target_kbps = 9_000;
+        top.rate.max_kbps = 9_000;
+        top.rate.buffer_kbits = 18_000;
+        top.gop.keyframe_interval_frames = 120;
+        let mut lower = program_profile(Codec::H264, 1920, 1080);
+        lower.fps = FrameRate::new(60, 1).unwrap();
+        lower.rate.target_kbps = 7_500;
+        lower.rate.max_kbps = 7_500;
+        lower.rate.buffer_kbits = 15_000;
+        lower.gop.keyframe_interval_frames = 120;
+        let graph = Graph::program(
+            &source,
+            &[program_output(
+                "twitch",
+                vec![
+                    crate::ProgramVideo {
+                        wire_track: 0,
+                        canvas_index: 0,
+                        profile: top,
+                        bframes: 0,
+                        layout: None,
+                    },
+                    crate::ProgramVideo {
+                        wire_track: 1,
+                        canvas_index: 0,
+                        profile: lower,
+                        bframes: 2,
+                        layout: None,
+                    },
+                ],
+                vec![program_audio(0, 0)],
+            )],
+        )
+        .unwrap();
+        assert!(graph.routes[0].failure.is_none());
+        assert_eq!(graph.profiles.len(), 2);
+        assert_eq!(graph.profiles[0].video.codec, Codec::Hevc);
+        assert_eq!(graph.profiles[1].video.codec, Codec::H264);
+        let status = graph.describe_route(&graph.routes[0], "twitch");
+        assert!(status.video.iter().all(|video| video.mode == "encode"));
+        assert_eq!(status.video[0].encoder, Some("libx265"));
+        assert_eq!(status.video[1].encoder, Some("libx264"));
+        let args = graph
+            .arguments(
+                &[
+                    PathBuf::from("/private/native-2k-av1-top.sock"),
+                    PathBuf::from("/private/native-2k-av1-low.sock"),
+                ],
+                4,
+                0,
+            )
+            .unwrap();
+        let args: Vec<_> = args.iter().map(|value| value.to_string_lossy()).collect();
+        assert!(args.iter().any(|arg| arg.as_ref() == "libx265"));
+        assert!(args.iter().any(|arg| arg.as_ref() == "libx264"));
+    }
+
+    #[test]
     fn program_caps_output_frame_rate_like_the_single_track_path() {
         let mut source = program_source();
         source.fps_numerator = 120;

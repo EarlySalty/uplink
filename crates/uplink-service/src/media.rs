@@ -216,21 +216,31 @@ impl Coordinator {
         tenant: u64,
         wunsch: &Zielwunsch,
         source: &uplink_media::SourceObservation,
+        input_mode: Native2kInputMode,
     ) -> Result<uplink_media::ProgramOutput, TwitchOutputError> {
         if wunsch.hochkant.is_some() {
             return Err(TwitchOutputError::Blocked(
                 "Native 2K und Hochkant werden getrennt freigegeben; für diesen Pfad darf keine zweite Canvas aktiv sein.",
             ));
         }
-        if source.codec != "hevc"
+        let erwarteter_codec = match input_mode {
+            Native2kInputMode::HevcPassthrough => "hevc",
+            Native2kInputMode::Av1Transcode => "av1",
+        };
+        if source.codec != erwarteter_codec
             || source.width != 2560
             || source.height != 1440
             || source.fps_numerator != 60
             || source.fps_denominator != 1
         {
-            return Err(TwitchOutputError::Blocked(
-                "Native Twitch-2K benötigt als Eingang exakt 2560×1440@60 HEVC; AV1/H.264 werden dafür nicht umkodiert.",
-            ));
+            return Err(TwitchOutputError::Blocked(match input_mode {
+                Native2kInputMode::HevcPassthrough => {
+                    "Native Twitch-2K benötigt als Eingang exakt 2560×1440@60 HEVC; AV1/H.264 werden in diesem Modus nicht umkodiert."
+                }
+                Native2kInputMode::Av1Transcode => {
+                    "Native Twitch-2K AV1 benötigt als Eingang exakt 2560×1440@60 AV1; der Modus ist ausschließlich für den gemessenen AV1→HEVC-Serverpfad."
+                }
+            }));
         }
         let hardware = self
             .hardware
@@ -247,6 +257,17 @@ impl Coordinator {
         }) {
             return Err(TwitchOutputError::Blocked(
                 "Für die niedrigeren Twitch-2K-Stufen ist libx264 auf diesem Server nicht bestätigt.",
+            ));
+        }
+        if input_mode == Native2kInputMode::Av1Transcode
+            && !hardware.encoders.iter().any(|probe| {
+                probe.initialized
+                    && probe.codec == uplink_core::Codec::Hevc
+                    && probe.encoder == "libx265"
+            })
+        {
+            return Err(TwitchOutputError::Blocked(
+                "Für AV1→2K ist libx265 auf diesem Server nicht bestätigt.",
             ));
         }
         let tenant = i64::try_from(tenant).map_err(|_| "Nutzeridentität ist ungültig.")?;
@@ -287,6 +308,7 @@ impl Coordinator {
             wunsch.output.vod_audio_track,
             source,
             &client,
+            input_mode == Native2kInputMode::Av1Transcode,
         )
         .map_err(TwitchOutputError::Blocked)
     }
@@ -404,6 +426,9 @@ impl Coordinator {
             "single" => crate::destinations::TwitchOutputMode::Single,
             "enhanced" if platform == "twitch" => crate::destinations::TwitchOutputMode::Enhanced,
             "native_2k" if platform == "twitch" => crate::destinations::TwitchOutputMode::Native2k,
+            "native_2k_av1" if platform == "twitch" => {
+                crate::destinations::TwitchOutputMode::Native2kAv1
+            }
             _ => return Err("Gespeicherter Ausgabemodus ist ungültig."),
         };
         Ok(Zielwunsch {
@@ -443,6 +468,12 @@ struct Zielwunsch {
     generation: i64,
     hochkant: Option<(u32, u32)>,
     output_mode: crate::destinations::TwitchOutputMode,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Native2kInputMode {
+    HevcPassthrough,
+    Av1Transcode,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -613,17 +644,33 @@ impl SessionProcessor for Coordinator {
                 reservation.block_output(platform, reason);
                 continue;
             }
-            if wunsch.output_mode == crate::destinations::TwitchOutputMode::Native2k {
-                let units = self.state.config.media.enhanced.native_2k_units;
+            let native_2k = match wunsch.output_mode {
+                crate::destinations::TwitchOutputMode::Native2k => Some((
+                    self.state.config.media.enhanced.native_2k_units,
+                    Native2kInputMode::HevcPassthrough,
+                    "Native Twitch-2K ist auf diesem Server noch nicht durch ein Kapazitätsbudget freigegeben.",
+                    "Native 2K: 1440p60 HEVC wird unverändert durchgereicht; nur von Twitch angeforderte niedrigere H.264-Stufen werden serverseitig erzeugt.",
+                )),
+                crate::destinations::TwitchOutputMode::Native2kAv1 => Some((
+                    self.state.config.media.enhanced.native_2k_av1_units,
+                    Native2kInputMode::Av1Transcode,
+                    "Native Twitch-2K AV1 ist bis zu einer bestandenen AV1→HEVC-Lastmessung gesperrt.",
+                    "Native 2K AV1: 1440p60 AV1 wird serverseitig zu Twitch-HEVC gewandelt; die niedrigeren H.264-Stufen werden im selben Mediengraph erzeugt.",
+                )),
+                _ => None,
+            };
+            if let Some((units, input_mode, blocked, notice)) = native_2k {
                 if units == 0 {
-                    reservation.block_output(
-                        platform,
-                        "Native Twitch-2K ist auf diesem Server noch nicht durch ein Kapazitätsbudget freigegeben.",
-                    );
+                    reservation.block_output(platform, blocked);
                     continue;
                 }
                 match self
-                    .twitch_native_2k_output(tenant_wert, &wunsch, prepared.observation())
+                    .twitch_native_2k_output(
+                        tenant_wert,
+                        &wunsch,
+                        prepared.observation(),
+                        input_mode,
+                    )
                     .await
                 {
                     Ok(program) => {
@@ -631,10 +678,7 @@ impl SessionProcessor for Coordinator {
                             reservation.block_output(platform, reason);
                             continue;
                         }
-                        reservation.output_notice(
-                            platform.clone(),
-                            "Native 2K: 1440p60 HEVC wird unverändert durchgereicht; nur von Twitch angeforderte niedrigere H.264-Stufen werden serverseitig erzeugt.",
-                        );
+                        reservation.output_notice(platform.clone(), notice);
                         programs.push(program);
                     }
                     Err(

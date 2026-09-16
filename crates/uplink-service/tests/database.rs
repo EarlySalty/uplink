@@ -66,6 +66,7 @@ async fn output_mode_migration_keeps_legacy_rows_and_enforces_platform_constrain
     for statement in [
         "UPDATE relay.destinations SET twitch_output_mode='enhanced' WHERE platform='kick'",
         "UPDATE relay.destinations SET twitch_output_mode='native_2k' WHERE platform='kick'",
+        "UPDATE relay.destinations SET twitch_output_mode='native_2k_av1' WHERE platform='kick'",
         "UPDATE relay.destinations SET twitch_output_mode='automatic' WHERE platform='twitch'",
         "UPDATE relay.destinations SET twitch_output_mode=NULL WHERE platform='twitch'",
     ] {
@@ -74,7 +75,7 @@ async fn output_mode_migration_keeps_legacy_rows_and_enforces_platform_constrain
     state
         .store
         .query(
-            "UPDATE relay.destinations SET twitch_output_mode='enhanced' WHERE platform='twitch'",
+            "UPDATE relay.destinations SET twitch_output_mode='native_2k_av1' WHERE platform='twitch'",
             &[],
         )
         .await
@@ -90,7 +91,7 @@ async fn output_mode_migration_keeps_legacy_rows_and_enforces_platform_constrain
         )
         .await
         .unwrap();
-    assert_eq!(rows[0].get::<_, String>(0), "enhanced");
+    assert_eq!(rows[0].get::<_, String>(0), "native_2k_av1");
     database.stop().await;
 }
 

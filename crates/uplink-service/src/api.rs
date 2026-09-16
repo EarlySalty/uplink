@@ -800,7 +800,7 @@ async fn save_native_2k_hardware(
     }
     Ok(Json(json!({
         "configured":true,
-        "message":"Hardwareprofil gespeichert. Native 2K wird trotzdem erst bei einem echten 2560×1440@60-HEVC-Eingang und einer passenden Twitch-GoLive-Konfiguration aktiviert."
+        "message":"Hardwareprofil des Quellhosts gespeichert. Die CPU-/RAM-/OS-/GPU-Daten werden für Native 2K unverändert an Twitchs GoLive-Konfiguration weitergereicht. HEVC-Passthrough benötigt 2560×1440@60 HEVC; der getrennte AV1-Modus bleibt zusätzlich an seine Server-Lastfreigabe gebunden."
     })))
 }
 
