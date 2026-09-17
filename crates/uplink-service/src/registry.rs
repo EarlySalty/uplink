@@ -220,6 +220,28 @@ impl Registry {
     }
 }
 impl Reservation {
+    /// Reserviert atomar die gesamte Uplink-Kapazität für einen expliziten Test.
+    /// Bestehende Sessions werden niemals beendet; neue können erst nach dem
+    /// Drop dieser Reservation wieder zugelassen werden.
+    pub(crate) fn reserve_exclusive_test_capacity(&self) -> Result<(), &'static str> {
+        let registry = self.registry.upgrade().ok_or("Session ist beendet.")?;
+        let mut state = registry
+            .lock()
+            .map_err(|_| "Sessionverwaltung ist nicht verfügbar.")?;
+        if state.capacity_limit == 0 {
+            return Err("Für den AV1-2K-Test fehlt ein begrenztes Kapazitätsbudget.");
+        }
+        if !state.active.contains_key(&self.id) || !state.capacity.contains_key(&self.id) {
+            return Err("Session ist beendet.");
+        }
+        if state.active.len() != 1 {
+            return Err("Der AV1-2K-Test startet nur ohne andere aktive Uplink-Streams.");
+        }
+        let limit = state.capacity_limit;
+        state.capacity.insert(self.id, limit);
+        Ok(())
+    }
+
     pub fn reserve_profile_capacity(&self, units: u32) -> Result<(), &'static str> {
         let registry = self.registry.upgrade().ok_or("Session ist beendet.")?;
         let mut state = registry
@@ -606,6 +628,32 @@ impl Drop for Reservation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exclusive_test_preserves_other_sessions_and_releases_capacity() {
+        let registry = Registry::new(4, 1).unwrap();
+        registry.configure_capacity(100, 1).unwrap();
+        let test = registry.reserve(11).unwrap();
+        let normal = registry.reserve(12).unwrap();
+        assert!(test.reserve_exclusive_test_capacity().is_err());
+        assert_eq!(registry.active_count(), 2);
+        normal.reserve_profile_capacity(20).unwrap();
+        drop(normal);
+        test.reserve_exclusive_test_capacity().unwrap();
+        assert!(registry.reserve(12).is_err());
+        assert!(test.reserve_profile_capacity(1).is_err());
+        drop(test);
+        assert!(registry.reserve(12).is_ok());
+    }
+
+    #[test]
+    fn exclusive_test_requires_a_bounded_live_registry() {
+        let registry = Registry::new(2, 1).unwrap();
+        let test = registry.reserve(11).unwrap();
+        assert!(test.reserve_exclusive_test_capacity().is_err());
+        drop(registry);
+        assert!(test.reserve_exclusive_test_capacity().is_err());
+    }
 
     #[test]
     fn output_mode_is_active_only_while_its_publisher_sends() {

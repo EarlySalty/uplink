@@ -347,3 +347,90 @@ fn media_rejection_and_existing_errors_survive_session_completion() {
     assert_eq!(status.state, "Fehler");
     assert_eq!(status.error, Some("Ausgang abgewiesen"));
 }
+
+#[test]
+fn av1_2k_test_requires_one_explicit_account_and_no_global_release() {
+    let example = include_str!("../../../config/uplink-beispiel.toml");
+    let default = Config::parse(example).unwrap();
+    assert!(!default.media.enhanced.native_2k_av1_test_permits(11));
+    let mut input: toml::Value = toml::from_str(example).unwrap();
+    input["media"]["enhanced"]
+        .as_table_mut()
+        .unwrap()
+        .insert("native_2k_av1_test_streamer_id".into(), 11.into());
+    let accepted = Config::parse(&toml::to_string(&input).unwrap()).unwrap();
+    assert!(accepted.media.enhanced.native_2k_av1_test_permits(11));
+    for other in [0, 12, u64::MAX] {
+        assert!(!accepted.media.enhanced.native_2k_av1_test_permits(other));
+    }
+    assert_eq!(accepted.media.enhanced.native_2k_av1_units, 0);
+    for id in [0, -1] {
+        let mut bad = input.clone();
+        bad["media"]["enhanced"]["native_2k_av1_test_streamer_id"] = id.into();
+        assert!(Config::parse(&toml::to_string(&bad).unwrap()).is_err());
+    }
+    input["media"]["enhanced"]["native_2k_av1_units"] = 99.into();
+    assert!(Config::parse(&toml::to_string(&input).unwrap()).is_err());
+}
+
+#[test]
+fn av1_2k_test_never_uses_unlimited_capacity() {
+    let mut input: toml::Value =
+        toml::from_str(include_str!("../../../config/uplink-beispiel.toml")).unwrap();
+    let enhanced = input["media"]["enhanced"].as_table_mut().unwrap();
+    enhanced.insert("native_2k_av1_test_streamer_id".into(), 11.into());
+    enhanced.insert("av1_1080_enhanced_units".into(), 0.into());
+    enhanced.insert("native_2k_units".into(), 0.into());
+    enhanced.insert("capacity_units".into(), 0.into());
+    assert!(Config::parse(&toml::to_string(&input).unwrap()).is_err());
+    input["media"]["enhanced"]["capacity_units"] = 1.into();
+    assert!(Config::parse(&toml::to_string(&input).unwrap()).is_err());
+}
+
+#[test]
+fn enhanced_profile_budget_includes_the_existing_session_reservation() {
+    let example = include_str!("../../../config/uplink-beispiel.toml");
+    for field in [
+        "av1_1080_enhanced_units",
+        "native_2k_units",
+        "native_2k_av1_units",
+    ] {
+        let mut input: toml::Value = toml::from_str(example).unwrap();
+        input["media"]["enhanced"][field] = 99.into();
+        assert!(Config::parse(&toml::to_string(&input).unwrap()).is_ok());
+        input["media"]["enhanced"][field] = 100.into();
+        assert!(
+            Config::parse(&toml::to_string(&input).unwrap()).is_err(),
+            "{field}"
+        );
+    }
+    let mut input: toml::Value = toml::from_str(example).unwrap();
+    input["media"]["enhanced"]["profiles"] =
+        toml::Value::Array(vec![toml::Value::Table(toml::map::Map::from_iter([
+            ("key".into(), "synthetic-capacity-test".into()),
+            ("units".into(), 100.into()),
+        ]))]);
+    assert!(Config::parse(&toml::to_string(&input).unwrap()).is_err());
+}
+
+#[test]
+fn deployed_av1_1080_budget_can_actually_be_reserved() {
+    for input in [
+        include_str!("../../../deployment/uplink.toml"),
+        include_str!("../../../config/uplink-beispiel.toml"),
+    ] {
+        let config = Config::parse(input).unwrap();
+        let enhanced = config.media.enhanced;
+        let registry = Registry::new(config.max_sessions, config.max_sessions_per_tenant).unwrap();
+        registry
+            .configure_capacity(enhanced.capacity_units, enhanced.legacy_session_units)
+            .unwrap();
+        let session = registry.reserve(11).unwrap();
+        session
+            .reserve_profile_capacity(enhanced.av1_1080_enhanced_units)
+            .unwrap();
+        assert!(registry.reserve(12).is_err());
+        drop(session);
+        assert!(registry.reserve(12).is_ok());
+    }
+}

@@ -724,6 +724,11 @@ fn native_2k_request_forwards_source_gpu_and_never_advertises_av1() {
     )
     .unwrap();
     let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        value["capabilities"],
+        serde_json::to_value(&profile.capabilities).unwrap(),
+        "Alle Quellrechnerwerte bleiben unverändert; keine Serverdaten als Ersatz"
+    );
     assert_eq!(value["capabilities"]["gpu"][0]["vendor_id"], 0x1002);
     assert_eq!(value["capabilities"]["gpu"][0]["device_id"], 0x744c);
     assert_eq!(value["preferences"]["composition_gpu_index"], 0);
@@ -786,4 +791,55 @@ fn native_2k_contract_rejects_av1_and_missing_1440_hevc() {
         ),
         Err(GoLiveError::UnsupportedEncoder)
     ));
+}
+
+#[test]
+fn native_2k_request_preserves_both_source_gpus() {
+    let mut profile = native_2k_client();
+    profile.capabilities.gpu.push(ClientGpu {
+        model: "Synthetic second Radeon".into(),
+        vendor_id: 0x1002,
+        device_id: 0x73bf,
+        dedicated_video_memory: 16 * 1024 * 1024 * 1024,
+        shared_system_memory: 16 * 1024 * 1024 * 1024,
+        driver_version: "synthetic-second-driver".into(),
+    });
+    let bytes = request_native_2k_body(
+        &key(),
+        &profile,
+        &preferences_with(30_000, 5),
+        &[Codec::Hevc, Codec::H264],
+    )
+    .unwrap();
+    let request: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        request["capabilities"],
+        serde_json::to_value(&profile.capabilities).unwrap()
+    );
+    assert_eq!(request["capabilities"]["gpu"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn native_2k_contract_accepts_only_the_twitch_requested_top_track() {
+    let profile = native_2k_client();
+    let (hevc_encoder, h264_encoder) = profile.validate().unwrap();
+    let mut response: serde_json::Value = serde_json::from_slice(&native_2k_response()).unwrap();
+    response["encoder_configurations"]
+        .as_array_mut()
+        .unwrap()
+        .truncate(1);
+    let configuration = parse_configuration_mode(
+        &serde_json::to_vec(&response).unwrap(),
+        &preferences_with(30_000, 5),
+        &key(),
+        &hosts(),
+        &[Codec::Hevc, Codec::H264],
+        ConfigurationMode::Native2k {
+            hevc_encoder,
+            h264_encoder,
+        },
+    )
+    .unwrap();
+    assert_eq!(configuration.video.len(), 1);
+    assert_eq!(configuration.video[0].codec, Codec::Hevc);
 }

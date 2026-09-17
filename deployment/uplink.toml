@@ -51,9 +51,11 @@ maximum_video_tracks = 8
 maximum_aggregate_bitrate = 30000
 capacity_units = 100
 legacy_session_units = 1
-av1_1080_enhanced_units = 100
+av1_1080_enhanced_units = 99
 native_2k_units = 99
 native_2k_av1_units = 0
+# AV1-2K-Lasttest: optional native_2k_av1_test_streamer_id auf die autorisierte
+# numerische Streamer-ID setzen. Bleibt ohne ID gesperrt; siehe docs/twitch-native-2k.md.
 profiles = []
 
 [[platforms]]

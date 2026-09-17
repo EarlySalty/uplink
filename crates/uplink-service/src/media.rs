@@ -201,7 +201,7 @@ impl Coordinator {
             .try_get(0)
             .map_err(|_| "Das 2K-Hardwareprofil ist beschädigt.")?;
         let value = value.ok_or(
-            "Für Native Twitch-2K fehlen die Hardwaredaten des tatsächlich HEVC-kodierenden Quellrechners.",
+            "Für Native Twitch-2K fehlen die Hardwaredaten des tatsächlich streamenden Quellrechners.",
         )?;
         let profile: uplink_media::platform::twitch::Native2kClientProfile =
             serde_json::from_value(value).map_err(|_| "Das 2K-Hardwareprofil ist beschädigt.")?;
@@ -660,7 +660,14 @@ impl SessionProcessor for Coordinator {
                 _ => None,
             };
             if let Some((units, input_mode, blocked, notice)) = native_2k {
-                if units == 0 {
+                let av1_test = input_mode == Native2kInputMode::Av1Transcode
+                    && self
+                        .state
+                        .config
+                        .media
+                        .enhanced
+                        .native_2k_av1_test_permits(tenant_wert);
+                if units == 0 && !av1_test {
                     reservation.block_output(platform, blocked);
                     continue;
                 }
@@ -674,11 +681,20 @@ impl SessionProcessor for Coordinator {
                     .await
                 {
                     Ok(program) => {
-                        if let Err(reason) = reservation.reserve_profile_capacity(units) {
+                        let capacity = if av1_test {
+                            reservation.reserve_exclusive_test_capacity()
+                        } else {
+                            reservation.reserve_profile_capacity(units)
+                        };
+                        if let Err(reason) = capacity {
                             reservation.block_output(platform, reason);
                             continue;
                         }
-                        reservation.output_notice(platform.clone(), notice);
+                        reservation.output_notice(platform.clone(), if av1_test {
+                            "Experimenteller AV1-2K-Lasttest: exklusives Uplink-Budget, Quellrechner-Hardware an Twitch, HEVC/H.264-Encode auf dem Server. Keine Produktionsfreigabe."
+                        } else {
+                            notice
+                        });
                         programs.push(program);
                     }
                     Err(
@@ -950,8 +966,8 @@ mod tests {
     #[test]
     fn measured_av1_1080_envelope_is_narrow_and_fail_closed() {
         use uplink_core::{
-            Chroma, Codec, Color, ColorPrimaries, ColorRange, FrameRate, Gop, Matrix,
-            RateControl, RateMode, Transfer, VideoProfile,
+            Chroma, Codec, Color, ColorPrimaries, ColorRange, FrameRate, Gop, Matrix, RateControl,
+            RateMode, Transfer, VideoProfile,
         };
         use uplink_media::{
             ProgramOutput, ProgramVideo, PublishSecret, PublishTarget, SourceObservation,

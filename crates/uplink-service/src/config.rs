@@ -245,17 +245,26 @@ impl Config {
             return Err("Mediengrenzen oder Audiozuordnung sind ungültig.");
         }
         let enhanced = &config.media.enhanced;
+        let profile_budget = enhanced
+            .capacity_units
+            .saturating_sub(enhanced.legacy_session_units);
         let mut keys = std::collections::HashSet::new();
         if !(1..=16).contains(&enhanced.maximum_video_tracks)
             || !(1..=100_000).contains(&enhanced.maximum_aggregate_bitrate)
             || enhanced.capacity_units > 100_000
             || enhanced.legacy_session_units == 0
             || enhanced.profiles.len() > 128
+            || enhanced.native_2k_av1_test_streamer_id.is_some_and(|id| {
+                id == 0
+                    || id > i64::MAX as u64
+                    || enhanced.capacity_units <= enhanced.legacy_session_units
+                    || enhanced.native_2k_av1_units != 0
+            })
             || (enhanced.capacity_units > 0
                 && (enhanced.legacy_session_units > enhanced.capacity_units
-                    || enhanced.av1_1080_enhanced_units > enhanced.capacity_units
-                    || enhanced.native_2k_units > enhanced.capacity_units
-                    || enhanced.native_2k_av1_units > enhanced.capacity_units))
+                    || enhanced.av1_1080_enhanced_units > profile_budget
+                    || enhanced.native_2k_units > profile_budget
+                    || enhanced.native_2k_av1_units > profile_budget))
             || (enhanced.capacity_units == 0
                 && (enhanced.av1_1080_enhanced_units != 0
                     || enhanced.native_2k_units != 0
@@ -266,7 +275,7 @@ impl Config {
                     || profile.key.chars().any(char::is_control)
                     || !keys.insert(&profile.key)
                     || profile.units == 0
-                    || profile.units > enhanced.capacity_units
+                    || profile.units > profile_budget
             })
         {
             return Err("Enhanced-Broadcasting-Grenzen sind ungültig.");
@@ -327,6 +336,11 @@ pub struct EnhancedConfig {
     /// 1440p-HEVC-Topspur auf diesem Server neu encodiert werden muss.
     #[serde(default)]
     pub native_2k_av1_units: u32,
+    /// Einzelner autorisierter Lasttest, keine Produktionsfreigabe. Der Test
+    /// benötigt einen leeren Uplink und reserviert dessen gesamtes Budget.
+    /// Ohne ID bleibt der Test gesperrt; der Ausgabemodus wird nicht geändert.
+    #[serde(default)]
+    pub native_2k_av1_test_streamer_id: Option<u64>,
     #[serde(default)]
     pub profiles: Vec<CapacityProfile>,
 }
@@ -347,6 +361,16 @@ fn enhanced_bitrate() -> u64 {
 fn legacy_units() -> u32 {
     1
 }
+impl EnhancedConfig {
+    pub fn native_2k_av1_test_permits(&self, tenant: u64) -> bool {
+        tenant > 0
+            && tenant <= i64::MAX as u64
+            && self.native_2k_av1_test_streamer_id == Some(tenant)
+            && self.native_2k_av1_units == 0
+            && self.capacity_units > self.legacy_session_units
+    }
+}
+
 impl Default for EnhancedConfig {
     fn default() -> Self {
         Self {
@@ -357,6 +381,7 @@ impl Default for EnhancedConfig {
             av1_1080_enhanced_units: 0,
             native_2k_units: 0,
             native_2k_av1_units: 0,
+            native_2k_av1_test_streamer_id: None,
             profiles: Vec::new(),
         }
     }
