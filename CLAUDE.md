@@ -4,6 +4,7 @@ Uplink wird in einem neuen Repository vollständig neu implementiert. Der bisher
 
 ## Maßgebliche Dokumente
 
+- [AV1-Testgedächtnis und Agentenübergabe](docs/av1-uplink-test-gedaechtnis.md): zuerst lesen, wenn der Nutzer nach seinem geplanten Upload-Spar-/AV1-1440p-Test fragt. Enthält Ziel, bekannte Quellhardware, Normalbetrieb versus Versuch, Code-/Branchstand, offene Aktivierung, OBS-Ablauf, Messung und Rückkehr. Datierte Angaben vor Aktivierung mit dem Live-Stand abgleichen und nach Fortschritt aktualisieren.
 - [Produktvertrag v0.3](docs/produktvertrag-v0.3.md): vollständiger Umfang, Vorschläge, offene F1–F6 und übergebener Quellenstand.
 - [ADR 0001](docs/adr/0001-neues-repository-und-rust-neubau.md): neues Repository und Rust-Neuimplementierung.
 - [Architektur und nächste Arbeit](docs/architektur.md): Zuständigkeiten, Invarianten und Baufolge für den vollen Vier-Plattform-Umfang.

@@ -1,6 +1,7 @@
 # Uplink
 
 - Verbindliche Grundlage: [Produktvertrag v0.3](docs/produktvertrag-v0.3.md), [Neubauentscheidung](docs/adr/0001-neues-repository-und-rust-neubau.md) und [Abnahmestand](docs/abnahme.md).
+- Bei Fragen wie „Was wollte ich bei AV1/Uplink testen?“, zu Upload-Sparen, HQCBR, Native 2K oder Quell-GPU-Weitergabe zuerst [AV1-Testgedächtnis und Agentenübergabe](docs/av1-uplink-test-gedaechtnis.md) lesen. Dort stehen Nutzerziel, bekannte RX 7900 XT, die drei getrennten Wege, Codeorte, Feature-Stand, Aktivierungsgrenzen, OBS-Testablauf und Rückkehr. Den dort datierten Entwicklungsstand vor Aktionen mit dem tatsächlichen Release abgleichen; nach Fortschritten aktualisieren. Bekannte Anforderungen nicht erneut beim Nutzer erfragen.
 - Backend, Steuerung und Medienintegration neu in Rust implementieren. Alten Medienkern nicht kopieren oder umbenennen. Geprüfte Browser-Oberflächen und Assets dürfen bleiben; keine zusätzliche Laufzeit für neue Backendlogik.
 - Einfach und nachweisbar bauen. Bibliotheken für Codec/TLS verwenden, sobald die benötigte Kombination belegt ist. Keine unnötigen Dienste oder Abstraktionsschichten.
 - Keine ENV-Dateien und keine Umgebungsvariablen für Konfiguration. Normale Einstellungen gehören in eine Config-Datei; Secrets ausschließlich aus Infisical bzw. dem bestehenden autorisierten Broker. Secrets nie im Klartext lesen, ausgeben oder in Dateien schreiben.

@@ -2,6 +2,10 @@
 
 Sauberer Rust-Neubau in einem eigenständigen Repository. Grundlage ist der Produktvertrag v0.3 vom 8. September 2026. Der alte Medienkern und seine Git-Historie werden nicht übernommen.
 
+## Geplanter AV1-/Upload-Spar-Test
+
+[Was wollte ich testen, und wie ist es gebaut?](docs/av1-uplink-test-gedaechtnis.md) hält den persönlichen OBS→Uplink→Twitch-Versuch dauerhaft fest: 1080p-Sparmodus versus AV1-1440p-Lasttest, Quellhardware, vorhandene Implementierung, offene Aktivierung, Testanleitung, Messung und Rückkehr. Einstieg für Nutzer und spätere Agenten; den datierten Stand vor Aktivierung neu prüfen.
+
 ## Was bereits läuft
 
 `uplink-core` plant deklarierte Videoausgaben anhand vollständiger Profile, Quellspuren und ausdrücklich angegebener Fähigkeiten. Identische Videoausgaben derselben Sessiongeneration werden gruppiert; verschiedene Audio-Routen teilen weiterhin denselben Video-Encode. Die Planung prüft Decoder, Encoder, Layoutrevisionen, Profilgrenzen und die Anzahl notwendiger Video-Encodes. Sie reserviert noch keine realen Ressourcen.
