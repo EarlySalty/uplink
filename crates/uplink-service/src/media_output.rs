@@ -752,7 +752,8 @@ mod tests {
                 },
             ],
         };
-        let program = twitch_native_2k(config, 0, Some(1), &source, &native_client(), false).unwrap();
+        let program =
+            twitch_native_2k(config, 0, Some(1), &source, &native_client(), false).unwrap();
         assert_eq!(program.video.len(), 2);
         assert_eq!(program.video[0].profile.codec, Codec::Hevc);
         assert_eq!(program.video[0].bframes, 0);

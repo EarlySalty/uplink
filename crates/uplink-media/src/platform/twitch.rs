@@ -1050,8 +1050,8 @@ fn parse_configuration_mode(
             profile: v.settings.profile.into(),
         });
     }
-    if matches!(mode, ConfigurationMode::Native2k { .. }) {
-        if video
+    if matches!(mode, ConfigurationMode::Native2k { .. })
+        && (video
             .iter()
             .any(|item| item.canvas_index != 0 || item.codec == Codec::Av1)
             || video
@@ -1077,10 +1077,9 @@ fn parse_configuration_mode(
                         || item.height > 1080
                         || u64::from(item.framerate.numerator)
                             > 60 * u64::from(item.framerate.denominator))
-            })
-        {
-            return Err(GoLiveError::UnsupportedEncoder);
-        }
+            }))
+    {
+        return Err(GoLiveError::UnsupportedEncoder);
     }
     let vod = raw.audio_configurations.vod.as_deref().unwrap_or_default();
     if raw.audio_configurations.live.is_empty()
