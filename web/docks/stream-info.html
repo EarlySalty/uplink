@@ -305,6 +305,98 @@ footer {
   .pille.live .punkt { animation: none; }
   .kringel { animation-duration: 1400ms; }
 }
+
+/* OBS Dock refresh: compact Twitch-style dark UI. */
+:root {
+  --gold: #9146ff;
+  --gold-hell: #a970ff;
+  --messing: #adadb8;
+  --auf-gold: #ffffff;
+  --text: #efeff1;
+  --dim: #adadb8;
+  --blass: #53535f;
+  --linie: rgba(255, 255, 255, .08);
+  --linie-stark: #3a3a44;
+  --gruen: #00ff7f;
+  --warn: #e5a43b;
+  --rot: #eb0400;
+  --schrift: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif;
+  --anzeige: var(--schrift);
+}
+body { background: #0e0e10; }
+header {
+  flex-wrap: nowrap; gap: 6px; min-height: 38px; padding: 6px 8px;
+  background: #18181b; overflow: hidden;
+}
+#plattformen { flex-wrap: nowrap; overflow: hidden; }
+.pille {
+  gap: 6px; padding: 4px 10px; border-radius: 9999px;
+  background: #1f1f23; border-color: #2d2d35; color: #adadb8;
+  font-size: 11px; line-height: 1;
+}
+.pille .punkt { background: #53535f; }
+.pille.live { color: #efeff1; background: #1f1f23; border-color: #3a3a44; }
+.pille.live .punkt { background: #00ff7f; box-shadow: 0 0 6px rgba(0, 255, 127, .5); }
+.pille.leer .punkt { background: #53535f; box-shadow: none; }
+.stand { font-size: 11px; max-width: 92px; overflow: hidden; text-overflow: ellipsis; }
+.stand[data-lage="verbindet"] { color: #e5a43b; }
+.stand[data-lage="fehler"] { color: #eb0400; }
+
+main { padding: 12px 10px 14px; scrollbar-color: #3a3a44 transparent; }
+main::-webkit-scrollbar { width: 6px; }
+main::-webkit-scrollbar-thumb { background: #3a3a44; }
+.abschnitt { margin-bottom: 16px; }
+label, .feldname {
+  margin-bottom: 4px; color: #adadb8; font-size: 12px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: .5px;
+}
+.zaehler { color: #adadb8; font-size: 11px; }
+.hilfe { color: #adadb8; }
+input[type="text"], textarea {
+  background: #18181b; color: #efeff1; border-color: #3a3a44;
+  border-radius: 6px; padding-left: 12px; padding-right: 12px;
+}
+input[type="text"]:hover, textarea:hover { border-color: #53535f; }
+input[type="text"]:focus, textarea:focus {
+  border-color: #9146ff; background: #1f1f23;
+  box-shadow: 0 0 0 1px #9146ff;
+}
+input[type="text"]::placeholder, textarea::placeholder { color: #53535f; }
+.suchzeile input[type="text"] { padding-left: 31px; }
+.zweit {
+  background: #26262c; border-color: #3a3a44; color: #efeff1; font-weight: 600;
+}
+.zweit:hover { background: #303038; border-color: #53535f; }
+
+#vorschlaege { background: #18181b; border-color: #3a3a44; }
+#vorschlaege button:hover { background: #26262c; }
+#vorschlaege button:focus-visible { outline-color: #9146ff; }
+#vorschlaege .zuschauer, #vorschlaege .quelle { color: #adadb8; }
+
+.katkarte {
+  align-items: center; gap: 10px; padding: 8px 38px 8px 8px;
+  background: #18181b; border-color: #2d2d35;
+}
+.katkarte img { border-radius: 4px; background: #0e0e10; }
+.katkarte .name { font-weight: 600; color: #efeff1; }
+.katkarte .unter { color: #adadb8; font-size: 12px; }
+
+.tag {
+  gap: 4px; padding: 2px 8px; border-radius: 4px;
+  background: #26262c; border-color: #3a3a44; color: #efeff1; font-size: 12px;
+}
+.tag button { color: #adadb8; }
+
+footer { padding: 10px; background: #18181b; }
+#nichtgespeichert { color: #adadb8; }
+#nichtgespeichert::before { background: #9146ff; }
+#speichern {
+  height: 38px; background: #9146ff; color: #fff; border-radius: 6px; font-weight: 600;
+}
+#speichern:hover { background: #772ce8; }
+#speichern:disabled { background: #53535f; }
+.kringel { border-color: rgba(255,255,255,.25); border-top-color: #fff; }
+
 </style>
 </head>
 <body>
