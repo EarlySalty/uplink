@@ -1,0 +1,4 @@
+# Source, tests and patched third-party code remain in scope.
+.git/
+**/target/
+**/node_modules/

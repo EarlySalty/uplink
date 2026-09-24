@@ -1,33 +1,49 @@
 name: Rust
-
 on:
   push:
     branches: [main]
   pull_request:
-
+  merge_group:
+  workflow_dispatch:
+  schedule:
+    - cron: '23 4 * * 1'
 permissions:
   contents: read
-
+defaults:
+  run:
+    shell: bash
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 jobs:
   check:
     runs-on: ubuntu-24.04
+    timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Toolchain aus rust-toolchain.toml verwenden
         run: rustup show
       - name: Formatierung
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -j2 -- -D warnings
-      - name: Tests
-        run: cargo test --workspace --locked -j2
-      - name: Steuerung gegen isoliertes PostgreSQL
+      - name: Isolierte Testwerkzeuge vor Workspace-Tests installieren
         run: |
           set -eu
           ubuntu_sources=/etc/apt/sources.list.d/ubuntu.sources
           test -s "$ubuntu_sources"
           sudo apt-get -o "Dir::Etc::sourcelist=$ubuntu_sources" -o Dir::Etc::sourceparts=- update
           sudo apt-get -o "Dir::Etc::sourcelist=$ubuntu_sources" -o Dir::Etc::sourceparts=- install -y postgresql-16 ffmpeg
+          test -x /usr/lib/postgresql/16/bin/initdb
+          test -x /usr/lib/postgresql/16/bin/postgres
+      - name: Tests
+        run: cargo test --workspace --locked -j2
+      - name: Steuerung gegen isoliertes PostgreSQL
+        run: |
+          set -eu
+          cargo test -p uplink-youtube-live --test store_postgres --locked -j2 -- --ignored --test-threads=1
           cargo test -p uplink-service --test database --locked -j2 -- --ignored --test-threads=1
           cargo test -p uplink-service --test http_shutdown --locked -j2 -- --ignored --test-threads=1
           cargo test -p uplink-service --test lifecycle --locked -j2 -- --ignored --test-threads=1
@@ -79,3 +95,153 @@ jobs:
           cargo clippy --manifest-path experiments/scuffle-probe/Cargo.toml --all-targets --locked -- -D warnings
           cargo test --manifest-path experiments/scuffle-probe/Cargo.toml --locked
           cargo test --manifest-path experiments/scuffle-probe/Cargo.toml --release --locked
+
+  docks:
+    name: Dock DOM regressions
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22.22.2'
+      - run: npm ci --ignore-scripts --no-audit --no-fund --prefix web/docks/tests
+      - run: npm test --prefix web/docks/tests
+
+  gitleaks:
+    name: Gitleaks full history and tree
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Install verified scanner binary
+        run: |
+          bash .github/ci/install-tool.sh gitleaks "$RUNNER_TEMP/security-bin"
+          printf '%s\n' "$RUNNER_TEMP/security-bin" >> "$GITHUB_PATH"
+      - name: Blocking scan and controlled counterprobes
+        run: bash .github/ci/security.sh gitleaks
+      - name: Upload scan evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: security-gitleaks-${{ github.run_attempt }}
+          path: target/security-reports/
+          if-no-files-found: error
+          retention-days: 14
+
+  cargo-security:
+    name: Cargo Audit and Deny (all lockfiles)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install verified scanner binaries
+        run: |
+          bash .github/ci/install-tool.sh cargo-audit "$RUNNER_TEMP/security-bin"
+          bash .github/ci/install-tool.sh cargo-deny "$RUNNER_TEMP/security-bin"
+          printf '%s\n' "$RUNNER_TEMP/security-bin" >> "$GITHUB_PATH"
+      - name: Blocking scan and controlled counterprobes
+        run: bash .github/ci/security.sh cargo
+      - name: Upload scan evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: security-cargo-${{ github.run_attempt }}
+          path: target/security-reports/
+          if-no-files-found: error
+          retention-days: 14
+
+  semgrep:
+    name: Semgrep Rust, docks and Actions
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install locked Semgrep in an isolated environment
+        run: |
+          python3 -m venv "$RUNNER_TEMP/semgrep-env"
+          "$RUNNER_TEMP/semgrep-env/bin/pip" install --require-hashes -r .github/ci/semgrep-requirements.txt
+          printf '%s\n' "$RUNNER_TEMP/semgrep-env/bin" >> "$GITHUB_PATH"
+      - name: Blocking scan and controlled counterprobes
+        run: bash .github/ci/security.sh semgrep
+      - name: Upload scan evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: security-semgrep-${{ github.run_attempt }}
+          path: target/security-reports/
+          if-no-files-found: error
+          retention-days: 14
+
+  trivy:
+    name: Trivy HIGH and CRITICAL
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install verified scanner binary
+        run: |
+          bash .github/ci/install-tool.sh trivy "$RUNNER_TEMP/security-bin"
+          printf '%s\n' "$RUNNER_TEMP/security-bin" >> "$GITHUB_PATH"
+      - name: Blocking scan and controlled counterprobes
+        run: bash .github/ci/security.sh trivy
+      - name: Upload scan evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: security-trivy-${{ github.run_attempt }}
+          path: target/security-reports/
+          if-no-files-found: error
+          retention-days: 14
+
+  workflow-security:
+    name: Actionlint, Zizmor and gate counterprobes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install verified scanner binaries
+        run: |
+          bash .github/ci/install-tool.sh actionlint "$RUNNER_TEMP/security-bin"
+          bash .github/ci/install-tool.sh zizmor "$RUNNER_TEMP/security-bin"
+          printf '%s\n' "$RUNNER_TEMP/security-bin" >> "$GITHUB_PATH"
+      - name: Blocking scan and controlled counterprobes
+        run: bash .github/ci/security.sh workflows
+      - name: Upload scan evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: security-workflows-${{ github.run_attempt }}
+          path: target/security-reports/
+          if-no-files-found: error
+          retention-days: 14
+
+  required-pr-gate:
+    name: Required PR Gate
+    if: ${{ always() }}
+    needs: [check, docks, gitleaks, cargo-security, semgrep, trivy, workflow-security]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Require every mandatory job to succeed
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          printf '%s\n' "$NEEDS_JSON" | jq .
+          printf '%s\n' "$NEEDS_JSON" | jq -e -f .github/ci/required-gate.jq

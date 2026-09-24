@@ -1,0 +1,63 @@
+rules:
+  - id: uplink-rust-invalid-cert
+    languages: [rust]
+    severity: ERROR
+    message: TLS certificate verification must remain enabled.
+    pattern: $CLIENT.danger_accept_invalid_certs(true)
+  - id: uplink-rust-invalid-hostname
+    languages: [rust]
+    severity: ERROR
+    message: TLS hostname verification must remain enabled.
+    pattern: $CLIENT.danger_accept_invalid_hostnames(true)
+  - id: uplink-rust-openssl-no-verification
+    languages: [rust]
+    severity: ERROR
+    message: OpenSSL peer verification must not be disabled.
+    pattern: $CTX.set_verify(SslVerifyMode::NONE)
+  - id: uplink-rust-command-interpolation
+    languages: [rust]
+    severity: ERROR
+    message: Do not interpolate a command string. Pass executable arguments separately.
+    patterns:
+      - pattern-either:
+          - pattern: $CMD.arg("-c").arg(format!($...ARGS))
+          - pattern: $CMD.args(["-c", &format!($...ARGS)])
+  - id: uplink-rust-sql-interpolation
+    languages: [rust]
+    severity: ERROR
+    message: Use parameterized SQL rather than formatting values into a query.
+    pattern-either:
+      - pattern: $DB.query(&format!($...FMT), $...ARGS)
+      - pattern: $DB.execute(&format!($...FMT), $...ARGS)
+  - id: uplink-rust-world-writable
+    languages: [rust]
+    severity: ERROR
+    message: Do not create world-writable files or directories.
+    pattern-either:
+      - pattern: Permissions::from_mode(0o777)
+      - pattern: Permissions::from_mode(0o666)
+      - pattern: $OPTIONS.mode(0o777)
+      - pattern: $OPTIONS.mode(0o666)
+  - id: uplink-javascript-eval
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: Do not execute strings as JavaScript.
+    pattern-either:
+      - pattern: eval(...)
+      - pattern: new Function(...)
+  - id: uplink-html-script-eval
+    languages: [generic]
+    severity: ERROR
+    message: Do not execute strings in inline dock scripts.
+    paths:
+      include: ["*.html"]
+    pattern-regex: '\b(?:eval\s*\(|new\s+Function\s*\()'
+  - id: uplink-actions-script-injection
+    languages: [yaml]
+    severity: ERROR
+    message: Pass untrusted GitHub event fields through environment variables, not inline shell substitution.
+    patterns:
+      - pattern: 'run: $SCRIPT'
+      - metavariable-regex:
+          metavariable: $SCRIPT
+          regex: '(?s).*\$\{\{\s*github\.(?:event|head_ref)\b.*'

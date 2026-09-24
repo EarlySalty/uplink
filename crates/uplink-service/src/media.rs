@@ -950,8 +950,8 @@ mod tests {
     #[test]
     fn measured_av1_1080_envelope_is_narrow_and_fail_closed() {
         use uplink_core::{
-            Chroma, Codec, Color, ColorPrimaries, ColorRange, FrameRate, Gop, Matrix,
-            RateControl, RateMode, Transfer, VideoProfile,
+            Chroma, Codec, Color, ColorPrimaries, ColorRange, FrameRate, Gop, Matrix, RateControl,
+            RateMode, Transfer, VideoProfile,
         };
         use uplink_media::{
             ProgramOutput, ProgramVideo, PublishSecret, PublishTarget, SourceObservation,
