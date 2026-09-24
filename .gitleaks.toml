@@ -1,0 +1,13 @@
+title = "Uplink secret scanning"
+[extend]
+useDefault = true
+
+# SQL identifiers only. All attributes of the built-in rule remain inherited.
+[[rules]]
+id = "generic-api-key"
+[[rules.allowlists]]
+description = "Exact parameterized SQL upsert fragment, not a credential; SECURITY-CI.md"
+condition = "AND"
+paths = ['''^crates/uplink-service/src/api\.rs$''']
+regexTarget = "match"
+regexes = ['''^EXCLUDED\.ingest_key_hash,ingest_key_enc=EXCLUDED\.ingest_key_enc\s?$''']
