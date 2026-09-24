@@ -11,7 +11,11 @@ fn bounded_arg(index: usize, default: u32, min: u32, max: u32) -> u32 {
 }
 
 fn cpu_sample() -> Option<(u64, u64)> {
-    let line = fs::read_to_string("/proc/stat").ok()?.lines().next()?.to_owned();
+    let line = fs::read_to_string("/proc/stat")
+        .ok()?
+        .lines()
+        .next()?
+        .to_owned();
     let mut values = line
         .split_whitespace()
         .skip(1)
@@ -43,11 +47,13 @@ fn run(label: &str, args: &[String], seconds: u32) -> Result<(), String> {
     if !status.success() {
         return Err(format!("{label} ist fehlgeschlagen"));
     }
-    let cpu = before.zip(after).and_then(|((total_a, idle_a), (total_b, idle_b))| {
-        let total = total_b.checked_sub(total_a)?;
-        let idle = idle_b.checked_sub(idle_a)?;
-        (total > 0).then_some(100.0 * (total - idle) as f64 / total as f64)
-    });
+    let cpu = before
+        .zip(after)
+        .and_then(|((total_a, idle_a), (total_b, idle_b))| {
+            let total = total_b.checked_sub(total_a)?;
+            let idle = idle_b.checked_sub(idle_a)?;
+            (total > 0).then_some(100.0 * (total - idle) as f64 / total as f64)
+        });
     println!(
         "{label}: wall={elapsed:.2}s media={seconds}s speed={:.2}x host_cpu={:.1}%",
         f64::from(seconds) / elapsed,
@@ -64,7 +70,10 @@ fn main() -> Result<(), String> {
         Some("superfast") => "superfast",
         _ => "fast",
     };
-    let source = PathBuf::from(format!("/tmp/uplink-native2k-av1-{}.mkv", std::process::id()));
+    let source = PathBuf::from(format!(
+        "/tmp/uplink-native2k-av1-{}.mkv",
+        std::process::id()
+    ));
     let common = vec![
         "-nostdin".to_owned(),
         "-hide_banner".to_owned(),
@@ -73,13 +82,43 @@ fn main() -> Result<(), String> {
     ];
 
     let mut make = common.clone();
-    make.extend([
-        "-f", "lavfi", "-i", "testsrc2=size=2560x1440:rate=60", "-t",
-        &seconds.to_string(), "-pix_fmt", "yuv420p", "-color_primaries", "bt709",
-        "-color_trc", "bt709", "-colorspace", "bt709", "-color_range", "tv",
-        "-c:v", "libsvtav1", "-preset", "12", "-svtav1-params", "lp=8:pred-struct=1:irefresh-type=2",
-        "-b:v", "6500k", "-maxrate", "6500k", "-bufsize", "13000k", "-g", "120", "-y",
-    ].into_iter().map(str::to_owned));
+    make.extend(
+        [
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=2560x1440:rate=60",
+            "-t",
+            &seconds.to_string(),
+            "-pix_fmt",
+            "yuv420p",
+            "-color_primaries",
+            "bt709",
+            "-color_trc",
+            "bt709",
+            "-colorspace",
+            "bt709",
+            "-color_range",
+            "tv",
+            "-c:v",
+            "libsvtav1",
+            "-preset",
+            "12",
+            "-svtav1-params",
+            "lp=8:pred-struct=1:irefresh-type=2",
+            "-b:v",
+            "6500k",
+            "-maxrate",
+            "6500k",
+            "-bufsize",
+            "13000k",
+            "-g",
+            "120",
+            "-y",
+        ]
+        .into_iter()
+        .map(str::to_owned),
+    );
     make.push(source.display().to_string());
     let status = Command::new("/usr/bin/nice")
         .args(["-n", "19", FFMPEG])
@@ -91,7 +130,15 @@ fn main() -> Result<(), String> {
     }
 
     let mut decode = common.clone();
-    decode.extend(["-i".to_owned(), source.display().to_string(), "-map".to_owned(), "0:v:0".to_owned(), "-f".to_owned(), "null".to_owned(), "-".to_owned()]);
+    decode.extend([
+        "-i".to_owned(),
+        source.display().to_string(),
+        "-map".to_owned(),
+        "0:v:0".to_owned(),
+        "-f".to_owned(),
+        "null".to_owned(),
+        "-".to_owned(),
+    ]);
     run("av1_decode", &decode, seconds)?;
 
     let mut top_only = common.clone();
