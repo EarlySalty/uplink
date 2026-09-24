@@ -399,7 +399,12 @@ async fn normal_case_mode(
         while let Some(tag) = source.next().await.unwrap() {
             if single_audio && tag.audio_track().unwrap() == Some(1) { continue; }
             producer.try_send(Arc::new(tag)).unwrap();
-            tokio::time::sleep(Duration::from_millis(2)).await;
+            // Der echte OBS-Eingang liefert während der Enhanced-Aushandlung
+            // kontinuierlich Medien. Der kurze AV1-Fixture darf nicht vollständig
+            // vor der Control-Plane-Prüfung abgefeuert werden, sonst testet der
+            // Harness nur den RTMP-Inaktivitäts-Timeout.
+            let pacing_ms = if enhanced_fallback { 20 } else { 2 };
+            tokio::time::sleep(Duration::from_millis(pacing_ms)).await;
         }
         // Quelle bleibt offen, damit laufender Graph und Endzustand getrennt
         // über genau die normalen autorisierten HTTP-Routen beobachtet werden.
